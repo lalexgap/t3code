@@ -67,6 +67,7 @@ const makeHarness = Effect.fnUntraced(function* (
     settings: instanceSettings,
     api,
     pollIntervalMs: 3_600_000,
+    settleGraceMs: 1_000,
   });
   const runtime = yield* adapter.openSession({
     threadId: THREAD_ID,
@@ -274,6 +275,37 @@ describe("AmAdapterV2", () => {
       // The prompt T3 sent is already the thread's user message.
       assert.deepStrictEqual(harness.notices(), []);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  // Replays a live run (am main e2c459b): Claude's inbox took the prompt with no transcript entry,
+  // and its Stop hook marked the receipt done before Claude flushed the reply to its session
+  // file. So the first receipt T3 sees is already `done` at index 0, over a transcript without
+  // the reply, and "PONG" lands at index 0 a moment later with no wake. A typed prompt shows
+  // its own entry first, putting the reply at index 1.
+  it.live.each(["inbox", "typed"] as const)(
+    "waits for a reply flushed after the receipt is done (%s delivery)",
+    (shape) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeAm();
+        const harness = yield* makeHarness(fake);
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Say PONG"));
+        const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+        const transcriptRead = fake.takeCall("GET", `/api/agents/${AGENT}/transcript`);
+        yield* transcriptRead;
+        yield* fake.receipt(sent.messageId!, (message, agent) => {
+          message.state = "done";
+          message.transcriptIndex = 0;
+          agent.status = "idle";
+          if (shape === "typed") agent.entries.push(user("Say PONG"));
+        });
+        // Two reads see the done receipt without the reply, which was once all the run got.
+        yield* transcriptRead;
+        yield* transcriptRead;
+        fake.agents.get(AGENT)!.entries.push(assistant("PONG"));
+        yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
+        assert.deepStrictEqual(harness.replies(), ["PONG"]);
+        assert.deepStrictEqual(harness.notices(), []);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
   it.live("completes a delivered turn that produced no output when am reports it done", () =>
