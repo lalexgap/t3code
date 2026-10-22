@@ -56,6 +56,7 @@ describe("isSentMessage", () => {
   it("sees through am's attribution envelope", () => {
     assert.isTrue(isSentMessage("[am · from lead] yes", ["yes"]));
     assert.isFalse(isSentMessage("[am · from lead] yesterday", ["yes"]));
+    assert.isTrue(isSentMessage("[am · from lead] yes", ["[am · from lead] yes"]));
   });
 });
 

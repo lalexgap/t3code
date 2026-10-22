@@ -67,16 +67,20 @@ const MIN_CONTAINMENT_CHARS = 24;
  * Whether a transcript user entry is a message T3 typed into the agent. Providers can wrap or
  * split long text, so long messages compare on a normalized prefix; short ones must be equal.
  */
+const matchesMessage = (entry: string, message: string) => {
+  if (entry === message) return true;
+  if (entry.length < MIN_CONTAINMENT_CHARS || message.length < MIN_CONTAINMENT_CHARS) return false;
+  return entry.includes(message.slice(0, 200)) || message.includes(entry.slice(0, 200));
+};
+
 export const isSentMessage = (entryText: string, sent: ReadonlyArray<string>) => {
-  const entry = normalize(entryText).replace(AM_ENVELOPE, "");
-  if (!entry) return false;
+  const raw = normalize(entryText);
+  if (!raw) return false;
+  const unwrapped = raw.replace(AM_ENVELOPE, "");
   return sent.some((text) => {
     const message = normalize(text);
     if (!message) return false;
-    if (entry === message) return true;
-    if (entry.length < MIN_CONTAINMENT_CHARS || message.length < MIN_CONTAINMENT_CHARS)
-      return false;
-    return entry.includes(message.slice(0, 200)) || message.includes(entry.slice(0, 200));
+    return matchesMessage(raw, message) || (!!unwrapped && matchesMessage(unwrapped, message));
   });
 };
 
