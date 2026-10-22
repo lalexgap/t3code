@@ -4,7 +4,7 @@ import * as Schema from "effect/Schema";
 import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as HttpClient from "effect/http/HttpClient";
 
-import { AmSettings } from "../settings.ts";
+import { AmSettings, isAmApiUrlAllowed } from "../settings.ts";
 import { makeAmApi } from "./api.ts";
 import { FAKE_TOKEN, makeFakeAm } from "./fakeAm.testkit.ts";
 import { checkAmProviderStatus } from "./status.ts";
@@ -76,6 +76,42 @@ describe("checkAmProviderStatus", () => {
       assert.strictEqual(unknown.status, "error");
       assert.include(unknown.message ?? "", "remotes");
       assert.isTrue(fake.log.every((call) => call.path === "/api/hosts"));
+    }).pipe(Effect.scoped, Effect.provide(FetchHttpClient.layer)),
+  );
+
+  it.live("reports a Fleet host that names the machine running am serve", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm({ hosts: [{ name: "gapserver", reachable: true }] });
+      for (const host of ["local", "fake-local"]) {
+        const status = yield* check(fake.url, FAKE_TOKEN, { host });
+        assert.strictEqual(status.status, "error");
+        assert.include(status.message ?? "", "Leave Fleet host blank");
+      }
+    }).pipe(Effect.scoped, Effect.provide(FetchHttpClient.layer)),
+  );
+
+  it.live("refuses to send the token over plain http to another machine", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      const status = yield* check(fake.url, FAKE_TOKEN, { apiUrl: "http://am.example:8787" });
+      assert.strictEqual(status.status, "error");
+      assert.include(status.message ?? "", "https://");
+      assert.deepStrictEqual(fake.log, []);
+      for (const apiUrl of [
+        "http://127.0.0.1:8787",
+        "http://127.8.0.1",
+        "http://localhost:8787/",
+        "http://[::1]:8787",
+        "https://am.example",
+      ])
+        assert.isTrue(isAmApiUrlAllowed({ apiUrl }), apiUrl);
+      for (const apiUrl of [
+        "http://10.0.0.5:8787",
+        "http://localhost.example",
+        "http://127.0.0.1.example",
+        "ftp://127.0.0.1",
+      ])
+        assert.isFalse(isAmApiUrlAllowed({ apiUrl }), apiUrl);
     }).pipe(Effect.scoped, Effect.provide(FetchHttpClient.layer)),
   );
 

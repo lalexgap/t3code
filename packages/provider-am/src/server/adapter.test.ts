@@ -352,7 +352,7 @@ describe("AmAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
-  it.live("interrupts a delivered prompt on Stop", () =>
+  it.live("interrupts a delivered prompt on Stop by its message id", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();
       fake.agents.set(AGENT, idleAgent());
@@ -366,9 +366,34 @@ describe("AmAdapterV2", () => {
         providerThread: harness.providerThread,
         providerTurnId: started.providerTurn.id,
       });
-      yield* fake.takeCall("POST", `/api/agents/${AGENT}/interrupt`);
+      const interrupt = yield* fake.takeCall("POST", `/api/agents/${AGENT}/interrupt`);
+      assert.deepStrictEqual(interrupt.body, { messageId: sent.messageId });
       yield* harness.takeEvent("turn.terminal", (event) => event.status === "interrupted");
+      assert.deepStrictEqual(fake.escapes, [AGENT]);
       assert.isFalse(fake.log.some((call) => call.method === "DELETE"));
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("retries Stop while am's mailbox is busy or the turn has not started", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Behind"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      yield* deliver(fake, sent.messageId!, user("Behind"));
+      yield* harness.takeEvent("provider_session.updated");
+      const message = fake.messages.get(sent.messageId!)!;
+      message.busyInterrupts = 1;
+      message.unstartedInterrupts = 1;
+      yield* harness.runtime.interruptTurn({
+        providerThread: harness.providerThread,
+        providerTurnId: started.providerTurn.id,
+      });
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "interrupted");
+      assert.strictEqual(fake.log.filter((call) => call.path.endsWith("/interrupt")).length, 3);
+      assert.deepStrictEqual(fake.escapes, [AGENT]);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -389,12 +414,13 @@ describe("AmAdapterV2", () => {
         providerTurnId: started.providerTurn.id,
       });
       yield* fake.takeCall("DELETE", `/api/agents/${AGENT}/messages/${sent.messageId}`);
-      yield* fake.takeCall("POST", `/api/agents/${AGENT}/interrupt`);
+      const interrupt = yield* fake.takeCall("POST", `/api/agents/${AGENT}/interrupt`);
+      assert.deepStrictEqual(interrupt.body, { messageId: sent.messageId });
       yield* harness.takeEvent("turn.terminal", (event) => event.status === "interrupted");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
-  it.live("does not interrupt on Stop once the prompt's receipt is done", () =>
+  it.live("sends no Esc on Stop when am answers that the prompt is already done", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();
       fake.agents.set(AGENT, idleAgent());
@@ -410,8 +436,13 @@ describe("AmAdapterV2", () => {
         providerThread: harness.providerThread,
         providerTurnId: started.providerTurn.id,
       });
-      yield* harness.takeEvent("turn.terminal");
-      assert.isFalse(fake.log.some((call) => call.path.endsWith("/interrupt")));
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(terminal.status, "completed");
+      assert.deepStrictEqual(
+        fake.log.filter((call) => call.path.endsWith("/interrupt")).map((call) => call.body),
+        [{ messageId: sent.messageId }],
+      );
+      assert.deepStrictEqual(fake.escapes, []);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -433,9 +464,9 @@ describe("AmAdapterV2", () => {
       assert.deepStrictEqual(
         fake.log
           .filter((call) => call.method !== "GET" || call.path === path)
-          .slice(-4)
+          .slice(-3)
           .map((call) => `${call.method} ${call.path}`),
-        [`DELETE ${path}`, `GET ${path}`, `GET ${path}`, `POST /api/agents/${AGENT}/interrupt`],
+        [`DELETE ${path}`, `GET ${path}`, `POST /api/agents/${AGENT}/interrupt`],
       );
       yield* harness.takeEvent("turn.terminal", (event) => event.status === "interrupted");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
@@ -455,6 +486,100 @@ describe("AmAdapterV2", () => {
       const terminal = yield* harness.takeEvent("turn.terminal");
       assert.strictEqual(terminal.status, "failed");
       assert.include(terminal.failure?.message ?? "", "the pane never accepted input");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("fails the run when the session ends after am delivered the prompt", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Crashy"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      yield* deliver(fake, sent.messageId!, user("Crashy"), assistant("Starting."));
+      yield* harness.takeItem((event) => event.turnItem.type === "assistant_message");
+      yield* fake.receipt(sent.messageId!, (message, agent) => {
+        message.state = "failed";
+        message.error = "the tmux session ended mid-turn";
+        agent.status = "idle";
+      });
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(terminal.status, "failed");
+      assert.include(terminal.failure?.message ?? "", "the tmux session ended mid-turn");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("fails the run when a delivered steering message fails", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Long job"));
+      const prompt = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      yield* deliver(fake, prompt.messageId!, user("Long job"), assistant("Starting."));
+      yield* harness.takeItem((event) => event.turnItem.type === "assistant_message");
+      yield* steer(harness, started.providerTurn.id, "Faster");
+      const now = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      yield* deliver(fake, now.messageId!, user("Faster"));
+      yield* fake.takeCall("GET", `/api/agents/${AGENT}/messages/${now.messageId}`);
+      yield* fake.receipt(now.messageId!, (message) => {
+        message.state = "failed";
+        message.error = "the agent exited";
+      });
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(terminal.status, "failed");
+      assert.include(terminal.failure?.message ?? "", "the agent exited");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("refuses to send to an am without message receipts", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm({ messageReceipts: false });
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      const started = yield* harness.runtime
+        .startTurn(yield* turnInput(harness.providerThread, "Fix login"))
+        .pipe(Effect.flip);
+      assert.include(String(started.cause), "Update am");
+      assert.isFalse(fake.log.some((call) => call.path.endsWith("/messages")));
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("refuses to send to a fleet host whose am has no message receipts", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm({ messageReceipts: false });
+      const remote = decodeSettings({ enabled: true, apiToken: FAKE_TOKEN, host: "gapserver" });
+      const harness = yield* makeHarness(fake, undefined, remote);
+      const started = yield* harness.runtime
+        .startTurn(yield* turnInput(harness.providerThread, "Remote job"))
+        .pipe(Effect.flip);
+      assert.include(String(started.cause), "gapserver");
+      assert.include(String(started.cause), "Update am");
+      assert.isFalse(fake.log.some((call) => call.path.endsWith("/messages")));
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("refuses a Fleet host that names the machine running am serve", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      for (const host of ["local", "fake-local"]) {
+        const adapter = yield* makeAmAdapterV2({
+          instanceId: INSTANCE_ID,
+          settings: decodeSettings({ enabled: true, apiToken: FAKE_TOKEN, host }),
+          api: makeAmApi(yield* HttpClient.HttpClient, { baseUrl: fake.url, token: FAKE_TOKEN }),
+        });
+        const opened = yield* adapter
+          .openSession({
+            threadId: THREAD_ID,
+            providerSessionId: ProviderSessionId.make(`session-am-${host}`),
+            modelSelection,
+            runtimePolicy,
+          })
+          .pipe(Effect.flip);
+        assert.include(opened.message, "Leave Fleet host blank");
+      }
+      assert.strictEqual(fake.agents.size, 0);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -605,23 +730,26 @@ describe("AmAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
-  it.live("refuses an API URL that is not http or https", () =>
+  it.live("refuses an API URL that is not https or loopback http", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();
-      const adapter = yield* makeAmAdapterV2({
-        instanceId: INSTANCE_ID,
-        settings: decodeSettings({ enabled: true, apiToken: FAKE_TOKEN, apiUrl: "file:///tmp" }),
-        api: makeAmApi(yield* HttpClient.HttpClient, { baseUrl: fake.url, token: FAKE_TOKEN }),
-      });
-      const opened = yield* adapter
-        .openSession({
-          threadId: THREAD_ID,
-          providerSessionId: ProviderSessionId.make("session-am-file"),
-          modelSelection,
-          runtimePolicy,
-        })
-        .pipe(Effect.flip);
-      assert.include(opened.message, "http");
+      for (const apiUrl of ["file:///tmp", "http://am.example:8787"]) {
+        const adapter = yield* makeAmAdapterV2({
+          instanceId: INSTANCE_ID,
+          settings: decodeSettings({ enabled: true, apiToken: FAKE_TOKEN, apiUrl }),
+          api: makeAmApi(yield* HttpClient.HttpClient, { baseUrl: fake.url, token: FAKE_TOKEN }),
+        });
+        const opened = yield* adapter
+          .openSession({
+            threadId: THREAD_ID,
+            providerSessionId: ProviderSessionId.make("session-am-url"),
+            modelSelection,
+            runtimePolicy,
+          })
+          .pipe(Effect.flip);
+        assert.include(opened.message, "https://");
+      }
+      assert.deepStrictEqual(fake.log, []);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

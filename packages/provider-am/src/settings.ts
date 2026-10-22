@@ -20,7 +20,7 @@ export const AmSettings = makeProviderSettingsSchema(
       Schema.annotateKey({
         title: "API URL",
         description:
-          "Where `am serve` listens, over http or https. T3 Code sends the API token there. Leave blank for the local default.",
+          "Where `am serve` listens. T3 Code sends the API token there, so it must use https unless it is on this machine. Leave blank for the local default.",
         providerSettingsForm: { placeholder: AM_DEFAULT_API_URL, clearWhenEmpty: "omit" },
       }),
     ),
@@ -50,6 +50,21 @@ export type AmSettings = typeof AmSettings.Type;
 export const amApiUrl = (settings: Pick<AmSettings, "apiUrl">) =>
   (settings.apiUrl || AM_DEFAULT_API_URL).replace(/\/+$/, "");
 
-/** The bearer token goes to this URL, so only plain web origins are accepted. */
-export const isAmApiUrlAllowed = (settings: Pick<AmSettings, "apiUrl">) =>
-  /^https?:\/\/[^/]/i.test(amApiUrl(settings));
+// `URL` normalizes the host, so `127.1` and `LOCALHOST` arrive here as `127.0.0.1` and `localhost`.
+const isLoopbackHostname = (hostname: string) =>
+  hostname === "localhost" || hostname === "[::1]" || /^127(\.\d{1,3}){3}$/.test(hostname);
+
+/** The bearer token goes to this URL, so plain http is accepted only on the loopback interface. */
+export const isAmApiUrlAllowed = (settings: Pick<AmSettings, "apiUrl">) => {
+  if (!URL.canParse(amApiUrl(settings))) return false;
+  const url = new URL(amApiUrl(settings));
+  if (url.protocol === "https:") return url.hostname !== "";
+  return url.protocol === "http:" && isLoopbackHostname(url.hostname);
+};
+
+export const AM_API_URL_RULE =
+  "The Agent Motel API URL must use https://, or http:// only for localhost, 127.0.0.1 or ::1.";
+
+/** am's `local` alias and its own host name both resolve to the machine running `am serve`. */
+export const isAmLocalHostName = (host: string, local?: string) =>
+  host === "local" || host === local;

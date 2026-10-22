@@ -10,8 +10,9 @@ web, desktop, and mobile apps.
 1. On the machine hosting your environment, run `am serve`. It prints its API token (`am token` prints it again) and listens on
    `http://127.0.0.1:8787` unless am's config sets another `apiPort`.
 2. Open **Settings → Providers**, select the environment, and enable **Agent Motel**.
-3. Paste the token into **API token**. Set **API URL** if `am serve` listens elsewhere. The URL
-   must use `http` or `https`, and T3 Code sends the token to it, so point it only at your own am.
+3. Paste the token into **API token**. Set **API URL** if `am serve` listens elsewhere. T3 Code
+   sends the token to it, so point it only at your own am. It must use `https`; plain `http` is
+   accepted only for this machine (`localhost`, `127.0.0.1`, or `::1`).
 4. Refresh provider status. It only checks that am answers and accepts the token; it never starts
    an agent.
 
@@ -25,7 +26,8 @@ need to reach am themselves.
 
 To run agents on another machine in your am fleet, add another Agent Motel instance in
 **Settings → Providers** and set **Fleet host** to that machine's name from am's `remotes`, for
-example one instance for this machine and one named "am · laptop". Status for a fleet host checks
+example one instance for this machine and one named "am · laptop". Leave **Fleet host** blank for
+the machine running `am serve`; its own name, or `local`, is refused. Status for a fleet host checks
 whether am can reach it. Its turns update every few seconds rather than as am records them.
 
 The agent works in the fleet host's copy of the thread's project, at the same path under its home
@@ -50,13 +52,17 @@ with `am transcript <name>`.
 
 If the agent is busy with other work, the message waits in am's queue and the turn starts when am
 delivers it. Sending while the turn runs steers it. **Stop** withdraws a message am has not
-delivered yet, and otherwise sends Esc to the agent.
+delivered yet, and otherwise sends Esc to the agent only while that message's turn is running. If
+the agent's session ends mid-turn, the turn fails.
 
 ## Permissions and limitations
 
 am starts agents with their provider's own permissions, which are unrestricted unless am's
 `skipPermissions` is off. T3 Code offers only **Full access** for these threads and cannot answer an
 agent's prompts. When an agent waits on one, the thread says so; answer it in the agent's session with `am j <name>`.
+
+Leave `t3-…` agents to T3 Code: identical text typed or sent into one from outside T3 Code can be
+taken for T3 Code's own message.
 
 Plan mode, forks, conversation rewind, and T3 Code's tools are not available. Switching an
 existing thread to Agent Motel passes its conversation as a handoff.

@@ -38,6 +38,8 @@ export const AmAgentDetail = Schema.Struct({
   statusReason: Schema.optional(Schema.NullOr(Schema.String)),
   provider: Schema.String,
   dir: Schema.String,
+  /** Set by an am whose `send --json` returns receipt ids; a fleet host's reflects that host's am. */
+  messageReceipts: Schema.optional(Schema.Boolean),
 });
 export type AmAgentDetail = typeof AmAgentDetail.Type;
 
@@ -66,9 +68,13 @@ export const AmHosts = Schema.Struct({
 });
 export type AmHosts = typeof AmHosts.Type;
 
+export const AmHealth = Schema.Struct({ messageReceipts: Schema.optional(Schema.Boolean) });
+export type AmHealth = typeof AmHealth.Type;
+
 const SentMessage = Schema.Struct({ id: Schema.String });
 const ErrorBody = Schema.Struct({ error: Schema.String });
 const CancelConflict = Schema.Struct({ state: AmMessageState });
+const InterruptConflict = Schema.Struct({ error: Schema.String, state: AmMessageState });
 // Starting an agent can wait on its provider (codex creates its thread up front), so allow
 // more than a plain read needs; a hung am must still not hold a T3 session open forever.
 const REQUEST_TIMEOUT_MS = 60_000;
@@ -96,9 +102,14 @@ export type AmCancelResult =
   | { readonly cancelled: true }
   | { readonly cancelled: false; readonly state: AmMessageState };
 
+/** `reason` is am's explanation, which tells a busy mailbox or an unstarted turn from the rest. */
+export type AmInterruptResult =
+  | { readonly interrupted: true }
+  | { readonly interrupted: false; readonly state: AmMessageState; readonly reason: string };
+
 /** Agent routes take a bare name or `host:name` for an agent on a fleet host. */
 export interface AmApi {
-  readonly health: Effect.Effect<void, AmApiError>;
+  readonly health: Effect.Effect<AmHealth, AmApiError>;
   readonly hosts: Effect.Effect<AmHosts, AmApiError>;
   /** None when am has no agent with this name. */
   readonly getAgent: (ref: string) => Effect.Effect<Option.Option<AmAgentDetail>, AmApiError>;
@@ -112,7 +123,14 @@ export interface AmApi {
   readonly getMessage: (ref: string, id: string) => Effect.Effect<AmMessageReceipt, AmApiError>;
   /** Cancels a still-queued message; otherwise reports the state that prevented it. */
   readonly cancelMessage: (ref: string, id: string) => Effect.Effect<AmCancelResult, AmApiError>;
-  readonly interrupt: (name: string) => Effect.Effect<void, AmApiError>;
+  /**
+   * Sends Esc once, and only while this message's own turn runs, so it never stops other work.
+   * There is deliberately no bare interrupt here.
+   */
+  readonly interruptMessage: (
+    ref: string,
+    id: string,
+  ) => Effect.Effect<AmInterruptResult, AmApiError>;
   readonly resume: (name: string) => Effect.Effect<void, AmApiError>;
   readonly transcript: (name: string, after: number) => Effect.Effect<AmTranscript, AmApiError>;
   /** Every fleet event, as a bare wake signal; reconnecting is the caller's concern. */
@@ -188,7 +206,7 @@ export const makeAmApi = (
 
   return {
     health: send("health check", HttpClientRequest.get("/health")).pipe(
-      Effect.flatMap(expectOk("health check")),
+      Effect.flatMap((response) => decode("health check", AmHealth, response)),
     ),
     hosts: send("host list", HttpClientRequest.get("/hosts")).pipe(
       Effect.flatMap((response) => decode("host list", AmHosts, response)),
@@ -245,7 +263,21 @@ export const makeAmApi = (
             : expectOk("message cancel")(response).pipe(Effect.as({ cancelled: true })),
         ),
       ),
-    interrupt: (ref) => post("interrupt", agentPath(ref, "/interrupt"), {}),
+    interruptMessage: (ref, id) =>
+      send(
+        "interrupt",
+        HttpClientRequest.post(agentPath(ref, "/interrupt")).pipe(
+          HttpClientRequest.bodyJsonUnsafe({ messageId: id }),
+        ),
+      ).pipe(
+        Effect.flatMap((response): Effect.Effect<AmInterruptResult, AmApiError> =>
+          response.status === 409
+            ? decodeBody("interrupt", InterruptConflict, response).pipe(
+                Effect.map(({ error, state }) => ({ interrupted: false, state, reason: error })),
+              )
+            : expectOk("interrupt")(response).pipe(Effect.as({ interrupted: true })),
+        ),
+      ),
     resume: (ref) => post("resume", agentPath(ref, "/resume"), {}),
     transcript: (ref, after) =>
       send(

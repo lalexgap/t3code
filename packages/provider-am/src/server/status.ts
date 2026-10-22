@@ -8,7 +8,12 @@ import {
   DEFAULT_TIMEOUT_MS,
   type ProviderProbeResult,
 } from "@t3tools/provider-core/server/snapshotProbe";
-import { isAmApiUrlAllowed, type AmSettings } from "../settings.ts";
+import {
+  AM_API_URL_RULE,
+  isAmApiUrlAllowed,
+  isAmLocalHostName,
+  type AmSettings,
+} from "../settings.ts";
 import type { AmApi, AmApiError, AmHosts } from "./api.ts";
 import { AM_DEFAULT_MODEL } from "./mapping.ts";
 
@@ -73,8 +78,18 @@ export const checkAmProviderStatus = Effect.fn("checkAmProviderStatus")(function
       version: null,
       status: "error",
       auth: { status: "unknown" },
-      message: "The Agent Motel API URL must start with http:// or https://.",
+      message: AM_API_URL_RULE,
     });
+  const localFleetHost = (host: string) =>
+    snapshot(true, {
+      installed: false,
+      version: null,
+      status: "error",
+      auth: { status: "unknown" },
+      message: `Fleet host "${host}" is the machine running \`am serve\`. Leave Fleet host blank to run agents there.`,
+    });
+  if (settings.host && isAmLocalHostName(settings.host))
+    return yield* localFleetHost(settings.host);
   if (!settings.apiToken)
     return yield* snapshot(true, {
       installed: false,
@@ -89,6 +104,8 @@ export const checkAmProviderStatus = Effect.fn("checkAmProviderStatus")(function
     : api.health.pipe(Effect.as(undefined));
   const reached = yield* probe.pipe(Effect.timeout(DEFAULT_TIMEOUT_MS), Effect.result);
   if (Result.isSuccess(reached)) {
+    if (settings.host && isAmLocalHostName(settings.host, reached.success?.local))
+      return yield* localFleetHost(settings.host);
     const fleetHost = reached.success?.hosts.find((host) => host.name === settings.host);
     if (settings.host && !fleetHost)
       return yield* snapshot(true, {

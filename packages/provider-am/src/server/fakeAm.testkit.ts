@@ -26,6 +26,11 @@ export interface FakeMessage {
   error?: string;
   /** am is mid-delivery: a cancel answers 409 `queued`, and the delivery then completes. */
   deliveringOnCancel?: boolean;
+  /** How many interrupts answer 409 because the delivered message's turn has not started. */
+  unstartedInterrupts?: number;
+  /** How many interrupts answer 409 because the mailbox is busy. */
+  busyInterrupts?: number;
+  interrupted?: boolean;
 }
 
 export interface FakeCall {
@@ -40,13 +45,20 @@ export const FAKE_TOKEN = "fake-am-token";
 
 /** An `am serve` stand-in on a loopback port, following the route contract in am's src/server.ts. */
 export const makeFakeAm = Effect.fnUntraced(function* (
-  options: { readonly hosts?: ReadonlyArray<{ name: string; reachable: boolean }> } = {},
+  options: {
+    readonly hosts?: ReadonlyArray<{ name: string; reachable: boolean }>;
+    /** False plays an am from before message receipts, on health and on agent detail. */
+    readonly messageReceipts?: boolean;
+  } = {},
 ) {
+  const receiptsFlag = options.messageReceipts === false ? {} : { messageReceipts: true };
   const calls = yield* Queue.unbounded<FakeCall>();
   /** Keyed by am address: a bare name, or `host:name` for a fleet host's agent. */
   const agents = new Map<string, FakeAgent>();
   const messages = new Map<string, FakeMessage>();
   const log: Array<FakeCall> = [];
+  /** Each Esc am sent to an agent's TUI, by agent address. */
+  const escapes: Array<string> = [];
   let messageSeq = 0;
   const streams = new Set<NodeHttp.ServerResponse>();
   let markConnected!: () => void;
@@ -73,7 +85,8 @@ export const makeFakeAm = Effect.fnUntraced(function* (
     const call = { method, path: url.pathname, body, ...(messageId ? { messageId } : {}) };
     log.push(call);
     Queue.offerUnsafe(calls, call);
-    if (parts[0] === "health" && method === "GET") return json(res, 200, { ok: true, name: "am" });
+    if (parts[0] === "health" && method === "GET")
+      return json(res, 200, { ok: true, name: "am", ...receiptsFlag });
     if (parts[0] === "hosts" && method === "GET")
       return json(res, 200, { local: "fake-local", hosts: options.hosts ?? [] });
     if (parts[0] === "events" && method === "GET") {
@@ -109,6 +122,7 @@ export const makeFakeAm = Effect.fnUntraced(function* (
         dir: agent.dir,
         queue: [],
         pane: null,
+        ...receiptsFlag,
       });
     if (parts[2] === "transcript" && method === "GET") {
       const after = Number(url.searchParams.get("after") ?? "0");
@@ -165,8 +179,37 @@ export const makeFakeAm = Effect.fnUntraced(function* (
         return json(res, 200, { ok: true, state: "cancelled" });
       }
     }
-    if (["interrupt", "stop"].includes(parts[2] ?? "") && method === "POST")
+    if (parts[2] === "interrupt" && method === "POST") {
+      if (body?.messageId !== undefined && body.text !== undefined)
+        return json(res, 400, { error: "messageId and text are mutually exclusive" });
+      if (typeof body?.messageId !== "string") {
+        escapes.push(name);
+        return json(res, 200, { ok: true });
+      }
+      const id = body.messageId;
+      const message = messages.get(id);
+      if (!message || message.agent !== name) return json(res, 404, { error: "no such message" });
+      const conflict = (error: string) => json(res, 409, { error, state: message.state });
+      if (message.busyInterrupts) {
+        message.busyInterrupts--;
+        return conflict(`agent "${name}" mailbox is busy — retry`);
+      }
+      if (message.state !== "delivered")
+        return conflict(
+          message.state === "queued"
+            ? `message ${id} is not delivered yet`
+            : `message ${id} is already ${message.state}`,
+        );
+      if (message.unstartedInterrupts) {
+        message.unstartedInterrupts--;
+        return conflict(`message ${id} has not started yet`);
+      }
+      if (message.interrupted) return conflict(`message ${id} was already interrupted`);
+      message.interrupted = true;
+      escapes.push(name);
       return json(res, 200, { ok: true });
+    }
+    if (parts[2] === "stop" && method === "POST") return json(res, 200, { ok: true });
     return json(res, 404, { error: "not found" });
   };
   const server = NodeHttp.createServer((req, res) => {
@@ -205,6 +248,7 @@ export const makeFakeAm = Effect.fnUntraced(function* (
     messages,
     /** Every authorized call so far, in order. */
     log,
+    escapes,
     /** Changes a message's receipt (and optionally its agent), then wakes listeners. */
     receipt: (id: string, change: (message: FakeMessage, agent: FakeAgent) => void) =>
       Effect.suspend(() => {
