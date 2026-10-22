@@ -156,6 +156,8 @@ interface ActiveTurn {
   readonly ordinals: Map<string, number>;
   nextOrdinal: number;
   readonly sent: Array<string>;
+  /** am may wrap a new agent's task in launch instructions, so its first prompt is T3's by construction. */
+  readonly createdAgent: boolean;
   delivered: boolean;
   /** am can list the delivered prompt while still reporting the idle it had before it. */
   workSeen: boolean;
@@ -387,7 +389,10 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           if (entry.index < turn.startIndex) continue;
           // Until T3's prompt shows up, the transcript belongs to work that came before it.
           if (!turn.delivered) {
-            if (entry.kind === "user" && isSentMessage(entry.text ?? "", turn.sent)) {
+            if (
+              entry.kind === "user" &&
+              (turn.createdAgent || isSentMessage(entry.text ?? "", turn.sent))
+            ) {
               turn.delivered = true;
               turn.startIndex = entry.index;
             }
@@ -679,6 +684,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           ordinals: new Map(),
           nextOrdinal: turnInput.providerTurnOrdinal * 100 + 1,
           sent: [text],
+          createdAgent: !detail,
           delivered: false,
           workSeen: false,
           attentionEpisodes: 0,

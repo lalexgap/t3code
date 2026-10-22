@@ -228,6 +228,27 @@ describe("AmAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.live("takes a new agent's wrapped first task as its own prompt", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "fix it"));
+      yield* fake.takeCall("POST", "/api/agents");
+      yield* fake.update(AGENT, (agent) => {
+        agent.entries.push(user("<launch instructions>\n\nfix it"), assistant("Fixed."));
+        agent.status = "idle";
+      });
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
+      const items = harness.allEvents.flatMap((event) =>
+        event.type === "turn_item.updated" ? [event.turnItem] : [],
+      );
+      assert.deepStrictEqual(
+        items.map((item) => (item.type === "assistant_message" ? item.text : item.type)),
+        ["Fixed."],
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.live("queues to a busy agent and waits for its own message before settling", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();
