@@ -308,6 +308,30 @@ describe("AmAdapterV2", () => {
       }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.live("waits for a steer's reply flushed after its receipt is done", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Long job"));
+      const prompt = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      yield* steer(harness, started.providerTurn.id, "Also update the docs");
+      const behind = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      yield* deliver(fake, prompt.messageId!, user("Long job"), assistant("Halfway."));
+      yield* complete(fake, prompt.messageId!);
+      // The steer arrives through the inbox with no entry, and is done before its reply is on disk.
+      const transcriptRead = fake.takeCall("GET", `/api/agents/${AGENT}/transcript`);
+      yield* deliver(fake, behind.messageId!);
+      yield* complete(fake, behind.messageId!);
+      yield* transcriptRead;
+      yield* transcriptRead;
+      fake.agents.get(AGENT)!.entries.push(assistant("Docs updated."));
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
+      assert.deepStrictEqual(harness.replies(), ["Halfway.", "Docs updated."]);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.live("completes a delivered turn that produced no output when am reports it done", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();

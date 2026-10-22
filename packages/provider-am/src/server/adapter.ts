@@ -61,8 +61,10 @@ const CANCEL_RETRY_MS = 250;
 const CANCEL_ATTEMPTS = 40;
 // Claude flushes its session file in batches, so a turn's closing reply can reach the transcript
 // after the Stop hook has marked the receipt done. A finished turn waits this long for it.
+// Each read of a fleet host's agent is an ssh round trip, so a remote turn re-reads less often.
 const SETTLE_GRACE_MS = 3_000;
 const SETTLE_POLL_MS = 200;
+const REMOTE_SETTLE_POLL_MS = 1_000;
 const isSettled = (state: AmMessageState) =>
   state === "done" || state === "cancelled" || state === "failed";
 const SETTLED_BY_REASON = {
@@ -215,6 +217,8 @@ interface ActiveTurn {
   inAttention: boolean;
   /** When every message was first seen done while the transcript had not caught up. */
   settledAt: number | undefined;
+  /** A re-read is already scheduled while the turn waits for its reply. */
+  settleWakePending: boolean;
   readonly done: Deferred.Deferred<void>;
 }
 
@@ -497,7 +501,9 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         let last: AmTranscriptEntry | undefined;
         for (const { entry } of turn.published.values())
           if (!last || entry.index > last.index) last = entry;
-        return last?.kind === "assistant";
+        // A steer's reply comes after the steer, so an earlier message's reply does not count.
+        const from = Math.max(...turn.messages.map((message) => message.transcriptIndex ?? 0));
+        return last?.kind === "assistant" && last.index >= from;
       };
       const finish = Effect.fnUntraced(function* (
         turn: ActiveTurn,
@@ -732,8 +738,15 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
             const now = yield* Clock.currentTimeMillis;
             turn.settledAt ??= now;
             if (now - turn.settledAt < (options.settleGraceMs ?? SETTLE_GRACE_MS)) {
-              yield* Effect.sleep(SETTLE_POLL_MS).pipe(
-                Effect.andThen(Effect.sync(() => Queue.offerUnsafe(wake, undefined))),
+              if (turn.settleWakePending) return;
+              turn.settleWakePending = true;
+              yield* Effect.sleep(remote ? REMOTE_SETTLE_POLL_MS : SETTLE_POLL_MS).pipe(
+                Effect.andThen(
+                  Effect.sync(() => {
+                    turn.settleWakePending = false;
+                    Queue.offerUnsafe(wake, undefined);
+                  }),
+                ),
                 Effect.forkIn(scope),
               );
               return;
@@ -973,6 +986,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           attentionEpisodes: 0,
           inAttention: false,
           settledAt: undefined,
+          settleWakePending: false,
           done: yield* Deferred.make<void>(),
         };
         thread = turnInput.providerThread;
@@ -1098,6 +1112,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
             if (!text) return yield* protocolError("Agent Motel needs a text message");
             const mode = turn.messages[0]?.state === "queued" ? "queue" : "now";
             const id = yield* fromApi(api.sendMessage(agentRef!, text, mode));
+            turn.settledAt = undefined;
             turn.messages.push({
               id,
               mode,
