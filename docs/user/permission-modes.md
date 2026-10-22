@@ -28,6 +28,9 @@ to you for approval.
 Muse Code offers only **Supervised** and **Full access**. A Muse thread already set to another mode
 runs in **Supervised**.
 
+Agent Motel offers only **Full access**: am starts each agent with its own provider's permissions,
+and T3 Code cannot answer its prompts. See [Agent Motel permissions](./providers-am.md#permissions-and-limitations).
+
 Grok offers no **Auto-accept edits**. A Grok thread already set to it runs in **Supervised**. Grok
 file-change approvals offer **Allow all edits this session**. Its command approvals have no
 session-wide choice, because Grok would remember that command for the whole project.
