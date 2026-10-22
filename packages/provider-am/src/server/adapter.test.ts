@@ -394,6 +394,27 @@ describe("AmAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.live("does not interrupt on Stop once the prompt's receipt is done", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Quick"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      yield* deliver(fake, sent.messageId!, user("Quick"), assistant("Working."));
+      yield* harness.takeItem((event) => event.turnItem.type === "assistant_message");
+      // Done without a wake, while a peer's turn may already be running.
+      fake.messages.get(sent.messageId!)!.state = "done";
+      yield* harness.runtime.interruptTurn({
+        providerThread: harness.providerThread,
+        providerTurnId: started.providerTurn.id,
+      });
+      yield* harness.takeEvent("turn.terminal");
+      assert.isFalse(fake.log.some((call) => call.path.endsWith("/interrupt")));
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.live("waits out a cancel am answers mid-delivery, then interrupts", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();
@@ -412,9 +433,9 @@ describe("AmAdapterV2", () => {
       assert.deepStrictEqual(
         fake.log
           .filter((call) => call.method !== "GET" || call.path === path)
-          .slice(-3)
+          .slice(-4)
           .map((call) => `${call.method} ${call.path}`),
-        [`DELETE ${path}`, `GET ${path}`, `POST /api/agents/${AGENT}/interrupt`],
+        [`DELETE ${path}`, `GET ${path}`, `GET ${path}`, `POST /api/agents/${AGENT}/interrupt`],
       );
       yield* harness.takeEvent("turn.terminal", (event) => event.status === "interrupted");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
@@ -601,6 +622,40 @@ describe("AmAdapterV2", () => {
         })
         .pipe(Effect.flip);
       assert.include(opened.message, "http");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("refuses a saved thread whose agent is on another host than the Fleet host", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      const now = yield* DateTime.now;
+      const remote = decodeSettings({ enabled: true, apiToken: FAKE_TOKEN, host: "gapserver" });
+      const failure = yield* makeHarness(
+        fake,
+        {
+          id: ProviderThreadId.make("provider-thread-local"),
+          driver: ProviderDriverKind.make("am"),
+          providerInstanceId: INSTANCE_ID,
+          providerSessionId: null,
+          appThreadId: THREAD_ID,
+          ownerNodeId: null,
+          nativeThreadRef: {
+            driver: ProviderDriverKind.make("am"),
+            nativeId: AGENT,
+            strength: "strong",
+          },
+          nativeConversationHeadRef: null,
+          status: "idle",
+          firstRunOrdinal: 1,
+          lastRunOrdinal: 1,
+          handoffIds: [],
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+        },
+        remote,
+      ).pipe(Effect.flip);
+      assert.include(String((failure as { cause?: unknown }).cause), "Fleet host");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

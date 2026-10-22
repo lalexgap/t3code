@@ -540,6 +540,11 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
             message.state = receipt.state;
             message.transcriptIndex = receipt.transcriptIndex ?? message.transcriptIndex;
           }
+          // A cached `delivered` may already be `done`, and Esc would then stop whatever runs next.
+          if (message.state === "delivered") {
+            const receipt = yield* fromApi(api.getMessage(agentRef!, message.id));
+            message.state = receipt.state;
+          }
           if (message.state === "delivered") delivered = true;
         }
         return delivered;
@@ -677,6 +682,12 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           existing?.nativeThreadRef?.nativeId ??
           input.initialNativeThreadId ??
           amAgentRef(options.settings.host, amAgentName(args.threadId, args.title));
+        // Capabilities follow the instance's Fleet host, so a thread whose agent lives elsewhere
+        // would checkpoint the wrong copy.
+        if (parseAmAgentRef(name).host !== (options.settings.host || undefined))
+          return yield* protocolError(
+            "This thread's Agent Motel agent is on another host than this instance's Fleet host. Restore the setting or start a new thread.",
+          );
         if (thread && agentRef === name && thread.appThreadId === args.threadId) return thread;
         if (thread) return yield* protocolError("This session already serves another agent");
         if (active) return yield* protocolError("Cannot change agents during an active turn");
