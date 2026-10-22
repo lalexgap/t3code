@@ -472,6 +472,208 @@ describe("AmAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.live("retries a withdraw while am's mailbox is busy", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, { ...idleAgent(), status: "working" });
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Later"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      fake.messages.get(sent.messageId!)!.busyCancels = 2;
+      yield* harness.runtime.interruptTurn({
+        providerThread: harness.providerThread,
+        providerTurnId: started.providerTurn.id,
+      });
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "interrupted");
+      assert.strictEqual(fake.log.filter((call) => call.method === "DELETE").length, 3);
+      assert.strictEqual(fake.messages.get(sent.messageId!)?.state, "cancelled");
+      assert.isFalse(fake.log.some((call) => call.path.endsWith("/interrupt")));
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("sends no second Esc when am says the turn was already interrupted", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Twice"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      yield* deliver(fake, sent.messageId!, user("Twice"), assistant("Working."));
+      yield* harness.takeItem((event) => event.turnItem.type === "assistant_message");
+      // Another client's Stop pressed Esc, and am has not seen the prompt return yet.
+      fake.messages.get(sent.messageId!)!.escaped = true;
+      yield* harness.runtime.interruptTurn({
+        providerThread: harness.providerThread,
+        providerTurnId: started.providerTurn.id,
+      });
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "interrupted");
+      assert.strictEqual(fake.log.filter((call) => call.path.endsWith("/interrupt")).length, 1);
+      assert.deepStrictEqual(fake.escapes, []);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("ends the run on Stop without an Esc when am says the session is gone", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Gone"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      yield* deliver(fake, sent.messageId!, user("Gone"));
+      yield* harness.takeEvent("provider_session.updated");
+      fake.messages.get(sent.messageId!)!.conflict = {
+        error: `agent "${AGENT}" has no live tmux session`,
+        reason: "no_session",
+      };
+      yield* harness.runtime.interruptTurn({
+        providerThread: harness.providerThread,
+        providerTurnId: started.providerTurn.id,
+      });
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "interrupted");
+      assert.strictEqual(fake.log.filter((call) => call.path.endsWith("/interrupt")).length, 1);
+      assert.deepStrictEqual(fake.escapes, []);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("fails Stop at once with am's text on a refusal it cannot act on", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Refused"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      yield* deliver(fake, sent.messageId!, user("Refused"));
+      yield* harness.takeEvent("provider_session.updated");
+      const refusals = [
+        { error: "remote am too old on gapserver (unknown command)", reason: "remote_too_old" },
+        // An am from before reasons.
+        { error: "the agent is in a strange state" },
+      ];
+      for (const refusal of refusals) {
+        fake.messages.get(sent.messageId!)!.conflict = refusal;
+        const failure = yield* harness.runtime
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId: started.providerTurn.id,
+          })
+          .pipe(Effect.flip);
+        assert.include(String(failure.cause), refusal.error);
+      }
+      assert.strictEqual(fake.log.filter((call) => call.path.endsWith("/interrupt")).length, 2);
+      assert.deepStrictEqual(fake.escapes, []);
+      assert.isFalse(harness.allEvents.some((event) => event.type === "turn.terminal"));
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("fails a withdraw at once when am refuses the cancel without a reason", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, { ...idleAgent(), status: "working" });
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Later"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      fake.messages.get(sent.messageId!)!.conflict = { error: "cancel is not supported here" };
+      const failure = yield* harness.runtime
+        .interruptTurn({
+          providerThread: harness.providerThread,
+          providerTurnId: started.providerTurn.id,
+        })
+        .pipe(Effect.flip);
+      assert.include(String(failure.cause), "cancel is not supported here");
+      assert.strictEqual(fake.log.filter((call) => call.method === "DELETE").length, 1);
+      assert.strictEqual(fake.messages.get(sent.messageId!)?.state, "queued");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("ends the run as interrupted when the turn is aborted outside T3", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Long job"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      yield* deliver(fake, sent.messageId!, user("Long job"), assistant("Starting."));
+      yield* harness.takeItem((event) => event.turnItem.type === "assistant_message");
+      // `am interrupt` in a terminal: am ends the turn once the prompt is back.
+      yield* fake.receipt(sent.messageId!, (message, agent) => {
+        message.state = "done";
+        message.interrupted = true;
+        agent.status = "idle";
+      });
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(terminal.status, "interrupted");
+      assert.deepStrictEqual(harness.replies(), ["Starting."]);
+      assert.isFalse(fake.log.some((call) => call.path.endsWith("/interrupt")));
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("reports Stop as an interrupt when am already ended the turn after an Esc", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Aborted"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      yield* deliver(fake, sent.messageId!, user("Aborted"), assistant("Working."));
+      yield* harness.takeItem((event) => event.turnItem.type === "assistant_message");
+      // Aborted elsewhere without a wake reaching T3 first.
+      const message = fake.messages.get(sent.messageId!)!;
+      message.state = "done";
+      message.interrupted = true;
+      yield* harness.runtime.interruptTurn({
+        providerThread: harness.providerThread,
+        providerTurnId: started.providerTurn.id,
+      });
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(terminal.status, "interrupted");
+      assert.deepStrictEqual(fake.escapes, []);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("delivers a message sent after Stop once am drains the agent's queue", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "First try"));
+      const first = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      yield* deliver(fake, first.messageId!, user("First try"), assistant("Going the wrong way."));
+      yield* harness.takeItem((event) => event.turnItem.type === "assistant_message");
+      yield* harness.runtime.interruptTurn({
+        providerThread: harness.providerThread,
+        providerTurnId: started.providerTurn.id,
+      });
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "interrupted");
+      assert.isTrue(fake.messages.get(first.messageId!)?.interrupted);
+      assert.strictEqual(fake.agents.get(AGENT)?.status, "idle");
+
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Second try", 2));
+      const second = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      assert.deepStrictEqual(second.body, { text: "Second try", mode: "queue" });
+      const running = yield* harness.takeEvent(
+        "provider_turn.updated",
+        (event) => event.providerTurn.status === "running",
+      );
+      assert.notStrictEqual(running.providerTurn.id, started.providerTurn.id);
+      yield* fake.takeCall("GET", `/api/agents/${AGENT}/messages/${second.messageId}`);
+      // am drains the queue into the idle agent.
+      yield* deliver(fake, second.messageId!, user("Second try"), assistant("Done right."));
+      yield* complete(fake, second.messageId!);
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(terminal.status, "completed");
+      assert.strictEqual(terminal.providerTurnId, running.providerTurn.id);
+      assert.deepStrictEqual(harness.replies().slice(-1), ["Done right."]);
+      assert.deepStrictEqual(fake.escapes, [AGENT]);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.live("fails the run when am reports the message failed", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();

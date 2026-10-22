@@ -28,7 +28,14 @@ import {
   isAmLocalHostName,
   type AmSettings,
 } from "../settings.ts";
-import type { AmApi, AmApiError, AmMessageState, AmTranscriptEntry } from "./api.ts";
+import type {
+  AmApi,
+  AmApiError,
+  AmConflict,
+  AmMessageReceipt,
+  AmMessageState,
+  AmTranscriptEntry,
+} from "./api.ts";
 import {
   amAgentName,
   amAgentRef,
@@ -47,12 +54,17 @@ const AM_PROVIDER = ProviderDriverKind.make("am");
 /** Transcript indexes run past any real conversation; `after` beyond the end returns only the total. */
 const TRANSCRIPT_END = 1_000_000_000;
 const EVENT_RECONNECT_MS = 2_000;
-// am answers a cancel with `queued` while it is mid-delivery or its locks are busy, and an
-// interrupt with 409 while the mailbox is busy or the message's turn has not started yet.
+// am refuses a cancel while it is mid-delivery or its locks are busy, and an interrupt while the
+// mailbox is busy or the message's turn has not started yet; both are worth retrying.
 const CANCEL_RETRY_MS = 250;
 const CANCEL_ATTEMPTS = 40;
 const isSettled = (state: AmMessageState) =>
   state === "done" || state === "cancelled" || state === "failed";
+const SETTLED_BY_REASON = {
+  already_done: "done",
+  already_cancelled: "cancelled",
+  already_failed: "failed",
+} as const;
 // am launches agents with their provider's own full access; it has no restricted mode to map to.
 const FULL_ACCESS_ONLY = "Agent Motel only runs in Full access";
 
@@ -175,6 +187,8 @@ interface TrackedMessage {
   shownAt: number | undefined;
   /** am's reason, once the receipt is `failed`. */
   error?: string | undefined;
+  /** am ended its turn after an Esc, from T3's Stop or from anywhere else, rather than a finish. */
+  interrupted?: boolean;
 }
 
 const isPending = (message: TrackedMessage) =>
@@ -543,31 +557,57 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         }
         yield* Deferred.succeed(turn.done, undefined);
       });
+      const applyReceipt = (message: TrackedMessage, receipt: AmMessageReceipt) => {
+        message.state = receipt.state;
+        message.transcriptIndex = receipt.transcriptIndex ?? message.transcriptIndex;
+        message.error = receipt.error ?? message.error;
+        message.interrupted = receipt.state === "done" && receipt.interrupted === true;
+      };
+      /** Only the receipt says why a message failed, or whether a done turn was aborted. */
       const settle = Effect.fnUntraced(function* (message: TrackedMessage, state: AmMessageState) {
         message.state = state;
-        if (state !== "failed" || message.error !== undefined) return;
+        if (state === "failed" ? message.error !== undefined : state !== "done") return;
         const receipt = yield* api.getMessage(agentRef!, message.id).pipe(Effect.option);
-        if (receipt._tag === "Some") message.error = receipt.value.error ?? undefined;
+        if (receipt._tag === "Some" && receipt.value.state === state)
+          applyReceipt(message, receipt.value);
       });
+      /** A refusal T3 cannot act on, from an am too old to say why or with a reason it does not know. */
+      const refused = (refusal: AmConflict) =>
+        protocolError(`Agent Motel could not stop the agent: ${refusal.error}`);
       /** Cancels one message am has not delivered yet, waiting out a delivery in progress. */
       const withdrawMessage = Effect.fnUntraced(function* (message: TrackedMessage) {
         let withdrawn = false;
         for (let attempt = 1; message.state === "queued"; attempt++) {
           const result = yield* fromApi(api.cancelMessage(agentRef!, message.id));
-          if (result.cancelled || result.state !== "queued") {
-            withdrawn = result.cancelled;
-            yield* settle(message, result.cancelled ? "cancelled" : result.state);
+          if (result.cancelled) {
+            withdrawn = true;
+            yield* settle(message, "cancelled");
             break;
+          }
+          switch (result.reason) {
+            case "already_done":
+            case "already_cancelled":
+            case "already_failed":
+              yield* settle(message, SETTLED_BY_REASON[result.reason]);
+              return false;
+            // Delivered already, or handed over and awaiting am's confirmation.
+            case "already_delivered":
+              if (result.state === "delivered") {
+                message.state = "delivered";
+                return false;
+              }
+              break;
+            case "mailbox_busy":
+              break;
+            default:
+              return yield* refused(result);
           }
           if (attempt === CANCEL_ATTEMPTS)
             return yield* protocolError(
               "Agent Motel is still handing the message to the agent. Try Stop again.",
             );
           yield* Effect.sleep(CANCEL_RETRY_MS);
-          const receipt = yield* fromApi(api.getMessage(agentRef!, message.id));
-          message.state = receipt.state;
-          message.transcriptIndex = receipt.transcriptIndex ?? message.transcriptIndex;
-          message.error = receipt.error ?? message.error;
+          applyReceipt(message, yield* fromApi(api.getMessage(agentRef!, message.id)));
         }
         return withdrawn;
       });
@@ -591,17 +631,30 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           if (message.state !== "delivered") return false;
           const result = yield* fromApi(api.interruptMessage(agentRef!, message.id));
           if (result.interrupted) return true;
-          if (isSettled(result.state) || result.state === "queued") {
-            yield* settle(message, result.state);
-            continue;
+          switch (result.reason) {
+            case "not_delivered":
+              message.state = "queued";
+              continue;
+            case "already_done":
+            case "already_cancelled":
+            case "already_failed":
+              yield* settle(message, SETTLED_BY_REASON[result.reason]);
+              continue;
+            // Another Stop already sent this turn its Esc; a second one would rewind the TUI.
+            case "already_interrupted":
+              return true;
+            // The session ended with the turn; am fails the receipt rather than finishing it.
+            case "no_session":
+              return false;
+            // A busy mailbox, or a turn queued behind earlier work in the agent.
+            case "mailbox_busy":
+            case "not_started":
+              reason = result.error;
+              yield* Effect.sleep(CANCEL_RETRY_MS);
+              continue;
+            default:
+              return yield* refused(result);
           }
-          // Another Stop already sent this turn its Esc; a second one would rewind the TUI.
-          if (/already interrupted/.test(result.reason)) return true;
-          // The session ended with the turn; am fails the receipt rather than finishing it.
-          if (/no live tmux session/.test(result.reason)) return false;
-          // A busy mailbox, or a turn queued behind earlier work in the agent.
-          reason = result.reason;
-          yield* Effect.sleep(CANCEL_RETRY_MS);
         }
       });
       /** Follows T3's messages through am's receipts and publishes the transcript they produced. */
@@ -615,8 +668,9 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
             Effect.catchIf(
               (error) => error.status === 404,
               () =>
-                Effect.succeed({
-                  state: "failed" as const,
+                Effect.succeed<AmMessageReceipt>({
+                  id: message.id,
+                  state: "failed",
                   transcriptIndex: null,
                   error:
                     "Agent Motel no longer has a receipt for this message, for example after `am move`.",
@@ -625,9 +679,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           );
           if (active !== turn) return;
           const wasDelivered = message.state === "delivered" || message.transcriptIndex !== null;
-          message.state = receipt.state;
-          message.transcriptIndex = receipt.transcriptIndex ?? message.transcriptIndex;
-          message.error = receipt.error ?? message.error;
+          applyReceipt(message, receipt);
           if (receipt.state !== "failed") continue;
           // A message that failed after delivery lost its session mid-turn, taking the run with it.
           if (message === turn.messages[0] || wasDelivered || receipt.transcriptIndex !== null)
@@ -654,7 +706,12 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         const transcript = yield* api.transcript(ref, turn.cursor ?? TRANSCRIPT_END);
         if (active !== turn) return;
         yield* applyEntries(turn, transcript.entries, transcript.total, false);
-        if (!turn.messages.some(isPending)) return yield* finish(turn, "completed");
+        // am ends a turn aborted with Esc itself, whoever pressed it (`am interrupt` included).
+        if (!turn.messages.some(isPending))
+          return yield* finish(
+            turn,
+            turn.messages.some((message) => message.interrupted) ? "interrupted" : "completed",
+          );
         const phase = amTurnPhase(transcript.status);
         if (phase !== "attention") turn.inAttention = false;
         switch (phase) {
@@ -1033,9 +1090,9 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
             ),
         ),
         // A message am has not delivered is withdrawn, and a delivered one is interrupted by its id,
-        // so Esc never stops someone else's work. Esc stops the TUI's turn, but Claude Code runs no
-        // Stop hook for it, so am may keep reporting `working`. The run ends here instead of
-        // waiting for a receipt that may not come.
+        // so Esc never stops someone else's work. No provider runs a Stop hook for an Esc; am ends
+        // the turn and drains its queue once the prompt is back, but may never see it return, so
+        // the run ends here instead of waiting on the receipt.
         interruptTurn: Effect.fn("AmAdapterV2.interruptTurn")(
           function* (args) {
             const turn = active;
@@ -1052,7 +1109,11 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
               if (!stopped && message.state === "delivered")
                 stopped = yield* interruptDelivered(message);
             const failed = turn.messages.find((message) => message.state === "failed");
-            if (withdrew || stopped || turn.messages.some((message) => !isSettled(message.state)))
+            if (
+              withdrew ||
+              stopped ||
+              turn.messages.some((message) => !isSettled(message.state) || message.interrupted)
+            )
               return yield* finish(turn, "interrupted");
             // Everything had already ended before Stop reached am.
             if (failed)

@@ -30,7 +30,16 @@ export interface FakeMessage {
   unstartedInterrupts?: number;
   /** How many interrupts answer 409 because the mailbox is busy. */
   busyInterrupts?: number;
+  /** How many cancels answer 409 because the mailbox is busy. */
+  busyCancels?: number;
+  /** am sent this message's turn an Esc. */
+  escaped?: boolean;
+  /** The pane never returns to an empty prompt after the Esc, so am leaves the turn running. */
+  staysBusyAfterEsc?: boolean;
+  /** On a done receipt: am ended its turn after an Esc. */
   interrupted?: boolean;
+  /** The next cancel or interrupt answers this 409 instead, as an older or remote am might. */
+  conflict?: { readonly error: string; readonly reason?: string };
 }
 
 export interface FakeCall {
@@ -165,16 +174,38 @@ export const makeFakeAm = Effect.fnUntraced(function* (
           doneAt: message.state === "done" ? "2026-01-01T00:00:02.000Z" : null,
           transcriptIndex: message.transcriptIndex,
           ...(message.error ? { error: message.error } : {}),
+          ...(message.state === "done" && message.interrupted ? { interrupted: true } : {}),
         });
       if (method === "DELETE") {
+        if (message.conflict) {
+          const { conflict } = message;
+          delete message.conflict;
+          return json(res, 409, conflict);
+        }
+        if (message.busyCancels) {
+          message.busyCancels--;
+          return json(res, 409, {
+            error: `agent "${name}" mailbox is busy — retry the cancel`,
+            state: "queued",
+            reason: "mailbox_busy",
+          });
+        }
         if (message.deliveringOnCancel) {
           message.deliveringOnCancel = false;
           message.state = "delivered";
           message.transcriptIndex = agent.entries.length;
-          return json(res, 409, { error: "message is being delivered", state: "queued" });
+          return json(res, 409, {
+            error: `message ${id} is being delivered`,
+            state: "queued",
+            reason: "already_delivered",
+          });
         }
         if (message.state !== "queued")
-          return json(res, 409, { error: "already delivered", state: message.state });
+          return json(res, 409, {
+            error: `message ${id} is already ${message.state}`,
+            state: message.state,
+            reason: `already_${message.state}`,
+          });
         message.state = "cancelled";
         return json(res, 200, { ok: true, state: "cancelled" });
       }
@@ -189,24 +220,39 @@ export const makeFakeAm = Effect.fnUntraced(function* (
       const id = body.messageId;
       const message = messages.get(id);
       if (!message || message.agent !== name) return json(res, 404, { error: "no such message" });
-      const conflict = (error: string) => json(res, 409, { error, state: message.state });
+      const conflict = (error: string, reason: string) =>
+        json(res, 409, { error, state: message.state, reason });
+      if (message.conflict) {
+        const refusal = message.conflict;
+        delete message.conflict;
+        return json(res, 409, refusal);
+      }
       if (message.busyInterrupts) {
         message.busyInterrupts--;
-        return conflict(`agent "${name}" mailbox is busy — retry`);
+        return conflict(`agent "${name}" mailbox is busy — retry`, "mailbox_busy");
       }
+      if (message.state === "queued")
+        return conflict(`message ${id} is not delivered yet`, "not_delivered");
       if (message.state !== "delivered")
-        return conflict(
-          message.state === "queued"
-            ? `message ${id} is not delivered yet`
-            : `message ${id} is already ${message.state}`,
-        );
+        return conflict(`message ${id} is already ${message.state}`, `already_${message.state}`);
       if (message.unstartedInterrupts) {
         message.unstartedInterrupts--;
-        return conflict(`message ${id} has not started yet`);
+        return conflict(`message ${id} has not started yet`, "not_started");
       }
-      if (message.interrupted) return conflict(`message ${id} was already interrupted`);
-      message.interrupted = true;
+      if (message.escaped)
+        return conflict(`message ${id} was already interrupted`, "already_interrupted");
+      message.escaped = true;
       escapes.push(name);
+      // am answers once the pane is back at its prompt: the turn's receipts are done and
+      // interrupted, and the agent is idle, ready for its queue.
+      if (!message.staysBusyAfterEsc) {
+        for (const other of messages.values())
+          if (other.agent === name && other.state === "delivered") {
+            other.state = "done";
+            other.interrupted = true;
+          }
+        agent.status = "idle";
+      }
       return json(res, 200, { ok: true });
     }
     if (parts[2] === "stop" && method === "POST") return json(res, 200, { ok: true });

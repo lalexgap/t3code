@@ -59,8 +59,26 @@ export const AmMessageReceipt = Schema.Struct({
   /** The transcript length when am delivered the message; its output starts here. */
   transcriptIndex: Schema.NullOr(Schema.Number),
   error: Schema.optional(Schema.NullOr(Schema.String)),
+  /** Set on a `done` receipt whose turn was aborted with Esc rather than finished. */
+  interrupted: Schema.optional(Schema.Boolean),
 });
 export type AmMessageReceipt = typeof AmMessageReceipt.Type;
+
+/** Why am refused a message or interrupt route (HTTP 409). */
+export const AmConflictReason = Schema.Literals([
+  "not_delivered",
+  "already_done",
+  "already_cancelled",
+  "already_failed",
+  "not_started",
+  "already_interrupted",
+  "no_session",
+  "mailbox_busy",
+  "already_delivered",
+  "remote_too_old",
+]);
+export type AmConflictReason = typeof AmConflictReason.Type;
+const isConflictReason = Schema.is(AmConflictReason);
 
 export const AmHosts = Schema.Struct({
   local: Schema.String,
@@ -73,8 +91,12 @@ export type AmHealth = typeof AmHealth.Type;
 
 const SentMessage = Schema.Struct({ id: Schema.String });
 const ErrorBody = Schema.Struct({ error: Schema.String });
-const CancelConflict = Schema.Struct({ state: AmMessageState });
-const InterruptConflict = Schema.Struct({ error: Schema.String, state: AmMessageState });
+// A refusal relayed from a fleet host's am can lack a state, and an am older than reasons lacks one.
+const ConflictBody = Schema.Struct({
+  error: Schema.String,
+  state: Schema.optional(AmMessageState),
+  reason: Schema.optional(Schema.String),
+});
 // Starting an agent can wait on its provider (codex creates its thread up front), so allow
 // more than a plain read needs; a hung am must still not hold a T3 session open forever.
 const REQUEST_TIMEOUT_MS = 60_000;
@@ -98,14 +120,20 @@ export interface CreateAgentInput {
   readonly provider?: AmProvider;
 }
 
+/** am's 409. `reason` is undefined when am gave none T3 knows; `error` is am's own text. */
+export interface AmConflict {
+  readonly state: AmMessageState | undefined;
+  readonly reason: AmConflictReason | undefined;
+  readonly error: string;
+}
+
 export type AmCancelResult =
   | { readonly cancelled: true }
-  | { readonly cancelled: false; readonly state: AmMessageState };
+  | ({ readonly cancelled: false } & AmConflict);
 
-/** `reason` is am's explanation, which tells a busy mailbox or an unstarted turn from the rest. */
 export type AmInterruptResult =
   | { readonly interrupted: true }
-  | { readonly interrupted: false; readonly state: AmMessageState; readonly reason: string };
+  | ({ readonly interrupted: false } & AmConflict);
 
 /** Agent routes take a bare name or `host:name` for an agent on a fleet host. */
 export interface AmApi {
@@ -198,6 +226,14 @@ export const makeAmApi = (
       : rejected(operation, response);
   const expectOk = (operation: string) => (response: HttpClientResponse.HttpClientResponse) =>
     response.status >= 200 && response.status < 300 ? Effect.void : rejected(operation, response);
+  const conflict = (operation: string, response: HttpClientResponse.HttpClientResponse) =>
+    decodeBody(operation, ConflictBody, response).pipe(
+      Effect.map(({ error, state, reason }): AmConflict => ({
+        error,
+        state,
+        reason: isConflictReason(reason) ? reason : undefined,
+      })),
+    );
   const agentPath = (ref: string, suffix = "") => `/agents/${encodeURIComponent(ref)}${suffix}`;
   const post = (operation: string, path: string, body: unknown) =>
     send(operation, HttpClientRequest.post(path).pipe(HttpClientRequest.bodyJsonUnsafe(body))).pipe(
@@ -257,8 +293,8 @@ export const makeAmApi = (
       ).pipe(
         Effect.flatMap((response): Effect.Effect<AmCancelResult, AmApiError> =>
           response.status === 409
-            ? decodeBody("message cancel", CancelConflict, response).pipe(
-                Effect.map(({ state }) => ({ cancelled: false, state })),
+            ? conflict("message cancel", response).pipe(
+                Effect.map((refusal) => ({ cancelled: false as const, ...refusal })),
               )
             : expectOk("message cancel")(response).pipe(Effect.as({ cancelled: true })),
         ),
@@ -272,8 +308,8 @@ export const makeAmApi = (
       ).pipe(
         Effect.flatMap((response): Effect.Effect<AmInterruptResult, AmApiError> =>
           response.status === 409
-            ? decodeBody("interrupt", InterruptConflict, response).pipe(
-                Effect.map(({ error, state }) => ({ interrupted: false, state, reason: error })),
+            ? conflict("interrupt", response).pipe(
+                Effect.map((refusal) => ({ interrupted: false as const, ...refusal })),
               )
             : expectOk("interrupt")(response).pipe(Effect.as({ interrupted: true })),
         ),
