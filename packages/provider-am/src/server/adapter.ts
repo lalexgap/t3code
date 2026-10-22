@@ -157,6 +157,8 @@ interface ActiveTurn {
   nextOrdinal: number;
   readonly sent: Array<string>;
   delivered: boolean;
+  /** am can list the delivered prompt while still reporting the idle it had before it. */
+  workSeen: boolean;
   attentionEpisodes: number;
   inAttention: boolean;
   readonly done: Deferred.Deferred<void>;
@@ -394,6 +396,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           const previous = turn.published.get(entry.index);
           if (previous?.settled === settled && sameEntry(previous.entry, entry)) continue;
           turn.published.set(entry.index, { entry, settled });
+          if (entry.kind !== "user") turn.workSeen = true;
           yield* publishEntry(turn, entry, settled);
         }
         const open = turn.delivered
@@ -486,6 +489,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         if (active !== turn) return;
         yield* applyEntries(turn, transcript.entries, transcript.total, false);
         const phase = amTurnPhase(transcript.status);
+        if (turn.delivered && (phase === "running" || phase === "attention")) turn.workSeen = true;
         if (phase !== "attention") turn.inAttention = false;
         switch (phase) {
           case "running":
@@ -504,7 +508,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
             );
           }
           case "idle":
-            if (turn.delivered) yield* finish(turn, "completed");
+            if (turn.workSeen) yield* finish(turn, "completed");
             return;
           case "gone":
             return yield* finish(
@@ -676,6 +680,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           nextOrdinal: turnInput.providerTurnOrdinal * 100 + 1,
           sent: [text],
           delivered: false,
+          workSeen: false,
           attentionEpisodes: 0,
           inAttention: false,
           done: yield* Deferred.make<void>(),

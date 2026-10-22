@@ -320,6 +320,38 @@ describe("AmAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.live("waits for work after its prompt lands while am still reports idle", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, { status: "idle", dir: CWD, provider: "claude", entries: [] });
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Quick check"));
+      yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      yield* fake.takeCall("GET", `/api/agents/${AGENT}/transcript`);
+
+      yield* fake.update(AGENT, (agent) => {
+        agent.entries.push(user("Quick check"));
+      });
+      yield* fake.takeCall("GET", `/api/agents/${AGENT}/transcript`);
+      // A second read is either another sync or an early finish's last read; both precede the reply.
+      yield* fake.update(AGENT, () => {});
+      yield* fake.takeCall("GET", `/api/agents/${AGENT}/transcript`);
+
+      yield* fake.update(AGENT, (agent) => {
+        agent.entries.push(assistant("All good."));
+      });
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
+      assert.isTrue(
+        harness.allEvents.some(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "assistant_message" &&
+            event.turnItem.text === "All good.",
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.live("runs only in Full access", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();
