@@ -19,7 +19,8 @@ export const AmSettings = makeProviderSettingsSchema(
       Schema.withDecodingDefault(Effect.succeed("")),
       Schema.annotateKey({
         title: "API URL",
-        description: "Where `am serve` listens. Leave blank for the local default.",
+        description:
+          "Where `am serve` listens, over http or https. T3 Code sends the API token there. Leave blank for the local default.",
         providerSettingsForm: { placeholder: AM_DEFAULT_API_URL, clearWhenEmpty: "omit" },
       }),
     ),
@@ -32,10 +33,23 @@ export const AmSettings = makeProviderSettingsSchema(
         providerSettingsForm: { control: "password", clearWhenEmpty: "omit" },
       }),
     ),
+    host: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Fleet host",
+        description:
+          "Run agents on this host from am's `remotes`. Leave blank for the machine running `am serve`.",
+        providerSettingsForm: { placeholder: "this machine", clearWhenEmpty: "omit" },
+      }),
+    ),
   },
-  { order: ["apiUrl", "apiToken"] },
+  { order: ["apiUrl", "apiToken", "host"] },
 );
 export type AmSettings = typeof AmSettings.Type;
 
 export const amApiUrl = (settings: Pick<AmSettings, "apiUrl">) =>
   (settings.apiUrl || AM_DEFAULT_API_URL).replace(/\/+$/, "");
+
+/** The bearer token goes to this URL, so only plain web origins are accepted. */
+export const isAmApiUrlAllowed = (settings: Pick<AmSettings, "apiUrl">) =>
+  /^https?:\/\/[^/]/i.test(amApiUrl(settings));

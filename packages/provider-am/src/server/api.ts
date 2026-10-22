@@ -41,7 +41,34 @@ export const AmAgentDetail = Schema.Struct({
 });
 export type AmAgentDetail = typeof AmAgentDetail.Type;
 
+export const AmMessageState = Schema.Literals([
+  "queued",
+  "delivered",
+  "done",
+  "cancelled",
+  "failed",
+]);
+export type AmMessageState = typeof AmMessageState.Type;
+
+/** am's delivery receipt for one message sent through `am serve`. */
+export const AmMessageReceipt = Schema.Struct({
+  id: Schema.String,
+  state: AmMessageState,
+  /** The transcript length when am delivered the message; its output starts here. */
+  transcriptIndex: Schema.NullOr(Schema.Number),
+  error: Schema.optional(Schema.NullOr(Schema.String)),
+});
+export type AmMessageReceipt = typeof AmMessageReceipt.Type;
+
+export const AmHosts = Schema.Struct({
+  local: Schema.String,
+  hosts: Schema.Array(Schema.Struct({ name: Schema.String, reachable: Schema.Boolean })),
+});
+export type AmHosts = typeof AmHosts.Type;
+
+const SentMessage = Schema.Struct({ id: Schema.String });
 const ErrorBody = Schema.Struct({ error: Schema.String });
+const CancelConflict = Schema.Struct({ state: AmMessageState });
 // Starting an agent can wait on its provider (codex creates its thread up front), so allow
 // more than a plain read needs; a hung am must still not hold a T3 session open forever.
 const REQUEST_TIMEOUT_MS = 60_000;
@@ -59,21 +86,32 @@ export class AmApiError extends Schema.TaggedError<AmApiError>()("AmApiError", {
 
 export interface CreateAgentInput {
   readonly name: string;
-  readonly task?: string;
+  /** A fleet host from am's `remotes`; absent starts the agent on am's own machine. */
+  readonly host?: string;
   readonly dir: string;
   readonly provider?: AmProvider;
 }
 
+export type AmCancelResult =
+  | { readonly cancelled: true }
+  | { readonly cancelled: false; readonly state: AmMessageState };
+
+/** Agent routes take a bare name or `host:name` for an agent on a fleet host. */
 export interface AmApi {
   readonly health: Effect.Effect<void, AmApiError>;
-  /** None when am has no local agent with this name. */
-  readonly getAgent: (name: string) => Effect.Effect<Option.Option<AmAgentDetail>, AmApiError>;
+  readonly hosts: Effect.Effect<AmHosts, AmApiError>;
+  /** None when am has no agent with this name. */
+  readonly getAgent: (ref: string) => Effect.Effect<Option.Option<AmAgentDetail>, AmApiError>;
   readonly createAgent: (input: CreateAgentInput) => Effect.Effect<void, AmApiError>;
+  /** Returns the message's receipt id. */
   readonly sendMessage: (
-    name: string,
+    ref: string,
     text: string,
     mode: "queue" | "now",
-  ) => Effect.Effect<void, AmApiError>;
+  ) => Effect.Effect<string, AmApiError>;
+  readonly getMessage: (ref: string, id: string) => Effect.Effect<AmMessageReceipt, AmApiError>;
+  /** Cancels a still-queued message; otherwise reports the state that prevented it. */
+  readonly cancelMessage: (ref: string, id: string) => Effect.Effect<AmCancelResult, AmApiError>;
   readonly interrupt: (name: string) => Effect.Effect<void, AmApiError>;
   readonly resume: (name: string) => Effect.Effect<void, AmApiError>;
   readonly transcript: (name: string, after: number) => Effect.Effect<AmTranscript, AmApiError>;
@@ -121,23 +159,28 @@ export const makeAmApi = (
     );
     return yield* new AmApiError({ operation, status: response.status, detail: body });
   });
+  const decodeBody = <A, I>(
+    operation: string,
+    schema: Schema.Codec<A, I>,
+    response: HttpClientResponse.HttpClientResponse,
+    detail = "unreadable response",
+  ) =>
+    response.json.pipe(
+      Effect.flatMap(Schema.decodeUnknownEffect(schema)),
+      Effect.mapError(() => new AmApiError({ operation, status: response.status, detail })),
+    );
   const decode = <A, I>(
     operation: string,
     schema: Schema.Codec<A, I>,
     response: HttpClientResponse.HttpClientResponse,
+    detail?: string,
   ) =>
     response.status >= 200 && response.status < 300
-      ? response.json.pipe(
-          Effect.flatMap(Schema.decodeUnknownEffect(schema)),
-          Effect.mapError(
-            () =>
-              new AmApiError({ operation, status: response.status, detail: "unreadable response" }),
-          ),
-        )
+      ? decodeBody(operation, schema, response, detail)
       : rejected(operation, response);
   const expectOk = (operation: string) => (response: HttpClientResponse.HttpClientResponse) =>
     response.status >= 200 && response.status < 300 ? Effect.void : rejected(operation, response);
-  const agentPath = (name: string, suffix = "") => `/agents/${encodeURIComponent(name)}${suffix}`;
+  const agentPath = (ref: string, suffix = "") => `/agents/${encodeURIComponent(ref)}${suffix}`;
   const post = (operation: string, path: string, body: unknown) =>
     send(operation, HttpClientRequest.post(path).pipe(HttpClientRequest.bodyJsonUnsafe(body))).pipe(
       Effect.flatMap(expectOk(operation)),
@@ -147,8 +190,11 @@ export const makeAmApi = (
     health: send("health check", HttpClientRequest.get("/health")).pipe(
       Effect.flatMap(expectOk("health check")),
     ),
-    getAgent: (name) =>
-      send("agent lookup", HttpClientRequest.get(agentPath(name))).pipe(
+    hosts: send("host list", HttpClientRequest.get("/hosts")).pipe(
+      Effect.flatMap((response) => decode("host list", AmHosts, response)),
+    ),
+    getAgent: (ref) =>
+      send("agent lookup", HttpClientRequest.get(agentPath(ref))).pipe(
         Effect.flatMap((response) =>
           response.status === 404
             ? Effect.succeedNone
@@ -161,17 +207,50 @@ export const makeAmApi = (
         dir: input.dir,
         // T3 already owns the thread's worktree.
         inPlace: true,
-        ...(input.task ? { task: input.task } : {}),
+        ...(input.host ? { host: input.host } : {}),
         ...(input.provider ? { provider: input.provider } : {}),
       }),
-    sendMessage: (name, text, mode) =>
-      post("message", agentPath(name, "/messages"), { text, mode }),
-    interrupt: (name) => post("interrupt", agentPath(name, "/interrupt"), {}),
-    resume: (name) => post("resume", agentPath(name, "/resume"), {}),
-    transcript: (name, after) =>
+    sendMessage: (ref, text, mode) =>
+      send(
+        "message",
+        HttpClientRequest.post(agentPath(ref, "/messages")).pipe(
+          HttpClientRequest.bodyJsonUnsafe({ text, mode }),
+        ),
+      ).pipe(
+        Effect.flatMap((response) =>
+          decode(
+            "message",
+            SentMessage,
+            response,
+            "this am reports no message receipts; update it",
+          ),
+        ),
+        Effect.map((sent) => sent.id),
+      ),
+    getMessage: (ref, id) =>
+      send(
+        "message lookup",
+        HttpClientRequest.get(agentPath(ref, `/messages/${encodeURIComponent(id)}`)),
+      ).pipe(Effect.flatMap((response) => decode("message lookup", AmMessageReceipt, response))),
+    cancelMessage: (ref, id) =>
+      send(
+        "message cancel",
+        HttpClientRequest.delete(agentPath(ref, `/messages/${encodeURIComponent(id)}`)),
+      ).pipe(
+        Effect.flatMap((response): Effect.Effect<AmCancelResult, AmApiError> =>
+          response.status === 409
+            ? decodeBody("message cancel", CancelConflict, response).pipe(
+                Effect.map(({ state }) => ({ cancelled: false, state })),
+              )
+            : expectOk("message cancel")(response).pipe(Effect.as({ cancelled: true })),
+        ),
+      ),
+    interrupt: (ref) => post("interrupt", agentPath(ref, "/interrupt"), {}),
+    resume: (ref) => post("resume", agentPath(ref, "/resume"), {}),
+    transcript: (ref, after) =>
       send(
         "transcript read",
-        HttpClientRequest.get(agentPath(name, "/transcript")).pipe(
+        HttpClientRequest.get(agentPath(ref, "/transcript")).pipe(
           HttpClientRequest.setUrlParam("after", String(after)),
         ),
       ).pipe(Effect.flatMap((response) => decode("transcript read", AmTranscript, response))),

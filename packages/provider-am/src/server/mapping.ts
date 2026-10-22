@@ -33,6 +33,16 @@ export const amAgentName = (threadId: string, title?: string) => {
   return `t3-${slug ? `${slug}-` : ""}${fnv1a(threadId)}`;
 };
 
+/** am addresses an agent on a fleet host as `host:name`; names never contain a colon. */
+export const amAgentRef = (host: string, name: string) => (host ? `${host}:${name}` : name);
+
+export const parseAmAgentRef = (ref: string) => {
+  const colon = ref.indexOf(":");
+  return colon === -1
+    ? { host: undefined, name: ref }
+    : { host: ref.slice(0, colon), name: ref.slice(colon + 1) };
+};
+
 export type AmTurnPhase = "running" | "idle" | "attention" | "gone";
 
 /**
@@ -52,36 +62,6 @@ export const amTurnPhase = (status: string): AmTurnPhase => {
     default:
       return "running";
   }
-};
-
-const normalize = (text: string) => text.replace(/\s+/g, " ").trim();
-
-// am's attribution envelope (agent-motel comms.ts formatEnvelope), added when `am serve` runs
-// with an inherited agent identity.
-const AM_ENVELOPE = /^\[am · from [^\]]+\] /;
-
-/** Below this, containment matches unrelated text (`yes` inside `yesterday`). */
-const MIN_CONTAINMENT_CHARS = 24;
-
-/**
- * Whether a transcript user entry is a message T3 typed into the agent. Providers can wrap or
- * split long text, so long messages compare on a normalized prefix; short ones must be equal.
- */
-const matchesMessage = (entry: string, message: string) => {
-  if (entry === message) return true;
-  if (entry.length < MIN_CONTAINMENT_CHARS || message.length < MIN_CONTAINMENT_CHARS) return false;
-  return entry.includes(message.slice(0, 200)) || message.includes(entry.slice(0, 200));
-};
-
-export const isSentMessage = (entryText: string, sent: ReadonlyArray<string>) => {
-  const raw = normalize(entryText);
-  if (!raw) return false;
-  const unwrapped = raw.replace(AM_ENVELOPE, "");
-  return sent.some((text) => {
-    const message = normalize(text);
-    if (!message) return false;
-    return matchesMessage(raw, message) || (!!unwrapped && matchesMessage(unwrapped, message));
-  });
 };
 
 const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
@@ -155,9 +135,9 @@ const decodeFleetEvent = Schema.decodeUnknownOption(
 );
 
 /** Fleet events name the agent they concern; file-watch events name none and may concern any. */
-export const fleetEventConcerns = (data: string, agentName: string) => {
+export const fleetEventConcerns = (data: string, agentRef: string) => {
   const event = decodeFleetEvent(data);
-  return (
-    event._tag === "None" || event.value.agent === undefined || event.value.agent === agentName
-  );
+  if (event._tag === "None" || event.value.agent === undefined) return true;
+  // A remote agent's event may carry its bare name; a stray wake only costs a read.
+  return event.value.agent === agentRef || event.value.agent === parseAmAgentRef(agentRef).name;
 };

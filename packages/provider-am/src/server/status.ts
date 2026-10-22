@@ -8,8 +8,8 @@ import {
   DEFAULT_TIMEOUT_MS,
   type ProviderProbeResult,
 } from "@t3tools/provider-core/server/snapshotProbe";
-import type { AmSettings } from "../settings.ts";
-import type { AmApi } from "./api.ts";
+import { isAmApiUrlAllowed, type AmSettings } from "../settings.ts";
+import type { AmApi, AmApiError, AmHosts } from "./api.ts";
 import { AM_DEFAULT_MODEL } from "./mapping.ts";
 
 const AM_PRESENTATION = {
@@ -58,12 +58,23 @@ export const makePendingAmProvider = (settings: AmSettings) =>
       : "Agent Motel is disabled in T3 Code settings.",
   });
 
-/** Only `GET /api/health`: a status check never starts or touches an agent. */
+/**
+ * Only `GET /api/health`, or `GET /api/hosts` for a fleet host: a status check never starts or
+ * touches an agent.
+ */
 export const checkAmProviderStatus = Effect.fn("checkAmProviderStatus")(function* (
   settings: AmSettings,
   api: AmApi,
 ) {
   if (!settings.enabled) return yield* makePendingAmProvider(settings);
+  if (!isAmApiUrlAllowed(settings))
+    return yield* snapshot(true, {
+      installed: false,
+      version: null,
+      status: "error",
+      auth: { status: "unknown" },
+      message: "The Agent Motel API URL must start with http:// or https://.",
+    });
   if (!settings.apiToken)
     return yield* snapshot(true, {
       installed: false,
@@ -72,15 +83,37 @@ export const checkAmProviderStatus = Effect.fn("checkAmProviderStatus")(function
       auth: { status: "unauthenticated" },
       message: "Add the API token that `am serve` printed to connect to Agent Motel.",
     });
-  const health = yield* api.health.pipe(Effect.timeout(DEFAULT_TIMEOUT_MS), Effect.result);
-  if (Result.isSuccess(health))
+  // A fleet host's reachability comes from am's cached fleet state, so no ssh runs here.
+  const probe: Effect.Effect<AmHosts | undefined, AmApiError> = settings.host
+    ? api.hosts
+    : api.health.pipe(Effect.as(undefined));
+  const reached = yield* probe.pipe(Effect.timeout(DEFAULT_TIMEOUT_MS), Effect.result);
+  if (Result.isSuccess(reached)) {
+    const fleetHost = reached.success?.hosts.find((host) => host.name === settings.host);
+    if (settings.host && !fleetHost)
+      return yield* snapshot(true, {
+        installed: false,
+        version: null,
+        status: "error",
+        auth: { status: "authenticated" },
+        message: `Agent Motel has no fleet host "${settings.host}". Add it to am's \`remotes\`.`,
+      });
+    if (fleetHost && !fleetHost.reachable)
+      return yield* snapshot(true, {
+        installed: true,
+        version: null,
+        status: "warning",
+        auth: { status: "authenticated" },
+        message: `Agent Motel cannot reach ${settings.host} right now.`,
+      });
     return yield* snapshot(true, {
       installed: true,
       version: null,
       status: "ready",
       auth: { status: "authenticated" },
     });
-  const error = health.failure;
+  }
+  const error = reached.failure;
   if (error._tag === "AmApiError" && error.status === 401)
     return yield* snapshot(true, {
       installed: true,
@@ -95,8 +128,10 @@ export const checkAmProviderStatus = Effect.fn("checkAmProviderStatus")(function
     status: "error",
     auth: { status: "unknown" },
     message:
-      error._tag === "AmApiError" && error.status !== null
-        ? `Agent Motel answered HTTP ${error.status}. Check the API URL.`
-        : "Agent Motel is unreachable. Start `am serve` on this host or check the API URL.",
+      error._tag === "AmApiError" && error.status === 404 && settings.host
+        ? "This Agent Motel has no fleet hosts API. Update am to use a fleet host."
+        : error._tag === "AmApiError" && error.status !== null
+          ? `Agent Motel answered HTTP ${error.status}. Check the API URL.`
+          : "Agent Motel is unreachable. Start `am serve` on this host or check the API URL.",
   });
 });

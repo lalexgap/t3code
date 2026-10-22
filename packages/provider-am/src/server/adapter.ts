@@ -22,17 +22,18 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { providerMessageTextWithAttachmentPaths } from "@t3tools/provider-core/server/attachmentPrompt";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
-import type { AmSettings } from "../settings.ts";
-import type { AmApi, AmApiError, AmTranscriptEntry } from "./api.ts";
+import { isAmApiUrlAllowed, type AmSettings } from "../settings.ts";
+import type { AmApi, AmApiError, AmMessageState, AmTranscriptEntry } from "./api.ts";
 import {
   amAgentName,
+  amAgentRef,
   amEntryStatus,
   amProviderForModel,
   amToolPresentation,
   amTurnPhase,
   fleetEventConcerns,
   isEntryOpen,
-  isSentMessage,
+  parseAmAgentRef,
   sameEntry,
 } from "./mapping.ts";
 
@@ -41,6 +42,9 @@ const AM_PROVIDER = ProviderDriverKind.make("am");
 /** Transcript indexes run past any real conversation; `after` beyond the end returns only the total. */
 const TRANSCRIPT_END = 1_000_000_000;
 const EVENT_RECONNECT_MS = 2_000;
+// am answers a cancel with `queued` while it is mid-delivery or its locks are busy.
+const CANCEL_RETRY_MS = 250;
+const CANCEL_ATTEMPTS = 40;
 // am launches agents with their provider's own full access; it has no restricted mode to map to.
 const FULL_ACCESS_ONLY = "Agent Motel only runs in Full access";
 
@@ -137,6 +141,13 @@ const AmProviderCapabilitiesV2 = {
   },
 } satisfies OrchestrationV2ProviderCapabilities;
 
+// A fleet-host agent edits that host's copy of the project, so T3's checkpoints of its own copy
+// would not contain the agent's work.
+const amCapabilities = (remote: boolean): OrchestrationV2ProviderCapabilities => ({
+  ...AmProviderCapabilitiesV2,
+  checkpointing: { ...AmProviderCapabilitiesV2.checkpointing, appCanCheckpointFilesystem: !remote },
+});
+
 export interface AmAdapterV2Options {
   readonly instanceId: ProviderInstanceId;
   readonly settings: AmSettings;
@@ -145,26 +156,36 @@ export interface AmAdapterV2Options {
   readonly pollIntervalMs?: number;
 }
 
+/** A message T3 sent, followed through am's delivery receipt. */
+interface TrackedMessage {
+  readonly id: string;
+  readonly mode: "queue" | "now";
+  state: AmMessageState;
+  /** The transcript length when am delivered it. */
+  transcriptIndex: number | null;
+  /** The transcript user entry that shows this message, once seen. */
+  shownAt: number | undefined;
+}
+
+const isPending = (message: TrackedMessage) =>
+  message.state === "queued" || message.state === "delivered";
+
 interface ActiveTurn {
   readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
   providerTurn: OrchestrationV2ProviderTurn;
-  /** The transcript length at send, then the index of T3's own prompt once am delivers it. */
-  startIndex: number;
-  /** Lowest transcript index that can still change. */
-  cursor: number;
+  /** The prompt first, then any steering; the run ends when every one of them has. */
+  readonly messages: Array<TrackedMessage>;
+  /** Lowest transcript index that can still change; unset until am delivers the prompt. */
+  cursor: number | undefined;
   readonly published: Map<number, { readonly entry: AmTranscriptEntry; readonly settled: boolean }>;
   readonly ordinals: Map<string, number>;
   nextOrdinal: number;
-  readonly sent: Array<string>;
-  /** am may wrap a new agent's task in launch instructions, so its first prompt is T3's by construction. */
-  readonly createdAgent: boolean;
-  delivered: boolean;
-  /** am can list the delivered prompt while still reporting the idle it had before it. */
-  workSeen: boolean;
   attentionEpisodes: number;
   inAttention: boolean;
   readonly done: Deferred.Deferred<void>;
 }
+
+const trimSlashes = (path: string) => path.replace(/\/+$/, "");
 
 const nativeRef = (nativeId: string, strength: "strong" | "weak" = "strong") => ({
   driver: AM_PROVIDER,
@@ -178,6 +199,8 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const providerHost = yield* ProviderHost.ProviderHost;
   const { api } = options;
+  const remote = options.settings.host !== "";
+  const capabilities = amCapabilities(remote);
   const protocolError = (detail: string, cause?: unknown) =>
     new ProviderAdapter.ProviderAdapterProtocolError({
       driver: AM_PROVIDER,
@@ -190,7 +213,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
   return ProviderAdapter.ProviderAdapterV2.of({
     instanceId: options.instanceId,
     driver: AM_PROVIDER,
-    getCapabilities: () => Effect.succeed(AmProviderCapabilitiesV2),
+    getCapabilities: () => Effect.succeed(capabilities),
     planSelectionTransition: (input) =>
       Effect.succeed(
         input.current.model === input.target.model
@@ -204,6 +227,8 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
       input: ProviderAdapter.ProviderAdapterV2OpenSessionInput,
     ) {
       if (!options.settings.enabled) return yield* protocolError("Agent Motel is disabled");
+      if (!isAmApiUrlAllowed(options.settings))
+        return yield* protocolError("The Agent Motel API URL must start with http:// or https://");
       if (input.runtimePolicy.interactionMode === "plan")
         return yield* protocolError("Agent Motel does not support Plan mode");
       if (input.runtimePolicy.runtimeMode !== "full-access")
@@ -218,7 +243,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         status: "ready",
         cwd,
         model: input.modelSelection.model,
-        capabilities: AmProviderCapabilitiesV2,
+        capabilities,
         createdAt: now,
         updatedAt: now,
         lastError: null,
@@ -230,7 +255,8 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
       const wake = yield* Queue.sliding<void>(1);
       const lock = yield* Semaphore.make(1);
       let thread: OrchestrationV2ProviderThread | undefined;
-      let agentName: string | undefined;
+      /** The agent's am address: its name, or `host:name` on a fleet host. */
+      let agentRef: string | undefined;
       let active: ActiveTurn | undefined;
       let closed = false;
 
@@ -262,7 +288,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
 
       const baseItem = (turn: ActiveTurn, key: string, time: DateTime.Utc) => {
         if (!turn.ordinals.has(key)) turn.ordinals.set(key, turn.nextOrdinal++);
-        const identity = `${options.instanceId}:${agentName}:${key}`;
+        const identity = `${options.instanceId}:${agentRef}:${key}`;
         return {
           id: idAllocator.derive.turnItemFromProviderItem({
             driver: AM_PROVIDER,
@@ -277,7 +303,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           runId: turn.input.runId,
           providerThreadId: turn.input.providerThread.id,
           providerTurnId: turn.providerTurn.id,
-          nativeItemRef: nativeRef(`${agentName}:${key}`, "weak"),
+          nativeItemRef: nativeRef(`${agentRef}:${key}`, "weak"),
           parentItemId: null,
           ordinal: turn.ordinals.get(key)!,
           startedAt: time,
@@ -305,13 +331,30 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           },
         });
       });
+      // am marks the transcript just before typing a message. A queued one reaches an idle agent,
+      // so its entry comes before any reply; delivery through Claude's Stop-hook inbox shows no
+      // entry, so once the reply starts it claims nothing later. A `now` message is typed into a
+      // busy agent, which records it at its next step.
+      const isOwnMessage = (turn: ActiveTurn, index: number) => {
+        if (turn.messages.some((message) => message.shownAt === index)) return true;
+        const owner = turn.messages.find((message) => {
+          const from = message.transcriptIndex;
+          if (message.shownAt !== undefined || from === null || index < from) return false;
+          if (message.mode === "now") return true;
+          for (let earlier = from; earlier < index; earlier++)
+            if (turn.published.get(earlier)?.entry.kind !== "user") return false;
+          return true;
+        });
+        if (owner) owner.shownAt = index;
+        return owner !== undefined;
+      };
       const publishEntry = Effect.fnUntraced(function* (
         turn: ActiveTurn,
         entry: AmTranscriptEntry,
         settled: boolean,
       ) {
         if (entry.kind === "user") {
-          if (isSentMessage(entry.text ?? "", turn.sent)) return;
+          if (isOwnMessage(turn, entry.index)) return;
           // Someone else reached the agent through am (another agent, or its terminal).
           if (entry.text?.trim())
             yield* emitNotice(turn, `${entry.index}`, "Message to the agent", entry.text);
@@ -385,30 +428,19 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         total: number,
         settled: boolean,
       ) {
+        const start = turn.messages[0]?.transcriptIndex;
+        // Before am delivers the prompt, the transcript belongs to work that came before it.
+        if (start === null || start === undefined) return;
         for (const entry of entries) {
-          if (entry.index < turn.startIndex) continue;
-          // Until T3's prompt shows up, the transcript belongs to work that came before it.
-          if (!turn.delivered) {
-            if (
-              entry.kind === "user" &&
-              (turn.createdAgent || isSentMessage(entry.text ?? "", turn.sent))
-            ) {
-              turn.delivered = true;
-              turn.startIndex = entry.index;
-            }
-            continue;
-          }
+          if (entry.index < start) continue;
           const previous = turn.published.get(entry.index);
           if (previous?.settled === settled && sameEntry(previous.entry, entry)) continue;
           turn.published.set(entry.index, { entry, settled });
-          if (entry.kind !== "user") turn.workSeen = true;
           yield* publishEntry(turn, entry, settled);
         }
-        const open = turn.delivered
-          ? entries.filter((entry) => entry.index >= turn.startIndex && isEntryOpen(entry))
-          : [];
+        const open = entries.filter((entry) => entry.index >= start && isEntryOpen(entry));
         turn.cursor = Math.max(
-          turn.startIndex,
+          start,
           open.length > 0 ? Math.min(...open.map((entry) => entry.index)) : total,
         );
       });
@@ -419,7 +451,10 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
       ) {
         if (active !== turn) return;
         // One last read so open tools settle and the closing reply lands in this run.
-        const last = yield* api.transcript(agentName!, turn.cursor).pipe(Effect.option);
+        const last =
+          turn.cursor === undefined
+            ? Option.none()
+            : yield* api.transcript(agentRef!, turn.cursor).pipe(Effect.option);
         if (last._tag === "Some")
           yield* applyEntries(turn, last.value.entries, last.value.total, true);
         else
@@ -486,15 +521,75 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         }
         yield* Deferred.succeed(turn.done, undefined);
       });
-      /** Reads the agent's transcript and status, and settles the turn when am says it is done. */
+      /** Cancels T3's messages am has not delivered yet; reports whether any was delivered. */
+      const withdraw = Effect.fnUntraced(function* (turn: ActiveTurn) {
+        let delivered = false;
+        for (const message of [...turn.messages].reverse()) {
+          for (let attempt = 1; message.state === "queued"; attempt++) {
+            const result = yield* fromApi(api.cancelMessage(agentRef!, message.id));
+            if (result.cancelled || result.state !== "queued") {
+              message.state = result.cancelled ? "cancelled" : result.state;
+              break;
+            }
+            if (attempt === CANCEL_ATTEMPTS)
+              return yield* protocolError(
+                "Agent Motel is still handing the message to the agent. Try Stop again.",
+              );
+            yield* Effect.sleep(CANCEL_RETRY_MS);
+            const receipt = yield* fromApi(api.getMessage(agentRef!, message.id));
+            message.state = receipt.state;
+            message.transcriptIndex = receipt.transcriptIndex ?? message.transcriptIndex;
+          }
+          if (message.state === "delivered") delivered = true;
+        }
+        return delivered;
+      });
+      /** Follows T3's messages through am's receipts and publishes the transcript they produced. */
       const sync = Effect.fnUntraced(function* () {
         const turn = active;
-        if (!turn || !agentName || closed) return;
-        const transcript = yield* api.transcript(agentName, turn.cursor);
+        if (!turn || !agentRef || closed) return;
+        const ref = agentRef;
+        for (const message of turn.messages) {
+          if (!isPending(message)) continue;
+          const receipt = yield* api.getMessage(ref, message.id).pipe(
+            Effect.catchIf(
+              (error) => error.status === 404,
+              () =>
+                Effect.succeed({
+                  state: "failed" as const,
+                  transcriptIndex: null,
+                  error:
+                    "Agent Motel no longer has a receipt for this message, for example after `am move`.",
+                }),
+            ),
+          );
+          if (active !== turn) return;
+          message.state = receipt.state;
+          message.transcriptIndex = receipt.transcriptIndex ?? message.transcriptIndex;
+          if (receipt.state === "failed" && message !== turn.messages[0])
+            yield* emitNotice(
+              turn,
+              `steer-failed:${message.id}`,
+              "Message not delivered",
+              receipt.error ?? "Agent Motel could not deliver a follow-up message.",
+            );
+          if (receipt.state === "failed" && message === turn.messages[0])
+            return yield* finish(
+              turn,
+              "failed",
+              receipt.error ?? "Agent Motel could not deliver the message.",
+            );
+        }
+        const prompt = turn.messages[0]!;
+        // Someone else withdrew it, for example with `am queue --clear`.
+        if (prompt.state === "cancelled") return yield* finish(turn, "cancelled");
+        if (turn.cursor === undefined && prompt.transcriptIndex !== null)
+          turn.cursor = prompt.transcriptIndex;
+        const transcript = yield* api.transcript(ref, turn.cursor ?? TRANSCRIPT_END);
         if (active !== turn) return;
         yield* applyEntries(turn, transcript.entries, transcript.total, false);
+        if (!turn.messages.some(isPending)) return yield* finish(turn, "completed");
         const phase = amTurnPhase(transcript.status);
-        if (turn.delivered && (phase === "running" || phase === "attention")) turn.workSeen = true;
         if (phase !== "attention") turn.inAttention = false;
         switch (phase) {
           case "running":
@@ -503,23 +598,24 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
             yield* updateSession("waiting");
             if (turn.inAttention) return;
             turn.inAttention = true;
-            const detail = yield* api.getAgent(agentName).pipe(Effect.option);
+            const detail = yield* api.getAgent(ref).pipe(Effect.option);
             const reason = Option.getOrUndefined(Option.flatten(detail))?.statusReason;
             return yield* emitNotice(
               turn,
               `attention:${turn.input.runId}:${++turn.attentionEpisodes}`,
               "Waiting in its terminal",
-              `${reason ? `${reason}. ` : ""}T3 Code cannot answer this agent's prompts. Answer it in its session with \`am j ${agentName}\`.`,
+              `${reason ? `${reason}. ` : ""}T3 Code cannot answer this agent's prompts. Answer it in its session with \`am j ${ref}\`.`,
             );
           }
           case "idle":
-            if (turn.workSeen) yield* finish(turn, "completed");
             return;
           case "gone":
+            // A resumed agent would otherwise run the queued prompt outside any run.
+            yield* withdraw(turn).pipe(Effect.ignore);
             return yield* finish(
               turn,
               "failed",
-              `The Agent Motel agent ${agentName} is ${transcript.status}. Send a message to resume it.`,
+              `The Agent Motel agent ${ref} is ${transcript.status}. Send a message to resume it.`,
             );
         }
       });
@@ -539,7 +635,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
       yield* api.events.pipe(
         Stream.runForEach((event) =>
           Effect.sync(() => {
-            if (active && agentName && fleetEventConcerns(event.data, agentName))
+            if (active && agentRef && fleetEventConcerns(event.data, agentRef))
               Queue.offerUnsafe(wake, undefined);
           }),
         ),
@@ -580,12 +676,12 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         const name =
           existing?.nativeThreadRef?.nativeId ??
           input.initialNativeThreadId ??
-          amAgentName(args.threadId, args.title);
-        if (thread && agentName === name && thread.appThreadId === args.threadId) return thread;
+          amAgentRef(options.settings.host, amAgentName(args.threadId, args.title));
+        if (thread && agentRef === name && thread.appThreadId === args.threadId) return thread;
         if (thread) return yield* protocolError("This session already serves another agent");
         if (active) return yield* protocolError("Cannot change agents during an active turn");
         const time = yield* DateTime.now;
-        agentName = name;
+        agentRef = name;
         thread = existing
           ? {
               ...existing,
@@ -626,7 +722,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         thread !== undefined &&
         candidate.driver === AM_PROVIDER &&
         candidate.providerInstanceId === options.instanceId &&
-        candidate.nativeThreadRef?.nativeId === agentName;
+        candidate.nativeThreadRef?.nativeId === agentRef;
       const promptText = (message: ProviderAdapter.ProviderAdapterV2TurnMessage) =>
         providerMessageTextWithAttachmentPaths({
           text: message.text,
@@ -637,7 +733,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
       const start = Effect.fnUntraced(function* (
         turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
       ) {
-        if (closed || !agentName || !validateThread(turnInput.providerThread))
+        if (closed || !agentRef || !validateThread(turnInput.providerThread))
           return yield* protocolError("This thread is not attached to an Agent Motel agent");
         if (active)
           return yield* new ProviderAdapter.ProviderAdapterProtocolError({
@@ -651,25 +747,39 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           return yield* protocolError(FULL_ACCESS_ONLY);
         const text = promptText(turnInput.message);
         if (!text) return yield* protocolError("Agent Motel needs a text message");
-        const name = agentName;
-        const detail = Option.getOrUndefined(yield* fromApi(api.getAgent(name)));
-        let startIndex = 0;
-        if (detail) {
-          const phase = amTurnPhase(detail.status);
-          if (phase === "gone") yield* fromApi(api.resume(name));
-          const transcript = yield* fromApi(api.transcript(name, TRANSCRIPT_END));
-          startIndex = transcript.total;
+        const ref = agentRef;
+        const { host, name } = parseAmAgentRef(ref);
+        const dir = turnInput.runtimePolicy.cwd ?? cwd;
+        const detail = Option.getOrUndefined(yield* fromApi(api.getAgent(ref)));
+        // A fleet host's copy lives at a mapped path, so only a local agent's dir is comparable.
+        if (detail && !host && trimSlashes(detail.dir) !== trimSlashes(dir))
+          return yield* protocolError(
+            `The Agent Motel agent ${ref} works in ${detail.dir}, not this thread's ${dir}. Start a new thread, or remove the agent with \`am rm ${ref}\`.`,
+          );
+        if (detail && amTurnPhase(detail.status) === "gone") yield* fromApi(api.resume(ref));
+        if (!detail) {
+          const provider = amProviderForModel(turnInput.modelSelection.model);
+          // No task: am would wrap it in launch instructions and give it no receipt.
+          yield* fromApi(
+            api.createAgent({
+              name,
+              ...(host ? { host } : {}),
+              dir,
+              ...(provider ? { provider } : {}),
+            }),
+          );
         }
+        const id = yield* fromApi(api.sendMessage(ref, text, "queue"));
         const startedAt = yield* DateTime.now;
         const providerTurn: OrchestrationV2ProviderTurn = {
           id: idAllocator.derive.providerTurn({
             driver: AM_PROVIDER,
-            nativeTurnId: `${options.instanceId}:${name}:${turnInput.runId}:${startIndex}`,
+            nativeTurnId: `${options.instanceId}:${ref}:${id}`,
           }),
           providerThreadId: turnInput.providerThread.id,
           nodeId: turnInput.rootNodeId,
           runAttemptId: turnInput.attemptId,
-          nativeTurnRef: nativeRef(`${name}:${startIndex}`, "weak"),
+          nativeTurnRef: nativeRef(`${ref}:${id}`, "weak"),
           ordinal: turnInput.providerTurnOrdinal,
           status: "running",
           startedAt,
@@ -678,15 +788,13 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         const turn: ActiveTurn = {
           input: turnInput,
           providerTurn,
-          startIndex,
-          cursor: startIndex,
+          messages: [
+            { id, mode: "queue", state: "queued", transcriptIndex: null, shownAt: undefined },
+          ],
+          cursor: undefined,
           published: new Map(),
           ordinals: new Map(),
           nextOrdinal: turnInput.providerTurnOrdinal * 100 + 1,
-          sent: [text],
-          createdAgent: !detail,
-          delivered: false,
-          workSeen: false,
           attentionEpisodes: 0,
           inAttention: false,
           done: yield* Deferred.make<void>(),
@@ -705,22 +813,11 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           lastRunOrdinal: turnInput.runOrdinal,
         });
         yield* updateSession("running");
-        const provider = amProviderForModel(turnInput.modelSelection.model);
-        yield* fromApi(
-          detail
-            ? api.sendMessage(name, text, "queue")
-            : api.createAgent({
-                name,
-                dir: turnInput.runtimePolicy.cwd ?? cwd,
-                task: text,
-                ...(provider ? { provider } : {}),
-              }),
-        ).pipe(Effect.tapError((error) => finish(turn, "failed", error.detail)));
         Queue.offerUnsafe(wake, undefined);
       });
 
       const snapshot = Effect.fnUntraced(function* (current: OrchestrationV2ProviderThread) {
-        const transcript = yield* api.transcript(agentName!, 0).pipe(
+        const transcript = yield* api.transcript(agentRef!, 0).pipe(
           Effect.map((value) => value.entries),
           Effect.catchIf(
             (error) => error.status === 404,
@@ -739,7 +836,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
                   {
                     id: idAllocator.derive.messageFromProviderItem({
                       driver: AM_PROVIDER,
-                      nativeItemId: `${options.instanceId}:${agentName}:history:${entry.index}`,
+                      nativeItemId: `${options.instanceId}:${agentRef}:history:${entry.index}`,
                     }),
                     threadId: current.appThreadId ?? input.threadId,
                     runId: null,
@@ -811,6 +908,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           ),
         // am's `now` mode types straight into the TUI, steering whatever runs there. Before the
         // turn's own prompt is delivered that is someone else's work, so queue behind the prompt.
+        // Either way the message joins this run rather than starting one.
         steerTurn: Effect.fn("AmAdapterV2.steerTurn")(
           function* (args) {
             const turn = active;
@@ -822,8 +920,15 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
               return yield* protocolError("This Agent Motel turn cannot be steered");
             const text = promptText(args.message);
             if (!text) return yield* protocolError("Agent Motel needs a text message");
-            turn.sent.push(text);
-            yield* fromApi(api.sendMessage(agentName!, text, turn.delivered ? "now" : "queue"));
+            const mode = turn.messages[0]?.state === "queued" ? "queue" : "now";
+            const id = yield* fromApi(api.sendMessage(agentRef!, text, mode));
+            turn.messages.push({
+              id,
+              mode,
+              state: "queued",
+              transcriptIndex: null,
+              shownAt: undefined,
+            });
           },
           (effect, args) =>
             effect.pipe(
@@ -839,8 +944,9 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
               ),
             ),
         ),
-        // Esc stops the TUI's turn, but Claude Code runs no Stop hook for it, so am may keep
-        // reporting `working`. The run ends here instead of waiting for a status that may not come.
+        // A message am has not delivered is withdrawn, so Esc never stops someone else's work. Esc
+        // stops the TUI's turn, but Claude Code runs no Stop hook for it, so am may keep reporting
+        // `working`. The run ends here instead of waiting for a receipt that may not come.
         interruptTurn: Effect.fn("AmAdapterV2.interruptTurn")(
           function* (args) {
             const turn = active;
@@ -850,7 +956,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
               !validateThread(args.providerThread)
             )
               return yield* protocolError("This Agent Motel turn is no longer active");
-            yield* fromApi(api.interrupt(agentName!));
+            if (yield* withdraw(turn)) yield* fromApi(api.interrupt(agentRef!));
             yield* finish(turn, "interrupted");
           },
           (effect, args) =>

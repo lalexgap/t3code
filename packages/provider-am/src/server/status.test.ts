@@ -10,11 +10,17 @@ import { FAKE_TOKEN, makeFakeAm } from "./fakeAm.testkit.ts";
 import { checkAmProviderStatus } from "./status.ts";
 
 const decodeSettings = Schema.decodeSync(AmSettings);
-const settings = (apiToken: string) => decodeSettings({ enabled: true, apiToken });
 
-const check = Effect.fnUntraced(function* (baseUrl: string, token: string) {
+const check = Effect.fnUntraced(function* (
+  baseUrl: string,
+  token: string,
+  overrides: { readonly host?: string; readonly apiUrl?: string } = {},
+) {
   const api = makeAmApi(yield* HttpClient.HttpClient, { baseUrl, token });
-  return yield* checkAmProviderStatus(settings(token), api);
+  return yield* checkAmProviderStatus(
+    decodeSettings({ enabled: true, apiToken: token, ...overrides }),
+    api,
+  );
 });
 
 describe("checkAmProviderStatus", () => {
@@ -51,5 +57,35 @@ describe("checkAmProviderStatus", () => {
       assert.strictEqual(missing.status, "warning");
       assert.strictEqual(missing.auth.status, "unauthenticated");
     }).pipe(Effect.provide(FetchHttpClient.layer)),
+  );
+
+  it.live("checks a fleet host through am's host list without touching agents", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm({
+        hosts: [
+          { name: "gapserver", reachable: true },
+          { name: "laptop", reachable: false },
+        ],
+      });
+      const ready = yield* check(fake.url, FAKE_TOKEN, { host: "gapserver" });
+      assert.strictEqual(ready.status, "ready");
+      const offline = yield* check(fake.url, FAKE_TOKEN, { host: "laptop" });
+      assert.strictEqual(offline.status, "warning");
+      assert.include(offline.message ?? "", "laptop");
+      const unknown = yield* check(fake.url, FAKE_TOKEN, { host: "nowhere" });
+      assert.strictEqual(unknown.status, "error");
+      assert.include(unknown.message ?? "", "remotes");
+      assert.isTrue(fake.log.every((call) => call.path === "/api/hosts"));
+    }).pipe(Effect.scoped, Effect.provide(FetchHttpClient.layer)),
+  );
+
+  it.live("refuses to send the token to a non-http API URL", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      const status = yield* check(fake.url, FAKE_TOKEN, { apiUrl: "ftp://am.example" });
+      assert.strictEqual(status.status, "error");
+      assert.include(status.message ?? "", "http");
+      assert.deepStrictEqual(fake.log, []);
+    }).pipe(Effect.scoped, Effect.provide(FetchHttpClient.layer)),
   );
 });

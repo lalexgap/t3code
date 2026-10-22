@@ -13,6 +13,7 @@ import {
   ThreadId,
   type OrchestrationV2AppThread,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2ProviderTurn,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -29,7 +30,7 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import { AmSettings } from "../settings.ts";
 import { makeAmAdapterV2 } from "./adapter.ts";
 import { makeAmApi } from "./api.ts";
-import { FAKE_TOKEN, makeFakeAm, type FakeEntry } from "./fakeAm.testkit.ts";
+import { FAKE_TOKEN, makeFakeAm, type FakeAgent, type FakeEntry } from "./fakeAm.testkit.ts";
 import { amAgentName } from "./mapping.ts";
 
 const testLayer = Layer.mergeAll(
@@ -43,7 +44,8 @@ const THREAD_ID = ThreadId.make("thread-am-test");
 const TITLE = "Fix login";
 const AGENT = amAgentName(THREAD_ID, TITLE);
 const CWD = "/work/project";
-const settings = Schema.decodeSync(AmSettings)({ enabled: true, apiToken: FAKE_TOKEN });
+const decodeSettings = Schema.decodeSync(AmSettings);
+const settings = decodeSettings({ enabled: true, apiToken: FAKE_TOKEN });
 const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
   runtimeMode: "full-access",
   interactionMode: "default",
@@ -56,12 +58,13 @@ type Fake = Effect.Success<ReturnType<typeof makeFakeAm>>;
 const makeHarness = Effect.fnUntraced(function* (
   fake: Fake,
   existingProviderThread?: OrchestrationV2ProviderThread,
+  instanceSettings: AmSettings = settings,
 ) {
   const api = makeAmApi(yield* HttpClient.HttpClient, { baseUrl: fake.url, token: FAKE_TOKEN });
   // Turns must settle from am's event stream alone.
   const adapter = yield* makeAmAdapterV2({
     instanceId: INSTANCE_ID,
-    settings,
+    settings: instanceSettings,
     api,
     pollIntervalMs: 3_600_000,
   });
@@ -112,7 +115,23 @@ const makeHarness = Effect.fnUntraced(function* (
       item: ProviderAdapter.ProviderAdapterV2Event & { type: "turn_item.updated" },
     ) => boolean,
   ) => takeEvent("turn_item.updated", predicate).pipe(Effect.map((event) => event.turnItem));
-  return { runtime, providerThread, takeEvent, takeItem, allEvents };
+  const items = () =>
+    allEvents.flatMap((event) => (event.type === "turn_item.updated" ? [event.turnItem] : []));
+  const replies = () =>
+    items().flatMap((item) => (item.type === "assistant_message" ? [item.text] : []));
+  const notices = () =>
+    items().flatMap((item) => (item.type === "system_notice" ? [item.message] : []));
+  return {
+    adapter,
+    runtime,
+    providerThread,
+    takeEvent,
+    takeItem,
+    allEvents,
+    items,
+    replies,
+    notices,
+  };
 });
 
 const turnInput = Effect.fnUntraced(function* (
@@ -167,9 +186,48 @@ const turnInput = Effect.fnUntraced(function* (
 
 const user = (text: string): FakeEntry => ({ kind: "user", text });
 const assistant = (text: string): FakeEntry => ({ kind: "assistant", text });
+const idleAgent = (entries: Array<FakeEntry> = []): FakeAgent => ({
+  status: "idle",
+  dir: CWD,
+  provider: "claude",
+  entries,
+});
+
+/** am delivers the message: the transcript length is recorded before the agent writes more. */
+const deliver = (fake: Fake, id: string, ...entries: Array<FakeEntry>) =>
+  fake.receipt(id, (message, agent) => {
+    message.state = "delivered";
+    message.transcriptIndex = agent.entries.length;
+    agent.status = "working";
+    agent.entries.push(...entries);
+  });
+const complete = (fake: Fake, id: string, ...entries: Array<FakeEntry>) =>
+  fake.receipt(id, (message, agent) => {
+    agent.entries.push(...entries);
+    message.state = "done";
+    agent.status = "idle";
+  });
+const steer = (
+  harness: Effect.Success<ReturnType<typeof makeHarness>>,
+  providerTurnId: OrchestrationV2ProviderTurn["id"],
+  text: string,
+) =>
+  harness.runtime.steerTurn({
+    threadId: THREAD_ID,
+    runId: RunId.make("run-1"),
+    providerThread: harness.providerThread,
+    providerTurnId,
+    message: {
+      messageId: MessageId.make(`steer-${text}`),
+      text,
+      attachments: [],
+      createdBy: "user",
+      creationSource: "web",
+    },
+  });
 
 describe("AmAdapterV2", () => {
-  it.live("starts the agent in place with the first prompt and settles when am goes idle", () =>
+  it.live("starts the agent with no task, sends the prompt, and settles on its receipt", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();
       const harness = yield* makeHarness(fake);
@@ -181,18 +239,15 @@ describe("AmAdapterV2", () => {
         name: AGENT,
         dir: CWD,
         inPlace: true,
-        task: "Fix login",
         provider: "claude",
       });
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      assert.deepStrictEqual(sent.body, { text: "Fix login", mode: "queue" });
 
-      // `starting` comes before the prompt lands; it must not end the turn when am idles next.
-      yield* fake.update(AGENT, (agent) => {
-        agent.status = "working";
-        agent.entries.push(user("Fix login"), assistant("Looking at the login form."), {
-          kind: "tool",
-          name: "Bash",
-          input: '{"command":"grep -r login src"}',
-        });
+      yield* deliver(fake, sent.messageId!, user("Fix login"), assistant("Looking."), {
+        kind: "tool",
+        name: "Bash",
+        input: '{"command":"grep -r login src"}',
       });
       const running = yield* harness.takeItem(
         (event) => event.turnItem.type === "command_execution",
@@ -203,94 +258,288 @@ describe("AmAdapterV2", () => {
         "grep -r login src",
       );
 
+      // An idle status alone settles nothing; the receipt does.
       yield* fake.update(AGENT, (agent) => {
         agent.entries[2] = { ...agent.entries[2]!, output: "src/login.ts" };
-        agent.entries.push(assistant("Fixed the redirect."));
         agent.status = "idle";
       });
+      yield* complete(fake, sent.messageId!, assistant("Fixed the redirect."));
       const terminal = yield* harness.takeEvent("turn.terminal");
       assert.strictEqual(terminal.status, "completed");
 
-      const items = harness.allEvents.flatMap((event) =>
-        event.type === "turn_item.updated" ? [event.turnItem] : [],
-      );
-      assert.deepStrictEqual(
-        items
-          .filter((item) => item.type === "assistant_message")
-          .map((item) => item.type === "assistant_message" && item.text),
-        ["Looking at the login form.", "Fixed the redirect."],
-      );
-      const command = items.findLast((item) => item.type === "command_execution");
+      assert.deepStrictEqual(harness.replies(), ["Looking.", "Fixed the redirect."]);
+      const command = harness.items().findLast((item) => item.type === "command_execution");
       assert.strictEqual(command?.status, "completed");
       assert.strictEqual(command?.type === "command_execution" && command.output, "src/login.ts");
       // The prompt T3 sent is already the thread's user message.
-      assert.isFalse(items.some((item) => item.type === "system_notice"));
+      assert.deepStrictEqual(harness.notices(), []);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
-  it.live("takes a new agent's wrapped first task as its own prompt", () =>
+  it.live("completes a delivered turn that produced no output when am reports it done", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent([user("Old"), assistant("Old reply")]));
       const harness = yield* makeHarness(fake);
-      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "fix it"));
-      yield* fake.takeCall("POST", "/api/agents");
-      yield* fake.update(AGENT, (agent) => {
-        agent.entries.push(user("<launch instructions>\n\nfix it"), assistant("Fixed."));
-        agent.status = "idle";
-      });
-      yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
-      const items = harness.allEvents.flatMap((event) =>
-        event.type === "turn_item.updated" ? [event.turnItem] : [],
-      );
-      assert.deepStrictEqual(
-        items.map((item) => (item.type === "assistant_message" ? item.text : item.type)),
-        ["Fixed."],
-      );
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Quiet check"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      yield* deliver(fake, sent.messageId!);
+      yield* complete(fake, sent.messageId!);
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(terminal.status, "completed");
+      assert.deepStrictEqual(harness.items(), []);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
-  it.live("queues to a busy agent and waits for its own message before settling", () =>
+  it.live("follows a prompt a busy agent receives with no transcript entry for it", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();
       fake.agents.set(AGENT, {
+        ...idleAgent([user("Earlier work"), assistant("Earlier reply")]),
         status: "working",
-        dir: CWD,
-        provider: "codex",
-        entries: [user("Earlier work"), assistant("Earlier reply")],
       });
       const harness = yield* makeHarness(fake);
       yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Next task"));
       const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
       assert.deepStrictEqual(sent.body, { text: "Next task", mode: "queue" });
 
-      // The earlier work wraps up and ends; am has not delivered the queued message yet.
+      // The earlier work wraps up and idles while T3's message is still queued.
       yield* fake.update(AGENT, (agent) => {
         agent.entries.push(assistant("Earlier wrap-up"));
         agent.status = "idle";
       });
-      yield* fake.update(AGENT, (agent) => {
-        agent.entries.push(user("Next task"), assistant("Next reply"));
-      });
+      yield* fake.takeCall("GET", `/api/agents/${AGENT}/transcript`);
+      // Claude's Stop-hook inbox hands the message over without a visible user entry.
+      yield* deliver(fake, sent.messageId!, assistant("Next reply"));
+      yield* complete(fake, sent.messageId!);
       yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
-      const replies = harness.allEvents.flatMap((event) =>
-        event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
-          ? [event.turnItem.text]
-          : [],
+      assert.deepStrictEqual(harness.replies(), ["Next reply"]);
+      assert.deepStrictEqual(harness.notices(), []);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("shows a peer's message inside the turn as a note, even with the prompt's text", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "yes"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      yield* deliver(fake, sent.messageId!, user("yes"), assistant("On it."));
+      yield* complete(fake, sent.messageId!, user("[am · from lead] yes"), assistant("Noted."));
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
+      assert.deepStrictEqual(harness.notices(), ["[am · from lead] yes"]);
+      assert.deepStrictEqual(harness.replies(), ["On it.", "Noted."]);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("withdraws a still-queued prompt on Stop instead of interrupting other work", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, { ...idleAgent(), status: "working" });
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Later"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      yield* harness.runtime.interruptTurn({
+        providerThread: harness.providerThread,
+        providerTurnId: started.providerTurn.id,
+      });
+      yield* fake.takeCall("DELETE", `/api/agents/${AGENT}/messages/${sent.messageId}`);
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "interrupted");
+      assert.strictEqual(fake.messages.get(sent.messageId!)?.state, "cancelled");
+      assert.isFalse(fake.log.some((call) => call.path.endsWith("/interrupt")));
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("interrupts a delivered prompt on Stop", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Long job"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      yield* deliver(fake, sent.messageId!, user("Long job"), assistant("Starting."));
+      yield* harness.takeItem((event) => event.turnItem.type === "assistant_message");
+      yield* harness.runtime.interruptTurn({
+        providerThread: harness.providerThread,
+        providerTurnId: started.providerTurn.id,
+      });
+      yield* fake.takeCall("POST", `/api/agents/${AGENT}/interrupt`);
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "interrupted");
+      assert.isFalse(fake.log.some((call) => call.method === "DELETE"));
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("interrupts when am delivered the prompt just before Stop withdrew it", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Race"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      yield* fake.takeCall("GET", `/api/agents/${AGENT}/messages/${sent.messageId}`);
+      // Delivered without a wake, so T3 still believes the prompt is queued.
+      fake.messages.get(sent.messageId!)!.state = "delivered";
+      fake.messages.get(sent.messageId!)!.transcriptIndex = 0;
+      yield* harness.runtime.interruptTurn({
+        providerThread: harness.providerThread,
+        providerTurnId: started.providerTurn.id,
+      });
+      yield* fake.takeCall("DELETE", `/api/agents/${AGENT}/messages/${sent.messageId}`);
+      yield* fake.takeCall("POST", `/api/agents/${AGENT}/interrupt`);
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "interrupted");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("waits out a cancel am answers mid-delivery, then interrupts", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Handing over"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      yield* fake.takeCall("GET", `/api/agents/${AGENT}/messages/${sent.messageId}`);
+      fake.messages.get(sent.messageId!)!.deliveringOnCancel = true;
+      yield* harness.runtime.interruptTurn({
+        providerThread: harness.providerThread,
+        providerTurnId: started.providerTurn.id,
+      });
+      const path = `/api/agents/${AGENT}/messages/${sent.messageId}`;
+      assert.deepStrictEqual(
+        fake.log
+          .filter((call) => call.method !== "GET" || call.path === path)
+          .slice(-3)
+          .map((call) => `${call.method} ${call.path}`),
+        [`DELETE ${path}`, `GET ${path}`, `POST /api/agents/${AGENT}/interrupt`],
       );
-      assert.deepStrictEqual(replies, ["Next reply"]);
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "interrupted");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("fails the run when am reports the message failed", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Doomed"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      yield* fake.receipt(sent.messageId!, (message) => {
+        message.state = "failed";
+        message.error = "the pane never accepted input";
+      });
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(terminal.status, "failed");
+      assert.include(terminal.failure?.message ?? "", "the pane never accepted input");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("fails the run when am loses the receipt", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Moved"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      // `am move` leaves the receipt behind on the old host.
+      yield* fake.update(AGENT, () => fake.messages.delete(sent.messageId!));
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(terminal.status, "failed");
+      assert.include(terminal.failure?.message ?? "", "no longer has a receipt");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("steers within the run and ends it only after every steering message is done", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Long job"));
+      const prompt = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const started = yield* harness.takeEvent("provider_turn.updated");
+
+      // Before the prompt is delivered, steering queues behind it.
+      yield* steer(harness, started.providerTurn.id, "Also update the docs");
+      const behind = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      assert.deepStrictEqual(behind.body, { text: "Also update the docs", mode: "queue" });
+
+      yield* deliver(fake, prompt.messageId!, user("Long job"), assistant("Starting."));
+      yield* harness.takeItem((event) => event.turnItem.type === "assistant_message");
+      yield* steer(harness, started.providerTurn.id, "Skip the tests");
+      const now = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      assert.deepStrictEqual(now.body, { text: "Skip the tests", mode: "now" });
+      // A `now` message is typed into the busy agent and recorded at its next step.
+      yield* deliver(fake, now.messageId!, assistant("Halfway."), user("Skip the tests"));
+      yield* complete(fake, prompt.messageId!);
+      yield* complete(fake, now.messageId!);
+
+      yield* deliver(fake, behind.messageId!, user("Also update the docs"));
+      yield* complete(fake, behind.messageId!, assistant("Docs updated."));
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
+      assert.deepStrictEqual(harness.replies(), ["Starting.", "Halfway.", "Docs updated."]);
+      // Every user entry came from T3, so none shows as an outside message.
+      assert.deepStrictEqual(harness.notices(), []);
+      assert.strictEqual(
+        harness.allEvents.filter((event) => event.type === "turn.terminal").length,
+        1,
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("drives a fleet host's agent as host:name without workspace checkpoints", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      const remote = decodeSettings({ enabled: true, apiToken: FAKE_TOKEN, host: "gapserver" });
+      const harness = yield* makeHarness(fake, undefined, remote);
+      const ref = `gapserver:${AGENT}`;
+      assert.strictEqual(harness.providerThread.nativeThreadRef?.nativeId, ref);
+      const capabilities = yield* harness.adapter.getCapabilities();
+      assert.isFalse(capabilities.checkpointing.appCanCheckpointFilesystem);
+
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Remote job"));
+      const created = yield* fake.takeCall("POST", "/api/agents");
+      assert.deepStrictEqual(created.body, {
+        name: AGENT,
+        host: "gapserver",
+        dir: CWD,
+        inPlace: true,
+        provider: "claude",
+      });
+      const sent = yield* fake.takeCall("POST", `/api/agents/${encodeURIComponent(ref)}/messages`);
+      yield* deliver(fake, sent.messageId!, user("Remote job"), assistant("Done remotely."));
+      yield* complete(fake, sent.messageId!);
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
+      assert.deepStrictEqual(harness.replies(), ["Done remotely."]);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("refuses to adopt a local agent that works in another directory", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, { ...idleAgent(), dir: "/elsewhere" });
+      const harness = yield* makeHarness(fake);
+      const started = yield* harness.runtime
+        .startTurn(yield* turnInput(harness.providerThread, "Fix login"))
+        .pipe(Effect.flip);
+      assert.include(String(started.cause), "/elsewhere");
+      assert.isFalse(fake.log.some((call) => call.path.endsWith("/messages")));
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
   it.live("surfaces a blocked agent without answering for it", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();
-      fake.agents.set(AGENT, { status: "idle", dir: CWD, provider: "claude", entries: [] });
+      fake.agents.set(AGENT, idleAgent());
       const harness = yield* makeHarness(fake);
       yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Delete tmp"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      yield* deliver(fake, sent.messageId!, user("Delete tmp"));
       yield* fake.update(AGENT, (agent) => {
         agent.status = "needs-attention";
         agent.statusReason = "Bash: rm -rf tmp";
-        agent.entries.push(user("Delete tmp"));
       });
       yield* harness.takeEvent(
         "provider_session.updated",
@@ -299,77 +548,8 @@ describe("AmAdapterV2", () => {
       const notice = yield* harness.takeItem((event) => event.turnItem.type === "system_notice");
       assert.include(notice.type === "system_notice" ? notice.message : "", "Bash: rm -rf tmp");
       assert.include(notice.type === "system_notice" ? notice.message : "", `am j ${AGENT}`);
-      yield* fake.update(AGENT, (agent) => {
-        agent.status = "idle";
-        agent.statusReason = null;
-      });
+      yield* complete(fake, sent.messageId!);
       yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
-    }).pipe(Effect.scoped, Effect.provide(testLayer)),
-  );
-
-  it.live("completes only after its own prompt lands when another client got there first", () =>
-    Effect.gen(function* () {
-      const fake = yield* makeFakeAm();
-      fake.agents.set(AGENT, { status: "idle", dir: CWD, provider: "claude", entries: [] });
-      const harness = yield* makeHarness(fake);
-      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "My task"));
-      yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
-      yield* fake.takeCall("GET", `/api/agents/${AGENT}/transcript`);
-
-      // Another client's prompt reached the agent between T3's status read and its send.
-      yield* fake.update(AGENT, (agent) => {
-        agent.status = "working";
-        agent.entries.push(user("Other task"), assistant("Other reply"));
-      });
-      yield* fake.takeCall("GET", `/api/agents/${AGENT}/transcript`);
-      yield* fake.update(AGENT, (agent) => {
-        agent.status = "idle";
-      });
-      yield* fake.takeCall("GET", `/api/agents/${AGENT}/transcript`);
-
-      yield* fake.update(AGENT, (agent) => {
-        agent.entries.push(user("My task"), assistant("My reply"));
-      });
-      yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
-      const items = harness.allEvents.flatMap((event) =>
-        event.type === "turn_item.updated" ? [event.turnItem] : [],
-      );
-      assert.deepStrictEqual(
-        items.map((item) => (item.type === "assistant_message" ? item.text : item.type)),
-        ["My reply"],
-      );
-    }).pipe(Effect.scoped, Effect.provide(testLayer)),
-  );
-
-  it.live("waits for work after its prompt lands while am still reports idle", () =>
-    Effect.gen(function* () {
-      const fake = yield* makeFakeAm();
-      fake.agents.set(AGENT, { status: "idle", dir: CWD, provider: "claude", entries: [] });
-      const harness = yield* makeHarness(fake);
-      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Quick check"));
-      yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
-      yield* fake.takeCall("GET", `/api/agents/${AGENT}/transcript`);
-
-      yield* fake.update(AGENT, (agent) => {
-        agent.entries.push(user("Quick check"));
-      });
-      yield* fake.takeCall("GET", `/api/agents/${AGENT}/transcript`);
-      // A second read is either another sync or an early finish's last read; both precede the reply.
-      yield* fake.update(AGENT, () => {});
-      yield* fake.takeCall("GET", `/api/agents/${AGENT}/transcript`);
-
-      yield* fake.update(AGENT, (agent) => {
-        agent.entries.push(assistant("All good."));
-      });
-      yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
-      assert.isTrue(
-        harness.allEvents.some(
-          (event) =>
-            event.type === "turn_item.updated" &&
-            event.turnItem.type === "assistant_message" &&
-            event.turnItem.text === "All good.",
-        ),
-      );
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -404,70 +584,23 @@ describe("AmAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
-  it.live("steers behind its queued prompt, then with am's now mode, and interrupts with Esc", () =>
+  it.live("refuses an API URL that is not http or https", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();
-      fake.agents.set(AGENT, { status: "idle", dir: CWD, provider: "claude", entries: [] });
-      const harness = yield* makeHarness(fake);
-      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Long job"));
-      const started = yield* harness.takeEvent(
-        "provider_turn.updated",
-        (event) => event.providerTurn.status === "running",
-      );
-      yield* harness.runtime.steerTurn({
-        threadId: THREAD_ID,
-        runId: RunId.make("run-1"),
-        providerThread: harness.providerThread,
-        providerTurnId: started.providerTurn.id,
-        message: {
-          messageId: MessageId.make("steer-1"),
-          text: "Also update the docs",
-          attachments: [],
-          createdBy: "user",
-          creationSource: "web",
-        },
+      const adapter = yield* makeAmAdapterV2({
+        instanceId: INSTANCE_ID,
+        settings: decodeSettings({ enabled: true, apiToken: FAKE_TOKEN, apiUrl: "file:///tmp" }),
+        api: makeAmApi(yield* HttpClient.HttpClient, { baseUrl: fake.url, token: FAKE_TOKEN }),
       });
-      const queued = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
-      assert.deepStrictEqual(queued.body, { text: "Long job", mode: "queue" });
-      const behind = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
-      assert.deepStrictEqual(behind.body, { text: "Also update the docs", mode: "queue" });
-
-      yield* fake.update(AGENT, (agent) => {
-        agent.status = "working";
-        agent.entries.push(user("Long job"), assistant("Starting the long job."));
-      });
-      yield* harness.takeItem((event) => event.turnItem.type === "assistant_message");
-      yield* harness.runtime.steerTurn({
-        threadId: THREAD_ID,
-        runId: RunId.make("run-1"),
-        providerThread: harness.providerThread,
-        providerTurnId: started.providerTurn.id,
-        message: {
-          messageId: MessageId.make("steer-2"),
-          text: "Skip the tests",
-          attachments: [],
-          createdBy: "user",
-          creationSource: "web",
-        },
-      });
-      const now = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
-      assert.deepStrictEqual(now.body, { text: "Skip the tests", mode: "now" });
-
-      yield* fake.update(AGENT, (agent) => {
-        agent.entries.push(user("Also update the docs"), user("Skip the tests"));
-      });
-      yield* harness.runtime.interruptTurn({
-        providerThread: harness.providerThread,
-        providerTurnId: started.providerTurn.id,
-      });
-      yield* fake.takeCall("POST", `/api/agents/${AGENT}/interrupt`);
-      yield* harness.takeEvent("turn.terminal", (event) => event.status === "interrupted");
-      // Both messages came from T3, so neither shows as an outside message.
-      assert.isFalse(
-        harness.allEvents.some(
-          (event) => event.type === "turn_item.updated" && event.turnItem.type === "system_notice",
-        ),
-      );
+      const opened = yield* adapter
+        .openSession({
+          threadId: THREAD_ID,
+          providerSessionId: ProviderSessionId.make("session-am-file"),
+          modelSelection,
+          runtimePolicy,
+        })
+        .pipe(Effect.flip);
+      assert.include(opened.message, "http");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -476,10 +609,8 @@ describe("AmAdapterV2", () => {
       const fake = yield* makeFakeAm();
       const saved = "t3-saved-abc123";
       fake.agents.set(saved, {
+        ...idleAgent([user("Old"), assistant("Old reply")]),
         status: "exited",
-        dir: CWD,
-        provider: "claude",
-        entries: [user("Old"), assistant("Old reply")],
       });
       const now = yield* DateTime.now;
       const harness = yield* makeHarness(fake, {
@@ -505,20 +636,17 @@ describe("AmAdapterV2", () => {
       });
       yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Continue", 2));
       yield* fake.takeCall("POST", `/api/agents/${saved}/resume`);
-      yield* fake.takeCall("POST", `/api/agents/${saved}/messages`);
+      const sent = yield* fake.takeCall("POST", `/api/agents/${saved}/messages`);
       yield* fake.update(saved, (agent) => {
         agent.status = "dead";
       });
       const terminal = yield* harness.takeEvent("turn.terminal");
       assert.strictEqual(terminal.status, "failed");
       assert.include(terminal.failure?.message ?? "", saved);
+      // The queued prompt is withdrawn so a later resume does not run it outside any run.
+      assert.strictEqual(fake.messages.get(sent.messageId!)?.state, "cancelled");
       // History before this turn never re-renders into it.
-      assert.isFalse(
-        harness.allEvents.some(
-          (event) =>
-            event.type === "turn_item.updated" && event.turnItem.type === "assistant_message",
-        ),
-      );
+      assert.deepStrictEqual(harness.replies(), []);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 });

@@ -2,11 +2,12 @@ import { assert, describe, it } from "@effect/vitest";
 
 import {
   amAgentName,
+  amAgentRef,
   amEntryStatus,
   amToolPresentation,
   amTurnPhase,
   fleetEventConcerns,
-  isSentMessage,
+  parseAmAgentRef,
 } from "./mapping.ts";
 
 describe("amAgentName", () => {
@@ -38,25 +39,12 @@ describe("amTurnPhase", () => {
   });
 });
 
-describe("isSentMessage", () => {
-  it("matches a long delivered message through wrapping and whitespace changes", () => {
-    const sent = ["Fix the redirect bug\n\nin login.ts and add a test"];
-    assert.isTrue(isSentMessage("<prompt>Fix the redirect bug in login.ts and add a test", sent));
-    assert.isTrue(isSentMessage("Fix the redirect bug in login.ts", sent));
-    assert.isFalse(isSentMessage("Something else entirely", sent));
-    assert.isFalse(isSentMessage("   ", sent));
-  });
-
-  it("matches a short message only exactly", () => {
-    assert.isTrue(isSentMessage(" yes\n", ["yes"]));
-    assert.isFalse(isSentMessage("yesterday the build broke", ["yes"]));
-    assert.isFalse(isSentMessage("yes", ["yesterday the build broke again"]));
-  });
-
-  it("sees through am's attribution envelope", () => {
-    assert.isTrue(isSentMessage("[am · from lead] yes", ["yes"]));
-    assert.isFalse(isSentMessage("[am · from lead] yesterday", ["yes"]));
-    assert.isTrue(isSentMessage("[am · from lead] yes", ["[am · from lead] yes"]));
+describe("amAgentRef", () => {
+  it("addresses a fleet host's agent as host:name and round-trips", () => {
+    assert.strictEqual(amAgentRef("", "t3-a"), "t3-a");
+    assert.strictEqual(amAgentRef("gapserver", "t3-a"), "gapserver:t3-a");
+    assert.deepStrictEqual(parseAmAgentRef("gapserver:t3-a"), { host: "gapserver", name: "t3-a" });
+    assert.deepStrictEqual(parseAmAgentRef("t3-a"), { host: undefined, name: "t3-a" });
   });
 });
 
@@ -115,5 +103,7 @@ describe("fleetEventConcerns", () => {
     assert.isFalse(fleetEventConcerns('{"type":"fleet","event":"stop","agent":"other"}', "t3-a"));
     assert.isTrue(fleetEventConcerns('{"type":"fleet","event":"changed"}', "t3-a"));
     assert.isTrue(fleetEventConcerns("garbled", "t3-a"));
+    assert.isTrue(fleetEventConcerns('{"agent":"t3-a"}', "gapserver:t3-a"));
+    assert.isTrue(fleetEventConcerns('{"agent":"gapserver:t3-a"}', "gapserver:t3-a"));
   });
 });

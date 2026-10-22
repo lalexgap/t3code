@@ -10,18 +10,35 @@ web, desktop, and mobile apps.
 1. On the machine hosting your environment, run `am serve`. It prints its API token (`am token` prints it again) and listens on
    `http://127.0.0.1:8787` unless am's config sets another `apiPort`.
 2. Open **Settings → Providers**, select the environment, and enable **Agent Motel**.
-3. Paste the token into **API token**. Set **API URL** if `am serve` listens elsewhere.
+3. Paste the token into **API token**. Set **API URL** if `am serve` listens elsewhere. The URL
+   must use `http` or `https`, and T3 Code sends the token to it, so point it only at your own am.
 4. Refresh provider status. It only checks that am answers and accepts the token; it never starts
    an agent.
 
+T3 Code needs an am with message receipts. With an older am, sending fails and asks you to update
+it.
+
 T3 Code connects to `am serve` from the environment's host, so devices you connect from do not
 need to reach am themselves.
+
+## Fleet hosts
+
+To run agents on another machine in your am fleet, add another Agent Motel instance in
+**Settings → Providers** and set **Fleet host** to that machine's name from am's `remotes`, for
+example one instance for this machine and one named "am · laptop". Status for a fleet host checks
+whether am can reach it.
+
+The agent works in the fleet host's copy of the thread's project, at the same path under its home
+directory. T3 Code's diffs and checkpoints read this machine's copy, so they do not show the
+agent's changes. Review them on the fleet host, and keep both copies in sync yourself, for example
+by pushing and pulling a branch.
 
 ## Threads and agents
 
 The first message in a thread starts an am agent named after the thread, such as
 `t3-fix-login-4k2j9a`, in the thread's workspace or worktree. Later messages go to the same agent,
-including after T3 Code restarts. If the agent has stopped, T3 Code resumes it.
+including after T3 Code restarts. If the agent has stopped, T3 Code resumes it. T3 Code does not
+take over an existing agent of that name that works in another directory.
 
 Pick **Claude Code** or **Codex** in the model picker, or **am default** for the provider set in
 am's config. An agent keeps its provider, so start a new thread to switch.
@@ -31,7 +48,9 @@ token by token. Messages that reach the agent from elsewhere during a turn, such
 or its terminal, show as notes in the thread. Activity between T3 Code turns is not shown; read it
 with `am transcript <name>`.
 
-Sending while the agent works steers its current turn. **Stop** sends Esc to the agent.
+If the agent is busy with other work, the message waits in am's queue and the turn starts when am
+delivers it. Sending while the turn runs steers it. **Stop** withdraws a message am has not
+delivered yet, and otherwise sends Esc to the agent.
 
 ## Permissions and limitations
 
