@@ -52,6 +52,11 @@ describe("isSentMessage", () => {
     assert.isFalse(isSentMessage("yesterday the build broke", ["yes"]));
     assert.isFalse(isSentMessage("yes", ["yesterday the build broke again"]));
   });
+
+  it("sees through am's attribution envelope", () => {
+    assert.isTrue(isSentMessage("[am · from lead] yes", ["yes"]));
+    assert.isFalse(isSentMessage("[am · from lead] yesterday", ["yes"]));
+  });
 });
 
 describe("amToolPresentation", () => {

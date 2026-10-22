@@ -56,6 +56,10 @@ export const amTurnPhase = (status: string): AmTurnPhase => {
 
 const normalize = (text: string) => text.replace(/\s+/g, " ").trim();
 
+// am's attribution envelope (agent-motel comms.ts formatEnvelope), added when `am serve` runs
+// with an inherited agent identity.
+const AM_ENVELOPE = /^\[am · from [^\]]+\] /;
+
 /** Below this, containment matches unrelated text (`yes` inside `yesterday`). */
 const MIN_CONTAINMENT_CHARS = 24;
 
@@ -64,7 +68,7 @@ const MIN_CONTAINMENT_CHARS = 24;
  * split long text, so long messages compare on a normalized prefix; short ones must be equal.
  */
 export const isSentMessage = (entryText: string, sent: ReadonlyArray<string>) => {
-  const entry = normalize(entryText);
+  const entry = normalize(entryText).replace(AM_ENVELOPE, "");
   if (!entry) return false;
   return sent.some((text) => {
     const message = normalize(text);
