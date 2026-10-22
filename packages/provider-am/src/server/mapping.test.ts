@@ -98,12 +98,15 @@ describe("amEntryStatus", () => {
 });
 
 describe("fleetEventConcerns", () => {
-  it("wakes for this agent's events and for unnamed fleet changes", () => {
+  it("wakes a local agent for its own events and for unnamed fleet changes", () => {
     assert.isTrue(fleetEventConcerns('{"type":"fleet","event":"stop","agent":"t3-a"}', "t3-a"));
     assert.isFalse(fleetEventConcerns('{"type":"fleet","event":"stop","agent":"other"}', "t3-a"));
     assert.isTrue(fleetEventConcerns('{"type":"fleet","event":"changed"}', "t3-a"));
     assert.isTrue(fleetEventConcerns("garbled", "t3-a"));
-    assert.isTrue(fleetEventConcerns('{"agent":"t3-a"}', "gapserver:t3-a"));
-    assert.isTrue(fleetEventConcerns('{"agent":"gapserver:t3-a"}', "gapserver:t3-a"));
+  });
+
+  it("never wakes a fleet host's agent, whose events the local stream does not carry", () => {
+    assert.isFalse(fleetEventConcerns('{"agent":"t3-a"}', "gapserver:t3-a"));
+    assert.isFalse(fleetEventConcerns('{"type":"fleet","event":"changed"}', "gapserver:t3-a"));
   });
 });

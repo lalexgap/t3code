@@ -26,7 +26,7 @@ need to reach am themselves.
 To run agents on another machine in your am fleet, add another Agent Motel instance in
 **Settings → Providers** and set **Fleet host** to that machine's name from am's `remotes`, for
 example one instance for this machine and one named "am · laptop". Status for a fleet host checks
-whether am can reach it.
+whether am can reach it. Its turns update every few seconds rather than as am records them.
 
 The agent works in the fleet host's copy of the thread's project, at the same path under its home
 directory. T3 Code's diffs and checkpoints read this machine's copy, so they do not show the

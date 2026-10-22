@@ -136,8 +136,9 @@ const decodeFleetEvent = Schema.decodeUnknownOption(
 
 /** Fleet events name the agent they concern; file-watch events name none and may concern any. */
 export const fleetEventConcerns = (data: string, agentRef: string) => {
+  // `/api/events` carries only the local daemon's events, so a fleet host's agent never appears
+  // there, and waking on local churn would cost an ssh round trip each time.
+  if (parseAmAgentRef(agentRef).host !== undefined) return false;
   const event = decodeFleetEvent(data);
-  if (event._tag === "None" || event.value.agent === undefined) return true;
-  // A remote agent's event may carry its bare name; a stray wake only costs a read.
-  return event.value.agent === agentRef || event.value.agent === parseAmAgentRef(agentRef).name;
+  return event._tag === "None" || event.value.agent === undefined || event.value.agent === agentRef;
 };
