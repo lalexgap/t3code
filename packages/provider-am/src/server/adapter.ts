@@ -41,6 +41,8 @@ const AM_PROVIDER = ProviderDriverKind.make("am");
 /** Transcript indexes run past any real conversation; `after` beyond the end returns only the total. */
 const TRANSCRIPT_END = 1_000_000_000;
 const EVENT_RECONNECT_MS = 2_000;
+// am launches agents with their provider's own full access; it has no restricted mode to map to.
+const FULL_ACCESS_ONLY = "Agent Motel only runs in Full access";
 
 const AmProviderCapabilitiesV2 = {
   // The agent's own provider enforces permissions; T3 never answers for it.
@@ -146,15 +148,14 @@ export interface AmAdapterV2Options {
 interface ActiveTurn {
   readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
   providerTurn: OrchestrationV2ProviderTurn;
-  readonly startIndex: number;
+  /** The transcript length at send, then the index of T3's own prompt once am delivers it. */
+  startIndex: number;
   /** Lowest transcript index that can still change. */
   cursor: number;
   readonly published: Map<number, { readonly entry: AmTranscriptEntry; readonly settled: boolean }>;
   readonly ordinals: Map<string, number>;
   nextOrdinal: number;
   readonly sent: Array<string>;
-  /** A queued message only reaches a busy agent once its current work ends. */
-  readonly busyAtSend: boolean;
   delivered: boolean;
   attentionEpisodes: number;
   inAttention: boolean;
@@ -201,6 +202,8 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
       if (!options.settings.enabled) return yield* protocolError("Agent Motel is disabled");
       if (input.runtimePolicy.interactionMode === "plan")
         return yield* protocolError("Agent Motel does not support Plan mode");
+      if (input.runtimePolicy.runtimeMode !== "full-access")
+        return yield* protocolError(FULL_ACCESS_ONLY);
       const scope = yield* Effect.scope;
       const cwd = input.runtimePolicy.cwd ?? providerHost.paths.cwd;
       const now = yield* DateTime.now;
@@ -304,10 +307,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         settled: boolean,
       ) {
         if (entry.kind === "user") {
-          if (isSentMessage(entry.text ?? "", turn.sent)) {
-            turn.delivered = true;
-            return;
-          }
+          if (isSentMessage(entry.text ?? "", turn.sent)) return;
           // Someone else reached the agent through am (another agent, or its terminal).
           if (entry.text?.trim())
             yield* emitNotice(turn, `${entry.index}`, "Message to the agent", entry.text);
@@ -383,14 +383,22 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
       ) {
         for (const entry of entries) {
           if (entry.index < turn.startIndex) continue;
+          // Until T3's prompt shows up, the transcript belongs to work that came before it.
+          if (!turn.delivered) {
+            if (entry.kind === "user" && isSentMessage(entry.text ?? "", turn.sent)) {
+              turn.delivered = true;
+              turn.startIndex = entry.index;
+            }
+            continue;
+          }
           const previous = turn.published.get(entry.index);
           if (previous?.settled === settled && sameEntry(previous.entry, entry)) continue;
           turn.published.set(entry.index, { entry, settled });
           yield* publishEntry(turn, entry, settled);
         }
-        const open = entries.filter(
-          (entry) => entry.index >= turn.startIndex && isEntryOpen(entry),
-        );
+        const open = turn.delivered
+          ? entries.filter((entry) => entry.index >= turn.startIndex && isEntryOpen(entry))
+          : [];
         turn.cursor = Math.max(
           turn.startIndex,
           open.length > 0 ? Math.min(...open.map((entry) => entry.index)) : total,
@@ -428,7 +436,11 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
             class: "provider_error",
             message: detail ?? "The Agent Motel agent stopped.",
           });
-          const { identity: _identity, ...base } = baseItem(turn, "failure", completedAt);
+          const { identity: _identity, ...base } = baseItem(
+            turn,
+            `failure:${turn.input.runId}`,
+            completedAt,
+          );
           yield* emit({
             type: "turn_item.updated",
             driver: AM_PROVIDER,
@@ -474,9 +486,6 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         if (active !== turn) return;
         yield* applyEntries(turn, transcript.entries, transcript.total, false);
         const phase = amTurnPhase(transcript.status);
-        // `starting` precedes the first prompt, so only real work after an idle send counts.
-        if (!turn.busyAtSend && (transcript.status === "working" || phase === "attention"))
-          turn.delivered = true;
         if (phase !== "attention") turn.inAttention = false;
         switch (phase) {
           case "running":
@@ -489,7 +498,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
             const reason = Option.getOrUndefined(Option.flatten(detail))?.statusReason;
             return yield* emitNotice(
               turn,
-              `attention:${++turn.attentionEpisodes}`,
+              `attention:${turn.input.runId}:${++turn.attentionEpisodes}`,
               "Waiting in its terminal",
               `${reason ? `${reason}. ` : ""}T3 Code cannot answer this agent's prompts. Answer it in its session with \`am j ${agentName}\`.`,
             );
@@ -629,18 +638,18 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           });
         if (turnInput.runtimePolicy.interactionMode === "plan")
           return yield* protocolError("Agent Motel does not support Plan mode");
+        if (turnInput.runtimePolicy.runtimeMode !== "full-access")
+          return yield* protocolError(FULL_ACCESS_ONLY);
         const text = promptText(turnInput.message);
         if (!text) return yield* protocolError("Agent Motel needs a text message");
         const name = agentName;
         const detail = Option.getOrUndefined(yield* fromApi(api.getAgent(name)));
         let startIndex = 0;
-        let busyAtSend = false;
         if (detail) {
           const phase = amTurnPhase(detail.status);
           if (phase === "gone") yield* fromApi(api.resume(name));
           const transcript = yield* fromApi(api.transcript(name, TRANSCRIPT_END));
           startIndex = transcript.total;
-          busyAtSend = phase !== "idle";
         }
         const startedAt = yield* DateTime.now;
         const providerTurn: OrchestrationV2ProviderTurn = {
@@ -666,7 +675,6 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           ordinals: new Map(),
           nextOrdinal: turnInput.providerTurnOrdinal * 100 + 1,
           sent: [text],
-          busyAtSend,
           delivered: false,
           attentionEpisodes: 0,
           inAttention: false,
@@ -790,7 +798,8 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
                 }),
             ),
           ),
-        // am's `now` mode types straight into the TUI, which steers the running turn natively.
+        // am's `now` mode types straight into the TUI, steering whatever runs there. Before the
+        // turn's own prompt is delivered that is someone else's work, so queue behind the prompt.
         steerTurn: Effect.fn("AmAdapterV2.steerTurn")(
           function* (args) {
             const turn = active;
@@ -803,7 +812,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
             const text = promptText(args.message);
             if (!text) return yield* protocolError("Agent Motel needs a text message");
             turn.sent.push(text);
-            yield* fromApi(api.sendMessage(agentName!, text, "now"));
+            yield* fromApi(api.sendMessage(agentName!, text, turn.delivered ? "now" : "queue"));
           },
           (effect, args) =>
             effect.pipe(

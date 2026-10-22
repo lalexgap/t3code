@@ -56,9 +56,12 @@ export const amTurnPhase = (status: string): AmTurnPhase => {
 
 const normalize = (text: string) => text.replace(/\s+/g, " ").trim();
 
+/** Below this, containment matches unrelated text (`yes` inside `yesterday`). */
+const MIN_CONTAINMENT_CHARS = 24;
+
 /**
- * Whether a transcript user entry is a message T3 typed into the agent. am can attribute or
- * wrap delivered text, and long messages may be split, so compare on a normalized prefix.
+ * Whether a transcript user entry is a message T3 typed into the agent. Providers can wrap or
+ * split long text, so long messages compare on a normalized prefix; short ones must be equal.
  */
 export const isSentMessage = (entryText: string, sent: ReadonlyArray<string>) => {
   const entry = normalize(entryText);
@@ -66,8 +69,10 @@ export const isSentMessage = (entryText: string, sent: ReadonlyArray<string>) =>
   return sent.some((text) => {
     const message = normalize(text);
     if (!message) return false;
-    const probe = message.slice(0, 200);
-    return entry.includes(probe) || message.includes(entry.slice(0, 200));
+    if (entry === message) return true;
+    if (entry.length < MIN_CONTAINMENT_CHARS || message.length < MIN_CONTAINMENT_CHARS)
+      return false;
+    return entry.includes(message.slice(0, 200)) || message.includes(entry.slice(0, 200));
   });
 };
 

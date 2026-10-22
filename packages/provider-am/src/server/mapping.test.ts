@@ -39,11 +39,18 @@ describe("amTurnPhase", () => {
 });
 
 describe("isSentMessage", () => {
-  it("matches a delivered message through am's attribution and whitespace changes", () => {
-    const sent = ["Fix the bug\n\nin login.ts"];
-    assert.isTrue(isSentMessage("[from alex] Fix the bug in login.ts", sent));
+  it("matches a long delivered message through wrapping and whitespace changes", () => {
+    const sent = ["Fix the redirect bug\n\nin login.ts and add a test"];
+    assert.isTrue(isSentMessage("<prompt>Fix the redirect bug in login.ts and add a test", sent));
+    assert.isTrue(isSentMessage("Fix the redirect bug in login.ts", sent));
     assert.isFalse(isSentMessage("Something else entirely", sent));
     assert.isFalse(isSentMessage("   ", sent));
+  });
+
+  it("matches a short message only exactly", () => {
+    assert.isTrue(isSentMessage(" yes\n", ["yes"]));
+    assert.isFalse(isSentMessage("yesterday the build broke", ["yes"]));
+    assert.isFalse(isSentMessage("yes", ["yesterday the build broke again"]));
   });
 });
 
