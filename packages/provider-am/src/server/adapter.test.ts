@@ -67,6 +67,7 @@ const makeHarness = Effect.fnUntraced(function* (
     settings: instanceSettings,
     api,
     pollIntervalMs: 3_600_000,
+    settleGraceMs: 1_000,
   });
   const runtime = yield* adapter.openSession({
     threadId: THREAD_ID,
@@ -273,6 +274,61 @@ describe("AmAdapterV2", () => {
       assert.strictEqual(command?.type === "command_execution" && command.output, "src/login.ts");
       // The prompt T3 sent is already the thread's user message.
       assert.deepStrictEqual(harness.notices(), []);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  // Replays a live run (am main e2c459b): Claude's inbox took the prompt with no transcript entry,
+  // and its Stop hook marked the receipt done before Claude flushed the reply to its session
+  // file. So the first receipt T3 sees is already `done` at index 0, over a transcript without
+  // the reply, and "PONG" lands at index 0 a moment later with no wake. A typed prompt shows
+  // its own entry first, putting the reply at index 1.
+  it.live.each(["inbox", "typed"] as const)(
+    "waits for a reply flushed after the receipt is done (%s delivery)",
+    (shape) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeAm();
+        const harness = yield* makeHarness(fake);
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Say PONG"));
+        const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+        const transcriptRead = fake.takeCall("GET", `/api/agents/${AGENT}/transcript`);
+        yield* transcriptRead;
+        yield* fake.receipt(sent.messageId!, (message, agent) => {
+          message.state = "done";
+          message.transcriptIndex = 0;
+          agent.status = "idle";
+          if (shape === "typed") agent.entries.push(user("Say PONG"));
+        });
+        // Two reads see the done receipt without the reply, which was once all the run got.
+        yield* transcriptRead;
+        yield* transcriptRead;
+        fake.agents.get(AGENT)!.entries.push(assistant("PONG"));
+        yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
+        assert.deepStrictEqual(harness.replies(), ["PONG"]);
+        assert.deepStrictEqual(harness.notices(), []);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("waits for a steer's reply flushed after its receipt is done", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Long job"));
+      const prompt = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      yield* steer(harness, started.providerTurn.id, "Also update the docs");
+      const behind = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      yield* deliver(fake, prompt.messageId!, user("Long job"), assistant("Halfway."));
+      yield* complete(fake, prompt.messageId!);
+      // The steer arrives through the inbox with no entry, and is done before its reply is on disk.
+      const transcriptRead = fake.takeCall("GET", `/api/agents/${AGENT}/transcript`);
+      yield* deliver(fake, behind.messageId!);
+      yield* complete(fake, behind.messageId!);
+      yield* transcriptRead;
+      yield* transcriptRead;
+      fake.agents.get(AGENT)!.entries.push(assistant("Docs updated."));
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
+      assert.deepStrictEqual(harness.replies(), ["Halfway.", "Docs updated."]);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
