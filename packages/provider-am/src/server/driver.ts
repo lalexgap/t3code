@@ -79,7 +79,6 @@ export const amGitRoot = (path: string) =>
       path,
       "rev-parse",
       "--show-prefix",
-      "--path-format=absolute",
       "--git-dir",
       "--git-common-dir",
     ]),

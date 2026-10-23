@@ -265,6 +265,30 @@ const amSafeRoot = (
 };
 
 /**
+ * A local repository with a linked worktree's main root spelled under the same home as `dir`.
+ * Git names the common dir by its real path, so under a symlinked home a worktree's main root
+ * would otherwise be spelled apart from the main checkout's own agents.
+ */
+export const amRepoSpelledLike = (
+  repo: AmGitRepo,
+  dir: string,
+  context: Pick<AmWorkspaceContext, "home" | "realHome">,
+): AmGitRepo => {
+  const home = normalizePath(context.home);
+  const realHome = normalizePath(context.realHome ?? context.home);
+  const at = normalizePath(amLocalPath(dir, context.home));
+  if (repo.worktree === null || home === realHome) return repo;
+  const within = (path: string, base: string) => path === base || isUnder(path, base);
+  for (const [from, to] of [
+    [realHome, home],
+    [home, realHome],
+  ] as const)
+    if (within(repo.root, from) && !within(repo.root, to) && within(at, to) && !within(at, from))
+      return { ...repo, root: `${to}${repo.root.slice(from.length)}` };
+  return repo;
+};
+
+/**
  * The project an agent's thread belongs to, and the worktree it runs in, if any: its am
  * worktree's repository, else the main repository its directory is in, else the directory. A
  * fleet host's worktree lives on that host, so its thread is never bound to a checkout here.
@@ -293,7 +317,9 @@ export const amWorkspace = (row: AmFleetRow, context: AmWorkspaceContext): AmWor
       true,
       remote ? null : { path: row.worktreePath, branch: row.worktreeBranch ?? null },
     );
-  const repo = context.gitRoot;
+  const repo =
+    context.gitRoot &&
+    (remote ? context.gitRoot : amRepoSpelledLike(context.gitRoot, dir, context));
   const gitRoot =
     repo === null
       ? null
@@ -326,18 +352,24 @@ export const amGitToplevel = (path: string, prefix: string) => {
 };
 
 /**
- * The repository `path` is in, from `git rev-parse --show-prefix --path-format=absolute
- * --git-dir --git-common-dir`. A linked worktree's git dir differs from the common dir, whose
- * parent is the main worktree. A bare repository's worktree, or an unexpected answer, keeps
- * the toplevel as the root.
+ * The repository `path` is in, from `git rev-parse --show-prefix --git-dir --git-common-dir`,
+ * whose relative answers are relative to `path`. A linked worktree's git dir is in its common
+ * dir's `worktrees`, and the common dir's parent is the main worktree. A bare repository's
+ * worktree, or an unexpected answer, keeps the toplevel as the root.
  */
 export const amGitRepo = (path: string, stdout: string): AmGitRepo | null => {
-  const [prefix = "", gitDir = "", commonDir = ""] = stdout.split("\n");
-  const toplevel = amGitToplevel(path, prefix);
+  const lines = (stdout.endsWith("\n") ? stdout.slice(0, -1) : stdout).split("\n");
+  const toplevel = amGitToplevel(path, lines[0] ?? "");
   if (toplevel === null) return null;
-  const common = trimSlashes(commonDir.trim());
-  const linked = gitDir.trim() !== "" && trimSlashes(gitDir.trim()) !== common;
-  if (!linked || !common.startsWith("/") || !common.endsWith("/.git"))
+  const [, gitDir = "", commonDir = ""] = lines;
+  const resolve = (dir: string) => normalizePath(dir.startsWith("/") ? dir : `${path}/${dir}`);
+  if (lines.length !== 3 || gitDir === "" || commonDir === "")
+    return { root: toplevel, worktree: null };
+  const common = resolve(commonDir);
+  const worktrees = `${common}/worktrees/`;
+  const own = resolve(gitDir);
+  const name = own.startsWith(worktrees) ? own.slice(worktrees.length) : "";
+  if (name === "" || name.includes("/") || !common.endsWith("/.git"))
     return { root: toplevel, worktree: null };
   return { root: common.slice(0, -"/.git".length) || "/", worktree: toplevel };
 };

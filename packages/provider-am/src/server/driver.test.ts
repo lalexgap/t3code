@@ -65,7 +65,6 @@ describe("amGitRoot", () => {
         "/home/me/app/ui",
         "rev-parse",
         "--show-prefix",
-        "--path-format=absolute",
         "--git-dir",
         "--git-common-dir",
       ]);

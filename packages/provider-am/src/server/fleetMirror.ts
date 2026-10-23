@@ -28,6 +28,7 @@ import {
   amLocalPath,
   amMirroredThrough,
   amMirrorStatus,
+  amRepoSpelledLike,
   amWorkspace,
   fleetHostPathHere,
   planMirror,
@@ -133,8 +134,13 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
         ? null
         : yield* options.gitRoot(amLocalPath(dirHere, options.home));
     const realPaths = new Map<string, string>();
+    // Resolve the main root as amWorkspace will bind it, under the agent's own home spelling.
+    const boundRoot =
+      !remote && gitRoot && dirHere !== null
+        ? amRepoSpelledLike(gitRoot, dirHere, options).root
+        : null;
     if (!remote)
-      for (const candidate of new Set([row.dir, row.repoRoot, gitRoot?.root])) {
+      for (const candidate of new Set([row.dir, row.repoRoot, boundRoot])) {
         if (!candidate) continue;
         const path = amLocalPath(candidate, options.home);
         const real = yield* options.realPath(path);

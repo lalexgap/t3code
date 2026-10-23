@@ -364,6 +364,44 @@ describe("makeAmFleetMirror", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.effect("groups a main checkout and a linked worktree under a symlinked home", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set("main", agent([], { dir: "/work/app/ui" }));
+      fake.agents.set("review", agent([], { dir: "/work/wt" }));
+      const mirror = yield* makeFakeMirror([]);
+      const resolved: Array<string> = [];
+      const { statuses } = yield* startMirror(fake, mirror, "", {
+        realHome: "/data/work",
+        // Git names a linked worktree's common dir by its real path.
+        gitRoot: (path) =>
+          Effect.succeed(
+            path === "/work/wt"
+              ? { root: "/data/work/app", worktree: "/work/wt" }
+              : { root: "/work/app", worktree: null },
+          ),
+        realPath: (path) => {
+          resolved.push(path);
+          return Effect.succeed(path.replace(/^\/work\//, "/data/work/"));
+        },
+      });
+      yield* Queue.take(statuses);
+      yield* TestClock.adjust("1 second");
+      assert.strictEqual(yield* Queue.take(statuses), "Mirroring 2 agents.");
+      const adopted = new Map<string, ProviderThreadMirror.ProviderThreadAdoption>();
+      for (let index = 0; index < 2; index++) {
+        const adoption = yield* Queue.take(mirror.adoptions);
+        adopted.set(adoption.nativeThreadId, adoption);
+      }
+      assert.strictEqual(adopted.get("main")?.workspaceRoot, "/work/app");
+      assert.strictEqual(adopted.get("review")?.workspaceRoot, "/work/app");
+      assert.deepStrictEqual(adopted.get("review")?.worktree, { path: "/work/wt", branch: null });
+      // The worktree's root is resolved as it is bound, not as git spelled it.
+      assert.include(resolved, "/work/app");
+      assert.notInclude(resolved, "/data/work/app");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.effect("counts a fleet host's agent with no path under this home as having no copy", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();

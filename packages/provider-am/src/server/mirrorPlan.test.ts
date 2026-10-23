@@ -11,6 +11,7 @@ import {
   amGitToplevel,
   amHistory,
   amMirrorStatus,
+  amRepoSpelledLike,
   amWorkspace,
   fleetHostPathHere,
   planMirror,
@@ -375,6 +376,37 @@ describe("amWorkspace", () => {
     });
   });
 
+  it("spells a linked worktree's main root under the agent's own home", () => {
+    const linked = { ...local, realHome: "/data/me" };
+    const main = amWorkspace(row("main", { dir: "/home/me/app/ui" }), {
+      ...linked,
+      gitRoot: { root: "/home/me/app", worktree: null },
+    });
+    const review = amWorkspace(row("review", { dir: "/home/me/wt" }), {
+      ...linked,
+      gitRoot: { root: "/data/me/app", worktree: "/home/me/wt" },
+    });
+    assert.deepStrictEqual(main, { _tag: "Workspace", root: "/home/me/app", worktree: null });
+    assert.deepStrictEqual(review, {
+      _tag: "Workspace",
+      root: "/home/me/app",
+      worktree: { path: "/home/me/wt", branch: null },
+    });
+    // An agent spelled by the real home keeps the real spelling.
+    assert.deepStrictEqual(
+      amWorkspace(row("review", { dir: "/data/me/wt" }), {
+        ...linked,
+        gitRoot: { root: "/home/me/app", worktree: "/data/me/wt" },
+      }),
+      { _tag: "Workspace", root: "/data/me/app", worktree: { path: "/data/me/wt", branch: null } },
+    );
+    // A root outside both homes is left as git spelled it.
+    assert.deepStrictEqual(
+      amRepoSpelledLike({ root: "/srv/app", worktree: "/home/me/wt" }, "/home/me/wt", linked),
+      { root: "/srv/app", worktree: "/home/me/wt" },
+    );
+  });
+
   it("groups an agent in a linked worktree into its main repository's project", () => {
     const repo = {
       root: "/home/me/code/app",
@@ -586,6 +618,49 @@ describe("amGitRepo", () => {
       worktree: null,
     });
     assert.isNull(amGitRepo("/home/me/elsewhere", "ui/\n/x/.git\n/x/.git\n"));
+  });
+
+  it("resolves git's relative answers against the directory", () => {
+    assert.deepStrictEqual(amGitRepo("/home/me/app", "\n.git\n.git\n"), {
+      root: "/home/me/app",
+      worktree: null,
+    });
+    // In a subdirectory git names the git dir by its real path but the common dir relatively.
+    assert.deepStrictEqual(amGitRepo("/home/me/app/ui", "ui/\n/data/me/app/.git\n../.git\n"), {
+      root: "/home/me/app",
+      worktree: null,
+    });
+    assert.deepStrictEqual(
+      amGitRepo("/home/me/wt", "\n/abs/main/.git/worktrees/x\n/abs/main/.git\n"),
+      { root: "/abs/main", worktree: "/home/me/wt" },
+    );
+    assert.deepStrictEqual(
+      amGitRepo("/home/me/wt/ui", "ui/\n/home/me/app/.git/worktrees/wt\n../../app/.git\n"),
+      { root: "/home/me/app", worktree: "/home/me/wt" },
+    );
+  });
+
+  it("keeps the toplevel for an answer of the wrong shape", () => {
+    const toplevel = { root: "/home/me/wt", worktree: null };
+    // A stray extra line, such as an old git echoing a flag it does not know.
+    assert.deepStrictEqual(
+      amGitRepo("/home/me/wt", "\n/abs/main/.git/worktrees/x\n/abs/main/.git\nextra\n"),
+      toplevel,
+    );
+    assert.deepStrictEqual(
+      amGitRepo(
+        "/home/me/wt",
+        "\n--path-format=absolute\n/abs/main/.git/worktrees/x\n/abs/main/.git\n",
+      ),
+      toplevel,
+    );
+    assert.deepStrictEqual(amGitRepo("/home/me/wt", "\n\n/abs/main/.git\n"), toplevel);
+    // A git dir nested deeper than one worktree name is not a linked worktree's.
+    assert.deepStrictEqual(
+      amGitRepo("/home/me/wt", "\n/abs/main/.git/worktrees/x/y\n/abs/main/.git\n"),
+      toplevel,
+    );
+    assert.isNull(amGitRepo("/home/me/elsewhere", "ui/\n.git\n.git\nextra\n"));
   });
 });
 
