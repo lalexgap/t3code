@@ -327,6 +327,79 @@ describe("amWorkspace", () => {
     });
   });
 
+  it("accepts a path under either spelling of a symlinked home", () => {
+    const linked = { ...local, realHome: "/data/me" };
+    assert.deepStrictEqual(amWorkspace(row("app", { dir: "/data/me/code/app" }), linked), {
+      _tag: "Workspace",
+      root: "/data/me/code/app",
+      worktree: null,
+    });
+    assert.deepStrictEqual(amWorkspace(row("app", { dir: "/home/me/code/app" }), linked), {
+      _tag: "Workspace",
+      root: "/home/me/code/app",
+      worktree: null,
+    });
+    assert.deepStrictEqual(amWorkspace(row("home", { dir: "/data/me" }), linked), {
+      _tag: "Unsafe",
+      reason: "home",
+    });
+    assert.deepStrictEqual(amWorkspace(row("app", { dir: "/data/me/code/app" }), local), {
+      _tag: "Unsafe",
+      reason: "outside-home",
+    });
+  });
+
+  it("checks a local root where its symlinks lead", () => {
+    const resolved = (
+      dir: string,
+      real: string,
+      context: Parameters<typeof amWorkspace>[1] = local,
+    ) => amWorkspace(row("agent", { dir }), { ...context, realPaths: new Map([[dir, real]]) });
+    assert.deepStrictEqual(resolved("/home/me/root", "/"), {
+      _tag: "Unsafe",
+      reason: "filesystem-root",
+    });
+    assert.deepStrictEqual(resolved("/home/me/srv", "/srv/app"), {
+      _tag: "Unsafe",
+      reason: "outside-home",
+    });
+    assert.deepStrictEqual(resolved("/home/me/link/../..", "/home"), {
+      _tag: "Unsafe",
+      reason: "outside-home",
+    });
+    // A `..` after a symlink is where the link leads, not where its spelling suggests.
+    assert.deepStrictEqual(resolved("/home/me/link/../app", "/home/me/code/app"), {
+      _tag: "Workspace",
+      root: "/home/me/code/app",
+      worktree: null,
+    });
+    // Other spellings are kept, normalized, so projects opened by that path still match.
+    assert.deepStrictEqual(
+      resolved("/home/me/code/app/", "/data/me/code/app", {
+        ...local,
+        realHome: "/data/me",
+      }),
+      { _tag: "Workspace", root: "/home/me/code/app", worktree: null },
+    );
+    // A repository whose real path leaves home groups nothing: the agent keeps its directory.
+    assert.deepStrictEqual(
+      amWorkspace(row("ui", { dir: "/home/me/code/app/ui" }), {
+        ...local,
+        gitRoot: "/home/me/code/app",
+        realPaths: new Map([["/home/me/code/app", "/srv/app"]]),
+      }),
+      { _tag: "Workspace", root: "/home/me/code/app/ui", worktree: null },
+    );
+    // A fleet host's paths are not on this machine, so nothing here resolves them.
+    assert.deepStrictEqual(
+      amWorkspace(row("app", { host: "laptop", dir: "/Users/alex/code/app" }), {
+        ...remote,
+        realPaths: new Map([["/home/me/code/app", "/srv/app"]]),
+      }),
+      { _tag: "Workspace", root: "~/code/app", worktree: null },
+    );
+  });
+
   it("maps a fleet host's paths under this machine's home", () => {
     assert.strictEqual(fleetHostPathHere("/Users/alex/code/app"), "~/code/app");
     assert.strictEqual(fleetHostPathHere("/home/alex"), "~");

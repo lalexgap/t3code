@@ -2,6 +2,7 @@ import { ProviderDriverKind, TextGenerationError } from "@t3tools/contracts";
 import * as NodeOS from "node:os";
 
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as HttpClient from "effect/http/HttpClient";
@@ -31,7 +32,7 @@ import type { ProviderTextGeneration } from "@t3tools/provider-core/server/textG
 import { AmSettings, amApiUrl } from "../settings.ts";
 import { makeAmAdapterV2 } from "./adapter.ts";
 import { makeAmApi } from "./api.ts";
-import { makeAmFleetMirror } from "./fleetMirror.ts";
+import { AmGitRootError, makeAmFleetMirror } from "./fleetMirror.ts";
 import { amGitToplevel } from "./mirrorPlan.ts";
 import { checkAmProviderStatus, makePendingAmProvider } from "./status.ts";
 
@@ -62,9 +63,31 @@ const unsupportedTextGeneration: ProviderTextGeneration = (() => {
 
 export type AmDriverEnv =
   | ChildProcessSpawner.ChildProcessSpawner
+  | FileSystem.FileSystem
   | IdAllocator.IdAllocatorV2
   | ProviderHost.ProviderHost
   | HttpClient.HttpClient;
+
+/**
+ * The git toplevel of `path`. Null only when git cleanly reports no repository; a timeout or a
+ * failed spawn fails, since the directory may well be in one.
+ */
+export const amGitRoot = (path: string) =>
+  spawnAndCollect(
+    "git",
+    ChildProcess.make("git", [
+      "-c",
+      "core.fsmonitor=false",
+      "-C",
+      path,
+      "rev-parse",
+      "--show-prefix",
+    ]),
+  ).pipe(
+    Effect.map((result) => (result.code === 0 ? amGitToplevel(path, result.stdout) : null)),
+    Effect.timeout("5 seconds"),
+    Effect.mapError((cause) => new AmGitRootError({ path, cause })),
+  );
 
 export const AmDriver: ProviderDriver<AmSettings, AmDriverEnv> = {
   driverKind: DRIVER_KIND,
@@ -80,18 +103,13 @@ export const AmDriver: ProviderDriver<AmSettings, AmDriverEnv> = {
   }) {
     const httpClient = yield* HttpClient.HttpClient;
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-    // Anything but a clean answer means no repository: the agent keeps its own directory.
+    const fileSystem = yield* FileSystem.FileSystem;
+    // Null when the path does not exist or cannot be read.
+    const realPath = (path: string) =>
+      fileSystem.realPath(path).pipe(Effect.orElseSucceed(() => null));
     const gitRoot = (path: string) =>
-      spawnAndCollect(
-        "git",
-        ChildProcess.make("git", ["-C", path, "rev-parse", "--show-prefix"]),
-      ).pipe(
-        Effect.map((result) => (result.code === 0 ? amGitToplevel(path, result.stdout) : null)),
-        Effect.timeoutOption("5 seconds"),
-        Effect.map((result) => (result._tag === "Some" ? result.value : null)),
-        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-        Effect.orElseSucceed(() => null),
-      );
+      amGitRoot(path).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
+    const home = NodeOS.homedir();
     const effectiveConfig = { ...config, enabled } satisfies AmSettings;
     const api = makeAmApi(httpClient, {
       baseUrl: amApiUrl(effectiveConfig),
@@ -116,8 +134,10 @@ export const AmDriver: ProviderDriver<AmSettings, AmDriverEnv> = {
       mirror: yield* ProviderThreadMirror.ProviderThreadMirror,
       continuationRequests: yield* ProviderContinuationRequests.ProviderContinuationRequests,
       busyAgents,
-      home: NodeOS.homedir(),
+      home,
+      realHome: (yield* realPath(home)) ?? home,
       gitRoot,
+      realPath,
     });
     const snapshotSettings = yield* makeProviderSnapshotSettingsSource(effectiveConfig);
     const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<AmSettings>>({

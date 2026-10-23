@@ -201,8 +201,15 @@ export interface AmWorkspaceContext {
   readonly remote: boolean;
   /** This machine's home directory. */
   readonly home: string;
+  /** The home directory with its symlinks resolved, when that differs; am may record either. */
+  readonly realHome?: string;
   /** The git toplevel of the agent's directory on this machine, if it is in a repository. */
   readonly gitRoot: string | null;
+  /**
+   * A local agent's candidate roots with their symlinks resolved, keyed by the absolute path as
+   * spelled. A root missing here is checked as spelled.
+   */
+  readonly realPaths?: ReadonlyMap<string, string>;
 }
 
 const trimSlashes = (path: string) => (path.length > 1 ? path.replace(/\/+$/, "") : path);
@@ -220,16 +227,29 @@ const normalizePath = (path: string) => {
 export const amLocalPath = (path: string, home: string) =>
   path === "~" || path.startsWith("~/") ? `${trimSlashes(home)}${path.slice(1)}` : path;
 
+const isUnder = (path: string, dir: string) => dir !== "/" && path.startsWith(`${dir}/`);
+
 /**
- * A project root T3 must never create or bind: the filesystem root, the home directory, and
- * anything outside it.
+ * A project root T3 may create or bind, as T3 should spell it, or why not: never the filesystem
+ * root, the home directory, or anything outside it. A local root is checked where its symlinks
+ * lead, since a link under home can point anywhere.
  */
-const amUnsafeRoot = (root: string, home: string): AmUnsafeRootReason | null => {
-  const path = normalizePath(amLocalPath(root, home));
-  const homeDir = normalizePath(home);
-  if (path === "/") return "filesystem-root";
-  if (path === homeDir) return "home";
-  return homeDir !== "/" && path.startsWith(`${homeDir}/`) ? null : "outside-home";
+const amSafeRoot = (
+  root: string,
+  context: AmWorkspaceContext,
+): { readonly root: string } | { readonly reason: AmUnsafeRootReason } => {
+  const local = amLocalPath(root, context.home);
+  const real = context.remote ? undefined : context.realPaths?.get(local);
+  const path = real ?? normalizePath(local);
+  const homes = [context.home, context.realHome ?? context.home].map(normalizePath);
+  if (path === "/") return { reason: "filesystem-root" };
+  if (homes.includes(path)) return { reason: "home" };
+  if (!homes.some((home) => isUnder(path, home))) return { reason: "outside-home" };
+  if (context.remote) return { root };
+  // A `..` after a symlink climbs from where the link points, which only the real path knows.
+  return {
+    root: real !== undefined && local.split("/").includes("..") ? real : normalizePath(local),
+  };
 };
 
 /**
@@ -241,8 +261,10 @@ export const amWorkspace = (row: AmFleetRow, context: AmWorkspaceContext): AmWor
   const { remote, home } = context;
   const here = (path: string) => (remote ? fleetHostPathHere(path) : path);
   const checked = (root: string, worktree: AmWorkspace["worktree"]): AmWorkspaceResult => {
-    const reason = amUnsafeRoot(root, home);
-    return reason ? { _tag: "Unsafe", reason } : { _tag: "Workspace", root, worktree };
+    const safe = amSafeRoot(root, context);
+    return "reason" in safe
+      ? { _tag: "Unsafe", reason: safe.reason }
+      : { _tag: "Workspace", root: safe.root, worktree };
   };
   const dir = here(row.dir);
   if (dir === null) return { _tag: "Unsafe", reason: "outside-home" };
@@ -261,7 +283,7 @@ export const amWorkspace = (row: AmFleetRow, context: AmWorkspaceContext): AmWor
   // A repository rooted at home, such as dotfiles, groups nothing: the agent keeps its directory.
   const root = [repoRoot, gitRoot].find(
     (candidate): candidate is string =>
-      candidate !== null && amUnsafeRoot(candidate, home) === null,
+      candidate !== null && "root" in amSafeRoot(candidate, context),
   );
   return checked(root ?? dir, null);
 };

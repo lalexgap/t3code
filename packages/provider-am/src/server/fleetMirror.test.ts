@@ -24,7 +24,7 @@ import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import { AmSettings } from "../settings.ts";
 import { makeAmApi } from "./api.ts";
 import { FAKE_TOKEN, makeFakeAm, type FakeAgent, type FakeEntry } from "./fakeAm.testkit.ts";
-import { makeAmFleetMirror } from "./fleetMirror.ts";
+import { AmGitRootError, makeAmFleetMirror, type AmFleetMirrorOptions } from "./fleetMirror.ts";
 import { AM_MIRROR_ENTRY_LIMIT, AM_REMOVED_MARK, amConversationHead } from "./mirrorPlan.ts";
 
 const testLayer = Layer.mergeAll(
@@ -125,6 +125,7 @@ const startMirror = Effect.fnUntraced(function* (
   fake: Effect.Success<ReturnType<typeof makeFakeAm>>,
   mirror: Effect.Success<ReturnType<typeof makeFakeMirror>>,
   host = "",
+  overrides: Partial<AmFleetMirrorOptions> = {},
 ) {
   const requests =
     yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
@@ -139,9 +140,12 @@ const startMirror = Effect.fnUntraced(function* (
     },
     busyAgents: new Set(),
     home: "/work",
+    realHome: "/work",
     gitRoot: () => Effect.succeed(null),
+    realPath: () => Effect.succeed(null),
     // Only explicit wakes and am's events reconcile during a test.
     intervalMs: 3_600_000,
+    ...overrides,
   });
   const statuses = yield* Queue.unbounded<string>();
   yield* fleetMirror.status.pipe(
@@ -304,6 +308,77 @@ describe("makeAmFleetMirror", () => {
       assert.strictEqual(request.providerThreadId, "provider-thread-worker");
       assert.strictEqual(request.delivery, "adapter_buffered");
       assert.strictEqual(request.notification?.summary, "Agent Motel activity");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("tries an agent again when git could not say which repository it is in", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set("ui", agent([], { dir: "/work/app/packages/ui" }));
+      const mirror = yield* makeFakeMirror([]);
+      let gitAnswers = false;
+      const { fleetMirror, statuses } = yield* startMirror(fake, mirror, "", {
+        gitRoot: () =>
+          gitAnswers
+            ? Effect.succeed("/work/app")
+            : Effect.fail(
+                new AmGitRootError({ path: "/work/app/packages/ui", cause: "timed out" }),
+              ),
+      });
+      assert.strictEqual(yield* Queue.take(statuses), "Mirroring 0 agents.");
+      assert.strictEqual(yield* Queue.size(mirror.adoptions), 0);
+
+      gitAnswers = true;
+      yield* fleetMirror.wake;
+      assert.strictEqual(yield* Queue.take(statuses), "Mirroring 1 agent.");
+      assert.strictEqual((yield* Queue.take(mirror.adoptions)).workspaceRoot, "/work/app");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("checks a local agent's project where its symlinks lead", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set("escaped", agent([], { dir: "/work/link" }));
+      fake.agents.set("real", agent([], { dir: "/data/work/app" }));
+      const mirror = yield* makeFakeMirror([]);
+      const { statuses } = yield* startMirror(fake, mirror, "", {
+        realHome: "/data/work",
+        realPath: (path) => Effect.succeed(path === "/work/link" ? "/srv/app" : path),
+      });
+      yield* Queue.take(statuses);
+      yield* TestClock.adjust("1 second");
+      assert.strictEqual(
+        yield* Queue.take(statuses),
+        "Mirroring 1 agent. Skipped 1 agent with a project outside your home directory.",
+      );
+      assert.strictEqual((yield* Queue.take(mirror.adoptions)).workspaceRoot, "/data/work/app");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("stops counting a skipped agent once it ages out of the imports", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      const now = yield* DateTime.now;
+      fake.agents.set(
+        "outside",
+        agent([], { dir: "/srv/app", status: "exited", updatedAt: daysAgo(now, 1) }),
+      );
+      fake.agents.set(
+        "elsewhere",
+        agent([], { dir: "/work/missing/app", status: "exited", updatedAt: daysAgo(now, 1) }),
+      );
+      const mirror = yield* makeFakeMirror([]);
+      const { fleetMirror, statuses } = yield* startMirror(fake, mirror);
+      yield* Queue.take(statuses);
+      yield* TestClock.adjust("1 second");
+      assert.strictEqual(
+        yield* Queue.take(statuses),
+        "Mirroring 0 agents. 1 agent works in a project with no copy on this machine. Skipped 1 agent with a project outside your home directory.",
+      );
+
+      yield* TestClock.adjust("30 days");
+      yield* fleetMirror.wake;
+      assert.strictEqual(yield* Queue.take(statuses), "Mirroring 0 agents.");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
