@@ -54,6 +54,8 @@ export interface MirrorPlanInput {
   readonly nowMs: number;
   /** Each agent's liveness at the previous reconcile; undefined before the first one. */
   readonly previous: ReadonlyMap<string, AmLiveness> | undefined;
+  /** Agents the previous listing left out, their liveness carried over from the one before. */
+  readonly previousOmitted?: ReadonlySet<string>;
 }
 
 export interface MirrorWatch {
@@ -73,6 +75,7 @@ export interface MirrorPlan {
   /** Visible threads whose agent am still has, including T3's own that have not run yet. */
   readonly mirrored: number;
   readonly liveness: ReadonlyMap<string, AmLiveness>;
+  readonly omitted: ReadonlySet<string>;
 }
 
 const timeMs = (value: string | undefined) => {
@@ -91,11 +94,21 @@ export const planMirror = (input: MirrorPlanInput): MirrorPlan => {
       watch: [],
       mirrored: 0,
       liveness: input.previous ?? new Map(),
+      omitted: input.previousOmitted ?? new Set(),
     };
   const rows = new Map<string, AmFleetRow>();
   for (const row of input.fleet.rows)
     if ((row.host ?? "") === host) rows.set(amAgentRef(host, row.name), row);
   const liveness = new Map([...rows].map(([ref, row]) => [ref, amLiveness(row.status)] as const));
+  const previousOmitted = input.previousOmitted ?? new Set<string>();
+  // One listing that leaves an agent out proves nothing, so it keeps its last liveness for one
+  // more listing: returning then is not coming back.
+  const omitted = new Set<string>();
+  for (const [ref, last] of input.previous ?? [])
+    if (!rows.has(ref) && !previousOmitted.has(ref)) {
+      liveness.set(ref, last);
+      omitted.add(ref);
+    }
   const bound = new Set(input.threads.map((thread) => thread.ref));
   const windowMs = input.autoImportDays * DAY_MS;
   const imports = [...rows]
@@ -119,8 +132,10 @@ export const planMirror = (input: MirrorPlanInput): MirrorPlan => {
     const row = rows.get(thread.ref);
     if (!row) {
       // A thread T3 never mirrored may belong to an agent its first message has yet to start.
-      // One fleet listing that leaves an agent out proves nothing; two in a row do.
-      const missingBefore = input.previous !== undefined && !input.previous.has(thread.ref);
+      // Two listings in a row that leave an agent out mean am removed it.
+      const missingBefore =
+        input.previous !== undefined &&
+        (!input.previous.has(thread.ref) || previousOmitted.has(thread.ref));
       if (!thread.archived && thread.head !== null && missingBefore) archive.push(thread);
       continue;
     }
@@ -137,7 +152,7 @@ export const planMirror = (input: MirrorPlanInput): MirrorPlan => {
       input.previous.get(thread.ref) !== "live";
     if (thread.head?.fingerprint === AM_REMOVED_MARK || cameBack) unarchive.push(thread);
   }
-  return { reachable: true, imports, archive, unarchive, watch, mirrored, liveness };
+  return { reachable: true, imports, archive, unarchive, watch, mirrored, liveness, omitted };
 };
 
 const HOME_PREFIX = /^(?:\/(?:Users|home)\/[^/]+|\/root)(?=\/|$)/;

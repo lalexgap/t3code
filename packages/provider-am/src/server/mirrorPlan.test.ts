@@ -114,10 +114,19 @@ describe("planMirror", () => {
     assert.deepStrictEqual(partial.archive, []);
     assert.deepStrictEqual(plan([], threads, { previous: full }).archive, []);
     // Still missing at the next one: am really removed it.
-    assert.deepStrictEqual(
-      refs(plan([row("kept")], threads, { previous: partial.liveness }).archive),
-      ["flaky"],
-    );
+    const next = { previous: partial.liveness, previousOmitted: partial.omitted };
+    assert.deepStrictEqual(refs(plan([row("kept")], threads, next).archive), ["flaky"]);
+  });
+
+  it("does not take an agent one listing left out for one that came back", () => {
+    const archived = [thread("busy", { archived: true })];
+    const omitted = plan([], archived, { previous: new Map([["busy", "live"]]) });
+    assert.strictEqual(omitted.liveness.get("busy"), "live");
+    const back = plan([row("busy", { status: "working" })], archived, {
+      previous: omitted.liveness,
+      previousOmitted: omitted.omitted,
+    });
+    assert.deepStrictEqual(back.unarchive, []);
   });
 
   it("leaves a thread alone when its stopped agent ages out of the window", () => {

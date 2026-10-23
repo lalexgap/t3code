@@ -83,6 +83,7 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
     isAmApiUrlAllowed(settings);
 
   let previous: ReadonlyMap<string, AmLiveness> | undefined;
+  let previousOmitted: ReadonlySet<string> = new Set();
   /** am's `updatedAt` for each agent when T3 last compared its transcript with the thread. */
   const checkedAt = new Map<string, string>();
   /** When T3 last asked to follow each agent, and the thread's head then. */
@@ -192,6 +193,7 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
       autoImportDays: days,
       nowMs: yield* Clock.currentTimeMillis,
       previous,
+      previousOmitted,
     });
     if (!plan.reachable) {
       yield* SubscriptionRef.set(status, `Agent Motel cannot reach ${host} to mirror its agents.`);
@@ -238,6 +240,7 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
     for (const { thread, row } of plan.watch)
       yield* follow(thread, row).pipe(ignoreFailure("follow", thread.ref, undefined));
     previous = plan.liveness;
+    previousOmitted = plan.omitted;
     const refs = new Set(plan.liveness.keys());
     for (const ref of missingWorkspaces.keys()) if (!refs.has(ref)) missingWorkspaces.delete(ref);
     yield* SubscriptionRef.set(
