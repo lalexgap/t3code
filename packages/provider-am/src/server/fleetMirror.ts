@@ -10,6 +10,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
@@ -27,9 +28,11 @@ import {
   amLocalPath,
   amMirroredThrough,
   amMirrorStatus,
+  amRepoSpelledLike,
   amWorkspace,
   fleetHostPathHere,
   planMirror,
+  type AmGitRepo,
   type AmLiveness,
   type AmUnsafeRootReason,
   type MirrorThreadView,
@@ -51,6 +54,15 @@ const OBSERVE_RETRY_MS = 120_000;
 const IMPORTS_PER_STEP = 1;
 const IMPORT_PACE_MS = 1_000;
 
+export class AmGitRootError extends Schema.TaggedError<AmGitRootError>()("AmGitRootError", {
+  path: Schema.String,
+  cause: Schema.Defect(),
+}) {
+  override get message(): string {
+    return `Could not ask git for the repository of ${this.path}`;
+  }
+}
+
 export interface AmFleetMirrorOptions {
   readonly instanceId: ProviderInstanceId;
   readonly settings: AmSettings;
@@ -63,8 +75,15 @@ export interface AmFleetMirrorOptions {
   readonly busyAgents: ReadonlySet<string>;
   /** This machine's home directory. */
   readonly home: string;
-  /** The git toplevel of a directory on this machine; null when it is not in a repository. */
-  readonly gitRoot: (path: string) => Effect.Effect<string | null>;
+  /** The home directory with its symlinks resolved. */
+  readonly realHome: string;
+  /**
+   * The repository of a directory on this machine; null when it is not in one. Fails when git
+   * could not answer, so the agent is tried again rather than kept out of its repository.
+   */
+  readonly gitRoot: (path: string) => Effect.Effect<AmGitRepo | null, AmGitRootError>;
+  /** A path on this machine with its symlinks resolved; null when it cannot be resolved. */
+  readonly realPath: (path: string) => Effect.Effect<string | null>;
   readonly intervalMs?: number;
 }
 
@@ -114,7 +133,31 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
       dirHere === null || (row.worktreePath && row.repoRoot)
         ? null
         : yield* options.gitRoot(amLocalPath(dirHere, options.home));
-    const workspace = amWorkspace(row, { remote, home: options.home, gitRoot });
+    const realPaths = new Map<string, string>();
+    // Resolve the main root as amWorkspace will bind it, under the agent's own home spelling.
+    const boundRoot =
+      !remote && gitRoot && dirHere !== null
+        ? amRepoSpelledLike(gitRoot, dirHere, options).root
+        : null;
+    if (!remote)
+      for (const candidate of new Set([row.dir, row.repoRoot, boundRoot])) {
+        if (!candidate) continue;
+        const path = amLocalPath(candidate, options.home);
+        const real = yield* options.realPath(path);
+        if (real !== null) realPaths.set(path, real);
+      }
+    const workspace = amWorkspace(row, {
+      remote,
+      home: options.home,
+      realHome: options.realHome,
+      gitRoot,
+      realPaths,
+    });
+    if (workspace._tag === "NoCopy") {
+      skipped.delete(row.ref);
+      missingWorkspaces.set(row.ref, row.updatedAt);
+      return false;
+    }
     if (workspace._tag === "Unsafe") {
       skipped.set(row.ref, { updatedAt: row.updatedAt, reason: workspace.reason });
       return false;
@@ -263,11 +306,17 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
     if (importing === 0) triedImports.clear();
     for (const { thread, row } of plan.watch)
       yield* follow(thread, row).pipe(ignoreFailure("follow", thread.ref, undefined));
+    // A listing that confirmed nothing keeps its liveness, and the counts with it.
+    const confirmed = plan.liveness !== previous;
     previous = plan.liveness;
     previousOmitted = plan.omitted;
-    const refs = new Set(plan.liveness.keys());
-    for (const ref of missingWorkspaces.keys()) if (!refs.has(ref)) missingWorkspaces.delete(ref);
-    for (const ref of skipped.keys()) if (!refs.has(ref)) skipped.delete(ref);
+    if (confirmed) {
+      // An agent aged out of the imports no longer counts as missing or skipped; one left out of
+      // a single listing still might come back.
+      const refs = new Set([...plan.imports.map((row) => row.ref), ...plan.omitted]);
+      for (const ref of missingWorkspaces.keys()) if (!refs.has(ref)) missingWorkspaces.delete(ref);
+      for (const ref of skipped.keys()) if (!refs.has(ref)) skipped.delete(ref);
+    }
     const skippedByReason = new Map<AmUnsafeRootReason, number>();
     for (const { reason } of skipped.values())
       skippedByReason.set(reason, (skippedByReason.get(reason) ?? 0) + 1);
