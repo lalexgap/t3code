@@ -101,6 +101,19 @@ export const planMirror = (input: MirrorPlanInput): MirrorPlan => {
   const rows = new Map<string, AmFleetRow>();
   for (const row of input.fleet.rows)
     if ((row.host ?? "") === host) rows.set(amAgentRef(host, row.name), row);
+  // An empty listing while threads are bound is likelier a failed read than every agent removed,
+  // so it confirms nothing and leaves the last known state as it was.
+  if (rows.size === 0 && input.threads.some((thread) => !thread.released))
+    return {
+      reachable: true,
+      imports: [],
+      archive: [],
+      unarchive: [],
+      watch: [],
+      mirrored: input.threads.filter((thread) => !thread.released && !thread.archived).length,
+      liveness: input.previous ?? new Map(),
+      omitted: input.previousOmitted ?? new Set(),
+    };
   const liveness = new Map([...rows].map(([ref, row]) => [ref, amLiveness(row.status)] as const));
   const previousOmitted = input.previousOmitted ?? new Set<string>();
   // One listing that leaves an agent out proves nothing, so it keeps its last liveness for one

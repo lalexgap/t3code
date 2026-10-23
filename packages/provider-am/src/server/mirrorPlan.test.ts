@@ -119,6 +119,19 @@ describe("planMirror", () => {
     assert.deepStrictEqual(refs(plan([row("kept")], threads, next).archive), ["flaky"]);
   });
 
+  it("treats an empty listing as unconfirmed while threads are bound", () => {
+    const threads = [thread("kept"), thread("other")];
+    const previous = new Map([["kept", "live" as const]]);
+    const previousOmitted = new Set(["other"]);
+    for (let listing = 0; listing < 2; listing++) {
+      const empty = plan([], threads, { previous, previousOmitted });
+      assert.deepStrictEqual(empty.archive, []);
+      assert.strictEqual(empty.liveness, previous);
+      assert.strictEqual(empty.omitted, previousOmitted);
+      assert.strictEqual(empty.mirrored, 2);
+    }
+  });
+
   it("does not take an agent one listing left out for one that came back", () => {
     const archived = [thread("busy", { archived: true })];
     const omitted = plan([], archived, { previous: new Map([["busy", "live"]]) });
