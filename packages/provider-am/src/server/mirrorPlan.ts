@@ -116,7 +116,9 @@ export const planMirror = (input: MirrorPlanInput): MirrorPlan => {
     const row = rows.get(thread.ref);
     if (!row) {
       // A thread T3 never mirrored may belong to an agent its first message has yet to start.
-      if (!thread.archived && thread.head !== null) archive.push(thread);
+      // One fleet listing that leaves an agent out proves nothing; two in a row do.
+      const missingBefore = input.previous !== undefined && !input.previous.has(thread.ref);
+      if (!thread.archived && thread.head !== null && missingBefore) archive.push(thread);
       continue;
     }
     if (!thread.archived) {
@@ -143,7 +145,10 @@ const HOME_PREFIX = /^(?:\/(?:Users|home)\/[^/]+|\/root)(?=\/|$)/;
  */
 export const fleetHostPathHere = (path: string) => {
   const home = HOME_PREFIX.exec(path);
-  return home ? `~${path.slice(home[0].length)}` : null;
+  if (!home) return null;
+  const rest = path.slice(home[0].length);
+  // A `..` could climb out of this machine's home.
+  return rest.split("/").includes("..") ? null : `~${rest}`;
 };
 
 export interface AmWorkspace {
@@ -151,14 +156,21 @@ export interface AmWorkspace {
   readonly worktree: { readonly path: string; readonly branch: string | null } | null;
 }
 
-/** The project an agent's thread belongs to, and the am worktree it runs in, if any. */
+/**
+ * The project an agent's thread belongs to, and the am worktree it runs in, if any. A fleet host's
+ * worktree lives on that host, so its thread is never bound to a checkout here.
+ */
 export const amWorkspace = (row: AmFleetRow, remote: boolean): AmWorkspace | null => {
   const here = (path: string) => (remote ? fleetHostPathHere(path) : path);
   const dir = here(row.dir);
   if (dir === null) return null;
   if (row.worktreePath && row.repoRoot) {
     const root = here(row.repoRoot);
-    if (root !== null) return { root, worktree: { path: dir, branch: row.worktreeBranch ?? null } };
+    if (root !== null)
+      return {
+        root,
+        worktree: remote ? null : { path: row.worktreePath, branch: row.worktreeBranch ?? null },
+      };
   }
   return { root: dir, worktree: null };
 };

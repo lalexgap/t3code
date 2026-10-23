@@ -242,6 +242,10 @@ describe("makeAmFleetMirror", () => {
       fake.agents.set("parked", agent([], { status: "working" }));
       const { fleetMirror, statuses } = yield* startMirror(fake, mirror);
 
+      // The first listing that misses an agent only notes it; the next one archives.
+      yield* Queue.take(statuses);
+      assert.strictEqual(yield* Queue.size(mirror.updates), 0);
+      yield* fleetMirror.wake;
       yield* Queue.take(statuses);
       const archived = yield* Queue.take(mirror.updates);
       assert.strictEqual(archived.threadId, "thread-gone");

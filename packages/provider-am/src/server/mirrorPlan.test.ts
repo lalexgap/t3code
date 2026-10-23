@@ -101,6 +101,25 @@ describe("planMirror", () => {
     assert.strictEqual(result.mirrored, 1);
   });
 
+  it("archives only an agent missing from two fleet listings in a row", () => {
+    const threads = [thread("kept"), thread("flaky")];
+    // Nothing is known before the first reconcile.
+    assert.deepStrictEqual(plan([], threads, { previous: undefined }).archive, []);
+    // An empty or partial listing right after a full one archives nothing.
+    const full = new Map([
+      ["kept", "live" as const],
+      ["flaky", "live" as const],
+    ]);
+    const partial = plan([row("kept")], threads, { previous: full });
+    assert.deepStrictEqual(partial.archive, []);
+    assert.deepStrictEqual(plan([], threads, { previous: full }).archive, []);
+    // Still missing at the next one: am really removed it.
+    assert.deepStrictEqual(
+      refs(plan([row("kept")], threads, { previous: partial.liveness }).archive),
+      ["flaky"],
+    );
+  });
+
   it("leaves a thread alone when its stopped agent ages out of the window", () => {
     const result = plan(
       [row("old", { status: "exited", updatedAt: daysAgo(90) })],
@@ -181,6 +200,18 @@ describe("amWorkspace", () => {
         worktree: { path: "/home/me/.agent-manager/worktrees/app/wt", branch: "am/wt" },
       },
     );
+    // An agent working in a subdirectory still binds the worktree's root.
+    assert.deepStrictEqual(
+      amWorkspace(
+        row("nested", {
+          dir: "/repo-wt/packages/ui",
+          worktreePath: "/repo-wt",
+          repoRoot: "/repo",
+        }),
+        false,
+      )?.worktree?.path,
+      "/repo-wt",
+    );
     assert.deepStrictEqual(amWorkspace(row("plain", { dir: "/srv/notes" }), false), {
       root: "/srv/notes",
       worktree: null,
@@ -192,6 +223,8 @@ describe("amWorkspace", () => {
     assert.strictEqual(fleetHostPathHere("/home/alex"), "~");
     assert.strictEqual(fleetHostPathHere("/root/x"), "~/x");
     assert.isNull(fleetHostPathHere("/srv/app"));
+    assert.isNull(fleetHostPathHere("/home/u/../.."));
+    assert.isNull(fleetHostPathHere("/home/u/code/../../other/x"));
     assert.deepStrictEqual(
       amWorkspace(
         row("wt", {
@@ -202,10 +235,8 @@ describe("amWorkspace", () => {
         }),
         true,
       ),
-      {
-        root: "~/code/app",
-        worktree: { path: "~/.agent-manager/worktrees/app/wt", branch: null },
-      },
+      // That worktree is on the fleet host; a checkout here may be unrelated.
+      { root: "~/code/app", worktree: null },
     );
     assert.isNull(amWorkspace(row("srv", { host: "laptop", dir: "/srv/app" }), true));
   });

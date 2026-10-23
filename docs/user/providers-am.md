@@ -70,7 +70,8 @@ still importing.
   you do not have it yet. An agent that am runs in a worktree of its own lands in the repository's
   project, on that worktree and branch.
 - **Fleet hosts.** A fleet host's paths are on that machine, so T3 Code uses this machine's copy at
-  the same path under your home directory, as it does for threads it starts there. It never creates
+  the same path under your home directory, as it does for threads it starts there. A fleet host's
+  worktree stays on that host, so its agent's thread uses the project, not a worktree. It never creates
   a directory: an agent whose project has no copy here is not mirrored, and provider status counts
   it. Diffs and checkpoints read this machine's copy, so they do not show such an agent's changes.
 - **History.** A new thread shows the agent's last 200 transcript entries as history, without tool
