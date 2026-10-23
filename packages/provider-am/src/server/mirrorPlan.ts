@@ -190,11 +190,21 @@ export interface AmWorkspace {
 }
 
 /** Why an agent's project root is never made a T3 project. */
-export type AmUnsafeRootReason = "filesystem-root" | "home" | "outside-home";
+export type AmUnsafeRootReason = "filesystem-root" | "home" | "non-git-outside-home";
 
 export type AmWorkspaceResult =
   | ({ readonly _tag: "Workspace" } & AmWorkspace)
-  | { readonly _tag: "Unsafe"; readonly reason: AmUnsafeRootReason };
+  | { readonly _tag: "Unsafe"; readonly reason: AmUnsafeRootReason }
+  /** A fleet host's agent whose directory has no path under this machine's home. */
+  | { readonly _tag: "NoCopy" };
+
+/** The repository a directory on this machine is in. */
+export interface AmGitRepo {
+  /** The main repository's root. */
+  readonly root: string;
+  /** The linked worktree the directory is in, if it is not the main worktree. */
+  readonly worktree: string | null;
+}
 
 export interface AmWorkspaceContext {
   /** True for a fleet host's agent, whose paths are on that host. */
@@ -203,8 +213,8 @@ export interface AmWorkspaceContext {
   readonly home: string;
   /** The home directory with its symlinks resolved, when that differs; am may record either. */
   readonly realHome?: string;
-  /** The git toplevel of the agent's directory on this machine, if it is in a repository. */
-  readonly gitRoot: string | null;
+  /** The repository of the agent's directory on this machine, if it is in one. */
+  readonly gitRoot: AmGitRepo | null;
   /**
    * A local agent's candidate roots with their symlinks resolved, keyed by the absolute path as
    * spelled. A root missing here is checked as spelled.
@@ -231,18 +241,19 @@ const isUnder = (path: string, dir: string) => dir !== "/" && path.startsWith(`$
 
 /**
  * A project root T3 may create or bind, as T3 should spell it, or why not: never the filesystem
- * root, the home directory, or anything outside it. A local root is checked both as bound and
- * where its symlinks lead, since a link can point anywhere.
+ * root or the home directory, and outside home only a git repository's root. A local root is
+ * checked both as bound and where its symlinks lead, since a link can point anywhere.
  */
 const amSafeRoot = (
   root: string,
+  git: boolean,
   context: AmWorkspaceContext,
 ): { readonly root: string } | { readonly reason: AmUnsafeRootReason } => {
   const homes = [context.home, context.realHome ?? context.home].map(normalizePath);
   const unsafe = (path: string): AmUnsafeRootReason | null => {
     if (path === "/") return "filesystem-root";
     if (homes.includes(path)) return "home";
-    return homes.some((home) => isUnder(path, home)) ? null : "outside-home";
+    return git || homes.some((home) => isUnder(path, home)) ? null : "non-git-outside-home";
   };
   const local = amLocalPath(root, context.home);
   const real = context.remote ? undefined : context.realPaths?.get(local);
@@ -254,39 +265,53 @@ const amSafeRoot = (
 };
 
 /**
- * The project an agent's thread belongs to, and the am worktree it runs in, if any: its am
- * worktree's repository, else the repository its directory is in, else the directory. A fleet
- * host's worktree lives on that host, so its thread is never bound to a checkout here.
+ * The project an agent's thread belongs to, and the worktree it runs in, if any: its am
+ * worktree's repository, else the main repository its directory is in, else the directory. A
+ * fleet host's worktree lives on that host, so its thread is never bound to a checkout here.
  */
 export const amWorkspace = (row: AmFleetRow, context: AmWorkspaceContext): AmWorkspaceResult => {
   const { remote, home } = context;
   const here = (path: string) => (remote ? fleetHostPathHere(path) : path);
-  const checked = (root: string, worktree: AmWorkspace["worktree"]): AmWorkspaceResult => {
-    const safe = amSafeRoot(root, context);
+  const checked = (
+    root: string,
+    git: boolean,
+    worktree: AmWorkspace["worktree"],
+  ): AmWorkspaceResult => {
+    const safe = amSafeRoot(root, git, context);
     return "reason" in safe
       ? { _tag: "Unsafe", reason: safe.reason }
       : { _tag: "Workspace", root: safe.root, worktree };
   };
+  if (remote && normalizePath(row.dir) === "/")
+    return { _tag: "Unsafe", reason: "filesystem-root" };
   const dir = here(row.dir);
-  if (dir === null) return { _tag: "Unsafe", reason: "outside-home" };
+  if (dir === null) return { _tag: "NoCopy" };
   const repoRoot = row.repoRoot === undefined ? null : here(row.repoRoot);
   if (row.worktreePath && repoRoot !== null)
     return checked(
       repoRoot,
+      true,
       remote ? null : { path: row.worktreePath, branch: row.worktreeBranch ?? null },
     );
+  const repo = context.gitRoot;
   const gitRoot =
-    context.gitRoot === null
+    repo === null
       ? null
       : remote
-        ? homeRelative(context.gitRoot, home)
-        : context.gitRoot;
+        ? (homeRelative(repo.root, home) ??
+          (context.realHome ? homeRelative(repo.root, context.realHome) : null) ??
+          repo.root)
+        : repo.root;
   // A repository rooted at home, such as dotfiles, groups nothing: the agent keeps its directory.
   const root = [repoRoot, gitRoot].find(
     (candidate): candidate is string =>
-      candidate !== null && "root" in amSafeRoot(candidate, context),
+      candidate !== null && "root" in amSafeRoot(candidate, true, context),
   );
-  return checked(root ?? dir, null);
+  if (root === undefined) return checked(dir, false, null);
+  // A linked worktree joins its main repository's project, as an am worktree does.
+  const worktree =
+    !remote && repo?.worktree && root === gitRoot ? { path: repo.worktree, branch: null } : null;
+  return checked(root, true, worktree);
 };
 
 /**
@@ -300,7 +325,24 @@ export const amGitToplevel = (path: string, prefix: string) => {
   return dir.endsWith(`/${rest}`) ? dir.slice(0, -rest.length - 1) || "/" : null;
 };
 
-/** A path under this machine's home as `~`-relative, as a fleet host's mapped paths are. */
+/**
+ * The repository `path` is in, from `git rev-parse --show-prefix --path-format=absolute
+ * --git-dir --git-common-dir`. A linked worktree's git dir differs from the common dir, whose
+ * parent is the main worktree. A bare repository's worktree, or an unexpected answer, keeps
+ * the toplevel as the root.
+ */
+export const amGitRepo = (path: string, stdout: string): AmGitRepo | null => {
+  const [prefix = "", gitDir = "", commonDir = ""] = stdout.split("\n");
+  const toplevel = amGitToplevel(path, prefix);
+  if (toplevel === null) return null;
+  const common = trimSlashes(commonDir.trim());
+  const linked = gitDir.trim() !== "" && trimSlashes(gitDir.trim()) !== common;
+  if (!linked || !common.startsWith("/") || !common.endsWith("/.git"))
+    return { root: toplevel, worktree: null };
+  return { root: common.slice(0, -"/.git".length) || "/", worktree: toplevel };
+};
+
+/** A path under a home directory as `~`-relative, as a fleet host's mapped paths are. */
 const homeRelative = (path: string, home: string) => {
   const homeDir = trimSlashes(home);
   return path === homeDir
@@ -380,7 +422,7 @@ export const amHistory = (
 const UNSAFE_ROOT_TEXT: Record<AmUnsafeRootReason, string> = {
   "filesystem-root": "at the filesystem root",
   home: "at your home directory",
-  "outside-home": "outside your home directory",
+  "non-git-outside-home": "outside your home directory that is not a git repository",
 };
 
 export const amMirrorStatus = (input: {

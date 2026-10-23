@@ -50,15 +50,36 @@ const withGit = (
   );
 
 describe("amGitRoot", () => {
-  it.effect("finds the toplevel, with git's fsmonitor off", () =>
+  it.effect("finds the repository in one call, with git's fsmonitor off", () =>
     Effect.gen(function* () {
       let seen: ReadonlyArray<string> = [];
-      const root = yield* withGit("/home/me/app/ui", (args) => {
+      const repo = yield* withGit("/home/me/app/ui", (args) => {
         seen = args;
-        return Effect.succeed(gitHandle({ stdout: "ui/\n" }));
+        return Effect.succeed(gitHandle({ stdout: "ui/\n/home/me/app/.git\n/home/me/app/.git\n" }));
       });
-      assert.strictEqual(root, "/home/me/app");
-      assert.deepStrictEqual(seen.slice(0, 2), ["-c", "core.fsmonitor=false"]);
+      assert.deepStrictEqual(repo, { root: "/home/me/app", worktree: null });
+      assert.deepStrictEqual(seen, [
+        "-c",
+        "core.fsmonitor=false",
+        "-C",
+        "/home/me/app/ui",
+        "rev-parse",
+        "--show-prefix",
+        "--path-format=absolute",
+        "--git-dir",
+        "--git-common-dir",
+      ]);
+    }),
+  );
+
+  it.effect("finds a linked worktree's main repository", () =>
+    Effect.gen(function* () {
+      const repo = yield* withGit("/home/me/wt", () =>
+        Effect.succeed(
+          gitHandle({ stdout: "\n/home/me/app/.git/worktrees/wt\n/home/me/app/.git\n" }),
+        ),
+      );
+      assert.deepStrictEqual(repo, { root: "/home/me/app", worktree: "/home/me/wt" });
     }),
   );
 

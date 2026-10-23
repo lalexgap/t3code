@@ -31,6 +31,7 @@ import {
   amWorkspace,
   fleetHostPathHere,
   planMirror,
+  type AmGitRepo,
   type AmLiveness,
   type AmUnsafeRootReason,
   type MirrorThreadView,
@@ -76,10 +77,10 @@ export interface AmFleetMirrorOptions {
   /** The home directory with its symlinks resolved. */
   readonly realHome: string;
   /**
-   * The git toplevel of a directory on this machine; null when it is not in a repository. Fails
-   * when git could not answer, so the agent is tried again rather than kept out of its repository.
+   * The repository of a directory on this machine; null when it is not in one. Fails when git
+   * could not answer, so the agent is tried again rather than kept out of its repository.
    */
-  readonly gitRoot: (path: string) => Effect.Effect<string | null, AmGitRootError>;
+  readonly gitRoot: (path: string) => Effect.Effect<AmGitRepo | null, AmGitRootError>;
   /** A path on this machine with its symlinks resolved; null when it cannot be resolved. */
   readonly realPath: (path: string) => Effect.Effect<string | null>;
   readonly intervalMs?: number;
@@ -133,7 +134,7 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
         : yield* options.gitRoot(amLocalPath(dirHere, options.home));
     const realPaths = new Map<string, string>();
     if (!remote)
-      for (const candidate of new Set([row.dir, row.repoRoot, gitRoot])) {
+      for (const candidate of new Set([row.dir, row.repoRoot, gitRoot?.root])) {
         if (!candidate) continue;
         const path = amLocalPath(candidate, options.home);
         const real = yield* options.realPath(path);
@@ -146,6 +147,11 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
       gitRoot,
       realPaths,
     });
+    if (workspace._tag === "NoCopy") {
+      skipped.delete(row.ref);
+      missingWorkspaces.set(row.ref, row.updatedAt);
+      return false;
+    }
     if (workspace._tag === "Unsafe") {
       skipped.set(row.ref, { updatedAt: row.updatedAt, reason: workspace.reason });
       return false;

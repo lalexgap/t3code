@@ -33,7 +33,7 @@ import { AmSettings, amApiUrl } from "../settings.ts";
 import { makeAmAdapterV2 } from "./adapter.ts";
 import { makeAmApi } from "./api.ts";
 import { AmGitRootError, makeAmFleetMirror } from "./fleetMirror.ts";
-import { amGitToplevel } from "./mirrorPlan.ts";
+import { amGitRepo } from "./mirrorPlan.ts";
 import { checkAmProviderStatus, makePendingAmProvider } from "./status.ts";
 
 const DRIVER_KIND = ProviderDriverKind.make("am");
@@ -79,9 +79,12 @@ export const amGitRoot = (path: string) =>
       path,
       "rev-parse",
       "--show-prefix",
+      "--path-format=absolute",
+      "--git-dir",
+      "--git-common-dir",
     ]),
   ).pipe(
-    Effect.map((result) => (result.code === 0 ? amGitToplevel(path, result.stdout) : null)),
+    Effect.map((result) => (result.code === 0 ? amGitRepo(path, result.stdout) : null)),
     Effect.timeout("5 seconds"),
     Effect.mapError((cause) => new AmGitRootError({ path, cause })),
   );
