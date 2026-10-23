@@ -166,11 +166,11 @@ export const fleetEventConcerns = (data: string, agentRef: string) => {
 // T3's approval card keys each choice by a decision, so each am option needs one of its kind's
 // slots. Codex names its options after the same decisions; Claude offers one allow-always per
 // suggestion it makes.
-const DECISION_SLOTS: Record<string, ReadonlyArray<ProviderApprovalDecision>> = {
-  allow: ["accept"],
-  allow_always: ["acceptForSession", "acceptAlways"],
-  deny: ["decline", "cancel"],
-};
+const DECISION_SLOTS = new Map<string, ReadonlyArray<ProviderApprovalDecision>>([
+  ["allow", ["accept"]],
+  ["allow_always", ["acceptForSession", "acceptAlways"]],
+  ["deny", ["decline", "cancel"]],
+]);
 
 /**
  * am's options in am's order and with am's labels, each on a decision of its kind. Options beyond
@@ -184,12 +184,12 @@ export const amApprovalChoices = (options: ReadonlyArray<AmPermissionOption>) =>
     taken.add(decision);
   };
   for (const option of options) {
-    const named = DECISION_SLOTS[option.kind]?.find((decision) => decision === option.id);
+    const named = DECISION_SLOTS.get(option.kind)?.find((decision) => decision === option.id);
     if (named && !taken.has(named)) take(option, named);
   }
   for (const option of options) {
     if (assigned.has(option)) continue;
-    const free = DECISION_SLOTS[option.kind]?.find((decision) => !taken.has(decision));
+    const free = DECISION_SLOTS.get(option.kind)?.find((decision) => !taken.has(decision));
     if (free) take(option, free);
   }
   const shown: Array<ProviderApprovalOption> = [];
@@ -230,7 +230,7 @@ export const amPermissionRequestKind = (tool: string): ProviderRequestKind =>
         ? "file-read"
         : "permission";
 
-const PROMPT_INPUT_LIMIT = 400;
+const PROMPT_INPUT_LIMIT = 4_000;
 
 /** am's one-line summary, then as much of the tool's input as a card can show. */
 export const amPermissionPrompt = (request: AmPermissionRequest) => {

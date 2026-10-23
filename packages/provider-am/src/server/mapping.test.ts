@@ -6,6 +6,7 @@ import {
   amApprovalChoices,
   amEntryStatus,
   amOptionForDecision,
+  amPermissionPrompt,
   amToolPresentation,
   amTurnPhase,
   fleetEventConcerns,
@@ -151,5 +152,40 @@ describe("amApprovalChoices", () => {
     assert.strictEqual(amOptionForDecision(optionIds, "cancel"), "deny");
     assert.strictEqual(amOptionForDecision(optionIds, "decline"), "deny");
     assert.strictEqual(amOptionForDecision(optionIds, "acceptAlways"), undefined);
+  });
+
+  it("leaves an option of a kind named like an Object property to the terminal", () => {
+    const choices = amApprovalChoices([
+      { id: "allow", label: "Yes", kind: "allow" },
+      { id: "constructor", label: "Odd", kind: "constructor" },
+      { id: "toString", label: "Odder", kind: "toString" },
+      { id: "proto", label: "Oddest", kind: "__proto__" },
+    ]);
+    assert.deepStrictEqual(choices.options, [{ decision: "accept", label: "Yes" }]);
+    assert.strictEqual(choices.hidden, 3);
+  });
+});
+
+describe("amPermissionPrompt", () => {
+  const request = (input: string) => ({
+    id: "PERM1",
+    provider: "claude",
+    tool: "Bash",
+    summary: "Bash",
+    input,
+    options: [],
+    createdAt: "2026-01-01T00:00:00.000Z",
+    expiresAt: null,
+  });
+
+  it("shows a long command in full", () => {
+    const command = `echo ${"x".repeat(2_000)} && rm -rf ~`;
+    assert.strictEqual(amPermissionPrompt(request(command)), `Bash\n\n${command}`);
+  });
+
+  it("marks where it cuts an input too long for a card", () => {
+    const prompt = amPermissionPrompt(request("y".repeat(10_000)));
+    assert.isTrue(prompt.endsWith("..."));
+    assert.isBelow(prompt.length, 10_000);
   });
 });
