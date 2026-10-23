@@ -42,10 +42,34 @@ export const AmSettings = makeProviderSettingsSchema(
         providerSettingsForm: { placeholder: "this machine", clearWhenEmpty: "omit" },
       }),
     ),
+    autoImportDays: Schema.Literals(["0", "1", "3", "7", "14", "30"]).pipe(
+      Schema.withDecodingDefault(Effect.succeed("7")),
+      Schema.annotateKey({
+        title: "Mirror agents",
+        description:
+          "Keeps a thread for each agent in am's fleet: running agents, and stopped ones active within this window. Off leaves the fleet alone.",
+        // The form shows the first option for an unset value and saves it as unset.
+        providerSettingsForm: {
+          control: "select",
+          options: [
+            { value: "7", label: "Running, or stopped in the last 7 days" },
+            { value: "1", label: "Running, or stopped in the last day" },
+            { value: "3", label: "Running, or stopped in the last 3 days" },
+            { value: "14", label: "Running, or stopped in the last 14 days" },
+            { value: "30", label: "Running, or stopped in the last 30 days" },
+            { value: "0", label: "Off" },
+          ],
+        },
+      }),
+    ),
   },
-  { order: ["apiUrl", "apiToken", "host"] },
+  { order: ["apiUrl", "apiToken", "host", "autoImportDays"] },
 );
 export type AmSettings = typeof AmSettings.Type;
+
+/** How long a stopped agent stays eligible for a mirrored thread, in days; 0 turns mirroring off. */
+export const amAutoImportDays = (settings: Pick<AmSettings, "autoImportDays">) =>
+  Number(settings.autoImportDays);
 
 export const amApiUrl = (settings: Pick<AmSettings, "apiUrl">) =>
   (settings.apiUrl || AM_DEFAULT_API_URL).replace(/\/+$/, "");

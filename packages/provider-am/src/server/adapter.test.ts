@@ -32,6 +32,7 @@ import { makeAmAdapterV2 } from "./adapter.ts";
 import { makeAmApi } from "./api.ts";
 import { FAKE_TOKEN, makeFakeAm, type FakeAgent, type FakeEntry } from "./fakeAm.testkit.ts";
 import { amAgentName } from "./mapping.ts";
+import { amConversationHead } from "./mirrorPlan.ts";
 
 const testLayer = Layer.mergeAll(
   NodeServices.layer,
@@ -1042,6 +1043,107 @@ describe("AmAdapterV2", () => {
         remote,
       ).pipe(Effect.flip);
       assert.include(String((failure as { cause?: unknown }).cause), "Fleet host");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("follows work T3 did not start, then a T3 turn adds only what is new", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent([user("Old"), assistant("Old reply")]));
+      const now = yield* DateTime.now;
+      const harness = yield* makeHarness(fake, {
+        id: ProviderThreadId.make("provider-thread-imported"),
+        driver: ProviderDriverKind.make("am"),
+        providerInstanceId: INSTANCE_ID,
+        providerSessionId: null,
+        appThreadId: THREAD_ID,
+        ownerNodeId: null,
+        nativeThreadRef: {
+          driver: ProviderDriverKind.make("am"),
+          nativeId: AGENT,
+          strength: "strong",
+        },
+        // Imported with its history, so the thread already shows the first two entries.
+        nativeConversationHeadRef: amConversationHead(AGENT, 2),
+        status: "idle",
+        firstRunOrdinal: null,
+        lastRunOrdinal: null,
+        handoffIds: [],
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+      const heads = () =>
+        harness.allEvents.flatMap((event) =>
+          event.type === "provider_thread.updated"
+            ? [event.providerThread.nativeConversationHeadRef?.ordinal]
+            : [],
+        );
+      const repliesById = () =>
+        new Map(
+          harness
+            .items()
+            .flatMap((item) => (item.type === "assistant_message" ? [[item.id, item.text]] : [])),
+        );
+
+      // A peer's message set the agent working, so the fleet mirror asked for a run to follow it:
+      // a provider-created message, which T3 never sends to the agent.
+      const working = fake.agents.get(AGENT)!;
+      working.status = "working";
+      working.entries.push(user("[am · from reviewer] check CI"), {
+        kind: "tool",
+        name: "Bash",
+        input: '{"command":"gh pr checks"}',
+      });
+      const observed = yield* turnInput(harness.providerThread, "Activity outside T3 Code");
+      yield* harness.runtime.startTurn({
+        ...observed,
+        message: { ...observed.message, createdBy: "agent", creationSource: "provider" },
+      });
+      yield* harness.takeItem((event) => event.turnItem.type === "command_execution");
+      yield* fake.update(AGENT, (agent) => {
+        agent.entries[3] = { ...agent.entries[3]!, output: "all green" };
+        agent.entries.push(assistant("CI is green."));
+        agent.status = "idle";
+      });
+      const observedEnd = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(observedEnd.status, "completed");
+      assert.isFalse(fake.log.some((call) => call.method === "POST"));
+      assert.deepStrictEqual([...repliesById().values()], ["CI is green."]);
+      assert.deepStrictEqual(harness.notices(), ["[am · from reviewer] check CI"]);
+      const afterObserve = harness.allEvents.findLast(
+        (event) => event.type === "provider_thread.updated",
+      );
+      assert.strictEqual(heads().at(-1), 5);
+
+      // Between runs someone types into the agent's terminal and it answers.
+      fake.agents
+        .get(AGENT)!
+        .entries.push(user("Typed in the terminal"), assistant("Terminal reply."));
+      yield* harness.runtime.startTurn(
+        yield* turnInput(
+          afterObserve?.type === "provider_thread.updated"
+            ? afterObserve.providerThread
+            : harness.providerThread,
+          "Next step",
+          2,
+        ),
+      );
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      yield* deliver(fake, sent.messageId!, user("Next step"), assistant("Next reply."));
+      yield* complete(fake, sent.messageId!);
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
+
+      // Every entry after the head shows once, in the run that saw it.
+      assert.deepStrictEqual(
+        [...repliesById().values()],
+        ["CI is green.", "Terminal reply.", "Next reply."],
+      );
+      assert.deepStrictEqual(harness.notices(), [
+        "[am · from reviewer] check CI",
+        "Typed in the terminal",
+      ]);
+      assert.strictEqual(heads().at(-1), 9);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

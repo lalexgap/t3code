@@ -15,6 +15,11 @@ export interface FakeAgent {
   dir: string;
   provider: string;
   entries: Array<FakeEntry>;
+  /** am's last state change, ISO; the fleet list reports it as the agent's activity. */
+  updatedAt?: string;
+  worktreePath?: string;
+  worktreeBranch?: string;
+  repoRoot?: string;
 }
 
 export interface FakeMessage {
@@ -70,6 +75,8 @@ export const makeFakeAm = Effect.fnUntraced(function* (
   const escapes: Array<string> = [];
   let messageSeq = 0;
   const streams = new Set<NodeHttp.ServerResponse>();
+  /** Fleet hosts the fleet list reports as unreachable. */
+  const unreachable: Array<string> = [];
   let markConnected!: () => void;
   const connected = new Promise<void>((resolve) => {
     markConnected = resolve;
@@ -107,6 +114,29 @@ export const makeFakeAm = Effect.fnUntraced(function* (
       return;
     }
     if (parts[0] !== "agents") return json(res, 404, { error: "not found" });
+    if (parts.length === 1 && method === "GET")
+      return json(res, 200, {
+        rows: [...agents].flatMap(([address, agent]) => {
+          const colon = address.indexOf(":");
+          const host = colon === -1 ? undefined : address.slice(0, colon);
+          if (host && unreachable.includes(host)) return [];
+          return [
+            {
+              name: colon === -1 ? address : address.slice(colon + 1),
+              ...(host ? { host } : {}),
+              status: agent.status,
+              provider: agent.provider,
+              queued: 0,
+              dir: agent.dir,
+              updatedAt: agent.updatedAt ?? "2026-01-01T00:00:00.000Z",
+              ...(agent.worktreePath ? { worktreePath: agent.worktreePath } : {}),
+              ...(agent.worktreeBranch ? { worktreeBranch: agent.worktreeBranch } : {}),
+              ...(agent.repoRoot ? { repoRoot: agent.repoRoot } : {}),
+            },
+          ];
+        }),
+        unreachable,
+      });
     if (parts.length === 1 && method === "POST") {
       const host = typeof body?.host === "string" ? body.host : undefined;
       const name = host ? `${host}:${String(body?.name)}` : String(body?.name);
@@ -287,6 +317,7 @@ export const makeFakeAm = Effect.fnUntraced(function* (
   return {
     url: `http://127.0.0.1:${port}`,
     agents,
+    unreachable,
     /** Resolves once a client holds the event stream open, so later wakes reach it. */
     connected: Effect.promise(() => connected),
     /** Mutates an agent, then wakes listeners the way am's daemon does after a state change. */
