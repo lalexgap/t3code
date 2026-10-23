@@ -46,14 +46,44 @@ Pick **Claude Code** or **Codex** in the model picker, or **am default** for the
 am's config. An agent keeps its provider, so start a new thread to switch.
 
 Replies, commands, and tool calls appear as am records them in the agent's transcript, not
-token by token. Messages that reach the agent from elsewhere during a turn, such as another agent
-or its terminal, show as notes in the thread. Activity between T3 Code turns is not shown; read it
-with `am transcript <name>`.
+token by token. Messages that reach the agent from elsewhere, such as another agent or its
+terminal, show as notes in the thread. Work the agent does between T3 Code turns shows as an
+**Agent Motel activity** run while **Mirror agents** is on (see below).
 
 If the agent is busy with other work, the message waits in am's queue and the turn starts when am
 delivers it. Sending while the turn runs steers it. **Stop** withdraws a message am has not
 delivered yet, and otherwise sends Esc to the agent only while that message's turn is running. If
 the agent's session ends mid-turn, the turn fails.
+
+## Mirrored agents
+
+T3 Code keeps a thread for each agent in am's fleet, including agents you start with `am new`.
+**Settings → Providers → Agent Motel → Mirror agents** picks which: agents with a running session,
+plus stopped agents active within the chosen window (7 days unless you change it). **Off** turns
+mirroring off; threads that already exist stay. Each Agent Motel instance mirrors its own Fleet
+host. Refresh provider status, or run **Sync Agent Motel agents** from the command palette, to sync
+now; otherwise it syncs about every 30 seconds, or every minute for a fleet host. Provider status
+shows how many agents it mirrors.
+
+- **Projects.** A new thread lands in the project for the agent's directory, which T3 Code adds if
+  you do not have it yet. An agent that am runs in a worktree of its own lands in the repository's
+  project, on that worktree and branch.
+- **Fleet hosts.** A fleet host's paths are on that machine, so T3 Code uses this machine's copy at
+  the same path under your home directory, as it does for threads it starts there. It never creates
+  a directory: an agent whose project has no copy here is not mirrored, and provider status counts
+  it. Diffs and checkpoints read this machine's copy, so they do not show such an agent's changes.
+- **History.** A new thread shows the agent's last 200 transcript entries as history, without tool
+  calls. Read older ones with `am transcript <name>`.
+- **Activity.** Work that T3 Code did not send appears as it happens in an **Agent Motel activity**
+  run, which lasts while the agent works. Sending a message during it waits for the agent instead
+  of typing into its work. **Stop** on such a run stops showing it; it does not interrupt the agent.
+- **Removed agents.** When am no longer has an agent, for example after `am rm`, its thread is
+  archived. It is unarchived if the agent comes back, for example with `am restore`. A stopped
+  agent that ages out of the window keeps its thread.
+- **Your archive wins.** A thread you archive stays archived while its agent keeps running. It is
+  unarchived only when the agent stops or disappears and later runs again.
+- **Deleting a thread** keeps the agent in am, and T3 Code never mirrors that agent again. If T3
+  Code offers to remove the thread's worktree, decline for an agent that still uses it.
 
 ## Permissions and limitations
 
@@ -67,5 +97,6 @@ taken for T3 Code's own message.
 Plan mode, forks, conversation rewind, and T3 Code's tools are not available. Switching an
 existing thread to Agent Motel passes its conversation as a handoff.
 
-Deleting a thread leaves its agent in am. Remove it with `am rm <name>`. To stop using Agent
-Motel in an environment, disable it in **Settings → Providers**.
+Deleting or archiving a thread never stops or removes its agent. Remove an agent with
+`am rm <name>`. To stop using Agent Motel in an environment, disable it in
+**Settings → Providers**.

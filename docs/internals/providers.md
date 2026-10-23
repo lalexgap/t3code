@@ -49,6 +49,19 @@ client connections and provider-instance rebuilds. Releases are immutable, with 
 selecting the version for new processes. Running processes hold leases on their version. Updates
 and removal must respect those leases instead of replacing executables under a running agent.
 
+## Native threads that start outside T3
+
+Agent Motel agents also start and work outside T3, so its instances mirror the fleet without a
+session. The [thread mirror](../../packages/provider-core/src/server/ProviderThreadMirror.ts) lets a
+provider list the threads bound to its instance, adopt a native thread with bounded history, and
+archive or restore one. The [server side](../../apps/server/src/orchestration-v2/ProviderThreadMirrorService.ts)
+writes an adoption in one transaction guarded by native-thread ownership, so a thread T3 created
+for the same native thread always wins. A deleted thread keeps its native ref, so its native thread
+is never adopted again. Activity T3 did not send runs as a provider continuation: the provider-created
+message starts a run in which the adapter only reads. The provider thread's
+`nativeConversationHeadRef` records how far the thread has mirrored the native transcript, so
+observing runs and T3 turns never show an entry twice.
+
 ## Setup must not happen as a health-check side effect
 
 Opening a provider session can start MCP servers, run hooks, or launch a login browser.
