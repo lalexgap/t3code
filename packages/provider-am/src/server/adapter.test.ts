@@ -17,6 +17,7 @@ import {
   type OrchestrationV2TurnItem,
   type ProviderApprovalDecision,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -65,6 +66,7 @@ const makeHarness = Effect.fnUntraced(function* (
   instanceSettings: AmSettings = settings,
   /** A fleet host's agent has no event stream, so only polling reaches it. */
   pollIntervalMs = 3_600_000,
+  settleGraceMs = 1_000,
 ) {
   const api = makeAmApi(yield* HttpClient.HttpClient, { baseUrl: fake.url, token: FAKE_TOKEN });
   // Turns must settle from am's event stream alone.
@@ -73,7 +75,7 @@ const makeHarness = Effect.fnUntraced(function* (
     settings: instanceSettings,
     api,
     pollIntervalMs,
-    settleGraceMs: 1_000,
+    settleGraceMs,
   });
   const runtime = yield* adapter.openSession({
     threadId: THREAD_ID,
@@ -410,6 +412,52 @@ describe("AmAdapterV2", () => {
       assert.deepStrictEqual(harness.replies(), ["Halfway.", "Docs updated."]);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
+
+  // A turn that ends on a tool call never shows a closing reply, so only am can say it is all there.
+  describe("settle grace from am's transcriptComplete", () => {
+    const LONG_GRACE_MS = 2_500;
+    const settleTimed = Effect.fnUntraced(function* (transcriptComplete: boolean | undefined) {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent());
+      const harness = yield* makeHarness(fake, undefined, settings, undefined, LONG_GRACE_MS);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Run the tests"));
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      yield* deliver(fake, sent.messageId!, assistant("Running them."));
+      const doneAt = yield* Clock.currentTimeMillis;
+      yield* fake.receipt(sent.messageId!, (message, agent) => {
+        agent.entries.push({ kind: "tool", name: "Bash", input: "vp test" });
+        message.state = "done";
+        if (transcriptComplete !== undefined) message.transcriptComplete = transcriptComplete;
+        agent.status = "idle";
+      });
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(terminal.status, "completed");
+      assert.deepStrictEqual(harness.replies(), ["Running them."]);
+      return (yield* Clock.currentTimeMillis) - doneAt;
+    });
+
+    it.live("finishes at once when am saw the reply on disk", () =>
+      Effect.gen(function* () {
+        const elapsed = yield* settleTimed(true);
+        assert.isBelow(elapsed, 900);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("waits a shorter grace when am waited for the reply in vain", () =>
+      Effect.gen(function* () {
+        const elapsed = yield* settleTimed(false);
+        assert.isAtLeast(elapsed, 900);
+        assert.isBelow(elapsed, LONG_GRACE_MS - 500);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("waits the full grace when am does not say", () =>
+      Effect.gen(function* () {
+        const elapsed = yield* settleTimed(undefined);
+        assert.isAtLeast(elapsed, LONG_GRACE_MS - 100);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+  });
 
   it.live("completes a delivered turn that produced no output when am reports it done", () =>
     Effect.gen(function* () {
