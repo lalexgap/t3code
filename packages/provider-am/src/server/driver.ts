@@ -36,7 +36,7 @@ import { makeAmApi } from "./api.ts";
 import { AmGitRootError, makeAmFleetMirror } from "./fleetMirror.ts";
 import { makeAmThreadLifecycle } from "./lifecycle.ts";
 import { amGitRepo } from "./mirrorPlan.ts";
-import { checkAmProviderStatus, makePendingAmProvider } from "./status.ts";
+import { checkAmProviderStatus, makeAmModelCatalogCache, makePendingAmProvider } from "./status.ts";
 
 const DRIVER_KIND = ProviderDriverKind.make("am");
 const decodeAmSettings = Schema.decodeSync(AmSettings);
@@ -143,6 +143,7 @@ export const AmDriver: ProviderDriver<AmSettings, AmDriverEnv> = {
       instanceId,
       makeAmThreadLifecycle({ settings: effectiveConfig, api, busyAgents }),
     );
+    const catalog = yield* makeAmModelCatalogCache(effectiveConfig, api);
     const snapshotSettings = yield* makeProviderSnapshotSettingsSource(effectiveConfig);
     const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<AmSettings>>({
       resolveMaintenance: () => Effect.succeed(MAINTENANCE),
@@ -152,7 +153,7 @@ export const AmDriver: ProviderDriver<AmSettings, AmDriverEnv> = {
       initialSnapshot: (settings) =>
         makePendingAmProvider(settings.provider).pipe(Effect.map(stampIdentity)),
       // A status refresh, including Refresh in settings, also reconciles the fleet.
-      checkProvider: checkAmProviderStatus(effectiveConfig, api).pipe(
+      checkProvider: checkAmProviderStatus(effectiveConfig, api, catalog).pipe(
         Effect.map(stampIdentity),
         Effect.tap(() => fleetMirror.wake),
       ),
@@ -191,6 +192,8 @@ export const AmDriver: ProviderDriver<AmSettings, AmDriverEnv> = {
       snapshot,
       orchestrationAdapter,
       textGeneration: unsupportedTextGeneration,
+      // A failed read keeps the list T3 had, so an am without a model list still refreshes.
+      refreshModels: () => catalog.refresh,
     } satisfies ProviderInstance;
   }),
 };

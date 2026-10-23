@@ -116,12 +116,14 @@ function makeTestAdapter(input: {
   readonly holdRunOrdinal?: number;
   readonly holdFirstTurn?: Deferred.Deferred<void>;
   readonly releaseFirstTurn?: Deferred.Deferred<void>;
+  readonly planSelectionTransition?: ProviderAdapter.ProviderAdapterV2["Service"]["planSelectionTransition"];
 }): ProviderAdapter.ProviderAdapterV2["Service"] {
   return {
     instanceId: input.instanceId,
     driver: input.driver,
     getCapabilities: () => Effect.succeed(input.capabilities),
-    planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
+    planSelectionTransition:
+      input.planSelectionTransition ?? (() => Effect.succeed({ type: "apply_on_next_turn" })),
     openSession: (sessionInput) =>
       Effect.gen(function* () {
         const events = yield* PubSub.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
@@ -1276,6 +1278,132 @@ describe("orchestration v2 provider switching", () => {
         );
       }),
     ),
+  );
+
+  // As an Agent Motel instance runs each provider's agent on a native thread of its own.
+  it.live.each(["started", "queued"] as const)(
+    "moves a %s selection its native thread cannot run to another provider thread of the instance",
+    (mode) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const cwd = yield* checkpointWorkspace(`instance-handoff-${mode}`);
+          const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+          const generation = yield* Ref.make(0);
+          const holdFirstTurn = yield* Deferred.make<void>();
+          const releaseFirstTurn = yield* Deferred.make<void>();
+          const family = (selection: ModelSelection) => selection.model.split("/")[0];
+          const select = (model: string): ModelSelection => ({
+            instanceId: CLAUDE_MODEL_SELECTION.instanceId,
+            model,
+          });
+          const registry = ProviderAdapterRegistry.layerFromAdapters([
+            makeTestAdapter({
+              instanceId: CLAUDE_MODEL_SELECTION.instanceId,
+              driver: CLAUDE_DRIVER,
+              capabilities: ClaudeProviderCapabilitiesV2,
+              modelSelection: CLAUDE_MODEL_SELECTION,
+              responseByRunOrdinal: { 1: "First family answer", 2: "Second family answer" },
+              capturedTurns,
+              nativeThreadGeneration: generation,
+              ...(mode === "queued" ? { holdFirstTurn, releaseFirstTurn } : {}),
+              planSelectionTransition: ({ current, target }) =>
+                Effect.succeed(
+                  family(current) === family(target)
+                    ? { type: "apply_on_next_turn" }
+                    : { type: "create_with_handoff" },
+                ),
+            }),
+          ]);
+          yield* Effect.gen(function* () {
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+            const send = (ordinal: number, modelSelection: ModelSelection) =>
+              orchestrator.dispatch({
+                type: "message.dispatch",
+                commandId: CommandId.make(`instance-handoff:${ordinal}`),
+                threadId,
+                messageId: MessageId.make(`instance-handoff:${ordinal}`),
+                createdBy: "user",
+                creationSource: "web",
+                text: `Request ${ordinal}`,
+                attachments: [],
+                modelSelection,
+                dispatchMode: { type: ordinal > 1 ? "queue_after_active" : "start_immediately" },
+              });
+            const settled = (ordinal: number) =>
+              orchestrator.streamStoredEvents.pipe(
+                Stream.filter(
+                  ({ event }) =>
+                    event.type === "run.updated" &&
+                    event.payload.ordinal === ordinal &&
+                    (event.payload.status === "completed" || event.payload.status === "failed"),
+                ),
+                Stream.runHead,
+                Effect.andThen(worker.drain()),
+              );
+            yield* orchestrator.dispatch({
+              type: "thread.create",
+              commandId: CommandId.make("instance-handoff:create"),
+              threadId,
+              projectId,
+              createdBy: "user",
+              creationSource: "web",
+              title: "Instance handoff",
+              modelSelection: select("one/first"),
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+            });
+            yield* send(1, select("one/first"));
+            if (mode === "queued") {
+              // Queued behind the running turn, the switch is decided before that turn ends.
+              yield* Deferred.await(holdFirstTurn);
+              yield* send(2, select("two/second"));
+              yield* Deferred.succeed(releaseFirstTurn, undefined);
+            }
+            yield* settled(1);
+            if (mode === "started") yield* send(2, select("two/second"));
+            yield* settled(2);
+            yield* send(3, select("one/third"));
+            yield* settled(3);
+
+            const turns = yield* Ref.get(capturedTurns);
+            assert.equal(turns.length, 3);
+            assert.notEqual(turns[1]!.providerThreadId, turns[0]!.providerThreadId);
+            assert.notEqual(turns[1]!.nativeThreadId, turns[0]!.nativeThreadId);
+            assert.include(turns[1]!.text, "First family answer");
+            // Back on the first family, its own native thread only needs what it missed.
+            assert.equal(turns[2]!.providerThreadId, turns[0]!.providerThreadId);
+            assert.include(turns[2]!.text, "Second family answer");
+            assert.notInclude(turns[2]!.text, "First family answer");
+            const projection = yield* orchestrator.getThreadProjection(threadId);
+            assert.deepEqual(
+              projection.runs.map((run) => run.status),
+              ["completed", "completed", "completed"],
+            );
+            assert.equal(projection.thread.activeProviderThreadId, turns[0]!.providerThreadId);
+            assert.lengthOf(
+              projection.providerThreads.filter((thread) => thread.ownerNodeId === null),
+              2,
+            );
+          }).pipe(
+            Effect.provide(
+              ProviderReplayHarness.layerWithRegistry(
+                {
+                  name: `instance-handoff-${mode}`,
+                  runtimePolicyOverride: {
+                    cwd,
+                    approvalPolicy: "never",
+                    sandboxPolicy: { type: "readOnly" },
+                  },
+                },
+                registry,
+              ),
+            ),
+          );
+        }),
+      ),
   );
 
   it.live.each(

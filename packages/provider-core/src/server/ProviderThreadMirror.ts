@@ -3,6 +3,7 @@ import type {
   OrchestrationV2ProviderThread,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderOptionSelection,
   ProviderThreadId,
   RuntimeMode,
   ThreadId,
@@ -38,6 +39,8 @@ export interface ProviderThreadAdoption {
   readonly nativeThreadId: string;
   readonly title: string;
   readonly model: string;
+  /** Options the native thread runs with, such as its effort. */
+  readonly modelOptions?: ReadonlyArray<ProviderOptionSelection>;
   readonly runtimeMode: RuntimeMode;
   /** Absolute, or `~/`-relative to this machine's home. It must exist; nothing is created. */
   readonly workspaceRoot: string;

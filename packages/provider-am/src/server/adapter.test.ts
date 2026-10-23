@@ -11,6 +11,7 @@ import {
   RunAttemptId,
   RunId,
   ThreadId,
+  type ModelSelection,
   type OrchestrationV2AppThread,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ProviderTurn,
@@ -33,7 +34,13 @@ import { AmSettings } from "../settings.ts";
 import { makeAmAdapterV2 } from "./adapter.ts";
 import { makeAmApi } from "./api.ts";
 import { makeAmThreadLifecycle } from "./lifecycle.ts";
-import { FAKE_TOKEN, makeFakeAm, type FakeAgent, type FakeEntry } from "./fakeAm.testkit.ts";
+import {
+  FAKE_MODEL_CATALOG,
+  FAKE_TOKEN,
+  makeFakeAm,
+  type FakeAgent,
+  type FakeEntry,
+} from "./fakeAm.testkit.ts";
 import { amAgentName } from "./mapping.ts";
 import { AM_MIRROR_ENTRY_LIMIT, AM_EMITTED_BYTE_LIMIT, amConversationHead } from "./mirrorPlan.ts";
 
@@ -162,6 +169,7 @@ const turnInput = Effect.fnUntraced(function* (
   providerThread: OrchestrationV2ProviderThread,
   text: string,
   ordinal = 1,
+  selection: ModelSelection = modelSelection,
 ): Effect.fn.Return<ProviderAdapter.ProviderAdapterV2TurnInput> {
   const now = yield* DateTime.now;
   const appThread: OrchestrationV2AppThread = {
@@ -203,7 +211,7 @@ const turnInput = Effect.fnUntraced(function* (
       createdBy: "user",
       creationSource: "web",
     },
-    modelSelection,
+    modelSelection: selection,
     runtimePolicy,
   };
 });
@@ -1619,6 +1627,215 @@ describe("AmAdapterV2", () => {
       assert.deepStrictEqual(harness.replies(), []);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
+
+  describe("model selection", () => {
+    const select = (model: string, effort?: string): ModelSelection => ({
+      instanceId: INSTANCE_ID,
+      model,
+      ...(effort ? { options: [{ id: "effort", value: effort }] } : {}),
+    });
+    const withModels = () => makeFakeAm({ models: () => FAKE_MODEL_CATALOG });
+    const reported = (harness: Effect.Success<ReturnType<typeof makeHarness>>) =>
+      harness
+        .takeEvent(
+          "provider_thread.updated",
+          (event) => event.providerThread.nativeMetadata?.modelSelection !== undefined,
+        )
+        .pipe(Effect.map((event) => event.providerThread.nativeMetadata?.modelSelection));
+    const calls = (fake: Fake) =>
+      fake.log.flatMap((call) =>
+        call.method === "POST" ? [`${call.path.replace(`/api/agents/${AGENT}`, "")}`] : [],
+      );
+
+    it.live("starts a new agent on the selected model and effort", () =>
+      Effect.gen(function* () {
+        const fake = yield* withModels();
+        const harness = yield* makeHarness(fake);
+        yield* harness.runtime.startTurn(
+          yield* turnInput(harness.providerThread, "Fix login", 1, select("claude/opus", "high")),
+        );
+        const created = yield* fake.takeCall("POST", "/api/agents");
+        assert.deepStrictEqual(created.body, {
+          name: AGENT,
+          dir: CWD,
+          inPlace: true,
+          provider: "claude",
+          model: "opus",
+          effort: "high",
+        });
+        yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+        assert.deepStrictEqual(yield* reported(harness), select("claude/opus", "high"));
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("sends neither model nor effort for a provider's default model", () =>
+      Effect.gen(function* () {
+        const fake = yield* withModels();
+        const harness = yield* makeHarness(fake);
+        yield* harness.runtime.startTurn(
+          yield* turnInput(harness.providerThread, "Fix login", 1, select("codex", "default")),
+        );
+        const created = yield* fake.takeCall("POST", "/api/agents");
+        assert.deepStrictEqual(created.body, {
+          name: AGENT,
+          dir: CWD,
+          inPlace: true,
+          provider: "codex",
+        });
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("restarts an idle agent on another model of its provider, then sends", () =>
+      Effect.gen(function* () {
+        const fake = yield* withModels();
+        fake.agents.set(AGENT, { ...idleAgent(), model: "opus", effort: "high" });
+        const harness = yield* makeHarness(fake);
+        yield* harness.runtime.startTurn(
+          yield* turnInput(harness.providerThread, "Go on", 1, select("claude/sonnet")),
+        );
+        const restart = yield* fake.takeCall("POST", `/api/agents/${AGENT}/restart`);
+        assert.deepStrictEqual(restart.body, { model: "sonnet", effort: null, ifIdle: true });
+        yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+        assert.deepStrictEqual(calls(fake), ["/restart", "/messages"]);
+        assert.deepStrictEqual(yield* reported(harness), select("claude/sonnet"));
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("returns an agent to its provider's default model by clearing it", () =>
+      Effect.gen(function* () {
+        const fake = yield* withModels();
+        fake.agents.set(AGENT, { ...idleAgent(), model: "opus", effort: null });
+        const harness = yield* makeHarness(fake);
+        yield* harness.runtime.startTurn(
+          yield* turnInput(harness.providerThread, "Go on", 1, select("claude")),
+        );
+        const restart = yield* fake.takeCall("POST", `/api/agents/${AGENT}/restart`);
+        assert.deepStrictEqual(restart.body, { model: null, ifIdle: true });
+        assert.isNull(fake.agents.get(AGENT)!.model);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("leaves an agent already on the selection alone", () =>
+      Effect.gen(function* () {
+        const fake = yield* withModels();
+        fake.agents.set(AGENT, { ...idleAgent(), model: "opus", effort: "high" });
+        const harness = yield* makeHarness(fake);
+        yield* harness.runtime.startTurn(
+          yield* turnInput(harness.providerThread, "Go on", 1, select("claude/opus", "high")),
+        );
+        yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+        assert.deepStrictEqual(calls(fake), ["/messages"]);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live.each([
+      ["busy", "is busy"],
+      ["queued", "is busy"],
+      ["remote_too_old", "Update am"],
+    ] as const)("sends nothing when am refuses the restart as %s", ([reason, says]) =>
+      Effect.gen(function* () {
+        const fake = yield* withModels();
+        fake.agents.set(AGENT, {
+          ...idleAgent(),
+          model: "opus",
+          restartRefusal: { error: `refused: ${reason}`, reason },
+        });
+        const harness = yield* makeHarness(fake);
+        const started = yield* harness.runtime
+          .startTurn(yield* turnInput(harness.providerThread, "Go on", 1, select("claude/sonnet")))
+          .pipe(Effect.flip);
+        assert.include(String(started.cause), says);
+        assert.deepStrictEqual(calls(fake), ["/restart"]);
+        assert.strictEqual(fake.agents.get(AGENT)!.model, "opus");
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("reports a model am rejects", () =>
+      Effect.gen(function* () {
+        const fake = yield* withModels();
+        fake.agents.set(AGENT, { ...idleAgent(), model: "opus" });
+        const harness = yield* makeHarness(fake);
+        const started = yield* harness.runtime
+          .startTurn(yield* turnInput(harness.providerThread, "Go on", 1, select("claude/nope")))
+          .pipe(Effect.flip);
+        assert.include(String(started.cause), 'unknown claude model "nope"');
+        assert.isFalse(fake.log.some((call) => call.path.endsWith("/messages")));
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("refuses to run another provider on the agent", () =>
+      Effect.gen(function* () {
+        const fake = yield* withModels();
+        fake.agents.set(AGENT, idleAgent());
+        const harness = yield* makeHarness(fake);
+        const started = yield* harness.runtime
+          .startTurn(
+            yield* turnInput(harness.providerThread, "Go on", 1, select("codex/gpt-6-luna")),
+          )
+          .pipe(Effect.flip);
+        assert.include(String(started.cause), "runs Claude Code");
+        assert.deepStrictEqual(calls(fake), []);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("gives a provider thread T3 opens for a handoff an agent of its own", () =>
+      Effect.gen(function* () {
+        const fake = yield* withModels();
+        fake.agents.set(AGENT, idleAgent());
+        const now = yield* DateTime.now;
+        const handoffThread: OrchestrationV2ProviderThread = {
+          id: ProviderThreadId.make("provider-thread-handoff"),
+          driver: ProviderDriverKind.make("am"),
+          providerInstanceId: INSTANCE_ID,
+          providerSessionId: null,
+          appThreadId: THREAD_ID,
+          ownerNodeId: null,
+          nativeThreadRef: null,
+          nativeConversationHeadRef: null,
+          status: "not_loaded",
+          firstRunOrdinal: 3,
+          lastRunOrdinal: 3,
+          handoffIds: [],
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+        };
+        const harness = yield* makeHarness(fake, handoffThread);
+        const agent = harness.providerThread.nativeThreadRef!.nativeId;
+        assert.notStrictEqual(agent, AGENT);
+        assert.strictEqual(agent, amAgentName(`${THREAD_ID}:provider-thread-handoff`, TITLE));
+        yield* harness.runtime.startTurn(
+          yield* turnInput(harness.providerThread, "Take over", 3, select("codex/gpt-6-luna")),
+        );
+        const created = yield* fake.takeCall("POST", "/api/agents");
+        assert.deepStrictEqual(created.body, {
+          name: agent,
+          dir: CWD,
+          inPlace: true,
+          provider: "codex",
+          model: "gpt-6-luna",
+        });
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("plans a restart within a provider and a handoff across providers", () =>
+      Effect.gen(function* () {
+        const fake = yield* withModels();
+        const harness = yield* makeHarness(fake);
+        const plan = (current: string, target: string) =>
+          harness.adapter
+            .planSelectionTransition({
+              current: select(current),
+              target: select(target),
+              sessionCapabilities: harness.runtime.providerSession.capabilities,
+            })
+            .pipe(Effect.map((transition) => transition.type));
+        assert.strictEqual(yield* plan("claude/opus", "claude/sonnet"), "apply_on_next_turn");
+        assert.strictEqual(yield* plan("claude/opus", "codex/gpt-6-luna"), "create_with_handoff");
+        assert.strictEqual(yield* plan("codex", "default"), "reject");
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+  });
 
   describe("permission prompts", () => {
     it.live("shows the agent's prompt as an approval with am's own choices", () =>

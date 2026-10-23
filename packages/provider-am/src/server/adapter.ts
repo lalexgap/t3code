@@ -1,5 +1,6 @@
 import {
   ProviderDriverKind,
+  type ModelSelection,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderCapabilities,
@@ -33,11 +34,13 @@ import {
   type AmSettings,
 } from "../settings.ts";
 import type {
+  AmAgentDetail,
   AmApi,
   AmApiError,
   AmConflict,
   AmMessageReceipt,
   AmMessageState,
+  AmModelChange,
   AmPermissionRequest,
   AmTranscriptEntry,
 } from "./api.ts";
@@ -57,7 +60,6 @@ import {
   amOptionForDecision,
   amPermissionPrompt,
   amPermissionRequestKind,
-  amProviderForModel,
   amToolPresentation,
   amTurnPhase,
   fleetEventConcerns,
@@ -65,6 +67,14 @@ import {
   parseAmAgentRef,
   sameEntry,
 } from "./mapping.ts";
+import {
+  amAgentSelection,
+  amModelChange,
+  amProviderMismatch,
+  amSelectionEffort,
+  amSelectionTransition,
+  parseAmModelSlug,
+} from "./models.ts";
 
 const AM_PROVIDER = ProviderDriverKind.make("am");
 
@@ -322,14 +332,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
     driver: AM_PROVIDER,
     getCapabilities: () => Effect.succeed(capabilities),
     planSelectionTransition: (input) =>
-      Effect.succeed(
-        input.current.model === input.target.model
-          ? { type: "apply_on_next_turn" as const }
-          : {
-              type: "reject" as const,
-              reason: "An Agent Motel agent keeps its provider. Start a new thread to change it.",
-            },
-      ),
+      Effect.succeed(amSelectionTransition(input.current, input.target)),
     openSession: Effect.fn("AmAdapterV2.openSession")(function* (
       input: ProviderAdapter.ProviderAdapterV2OpenSessionInput,
     ) {
@@ -1335,10 +1338,18 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           (existing.driver !== AM_PROVIDER || existing.providerInstanceId !== options.instanceId)
         )
           return yield* protocolError("This thread belongs to another provider instance");
+        // A provider thread T3 opened later in the thread, as for a switch to another provider,
+        // needs an agent of its own.
+        const later =
+          existing !== undefined &&
+          (existing.handoffIds.length > 0 || (existing.firstRunOrdinal ?? 1) > 1);
         const name =
           existing?.nativeThreadRef?.nativeId ??
           input.initialNativeThreadId ??
-          amAgentRef(options.settings.host, amAgentName(args.threadId, args.title));
+          amAgentRef(
+            options.settings.host,
+            amAgentName(later ? `${args.threadId}:${existing.id}` : args.threadId, args.title),
+          );
         // Capabilities follow the instance's Fleet host, so a thread whose agent lives elsewhere
         // would checkpoint the wrong copy.
         if (parseAmAgentRef(name).host !== (options.settings.host || undefined))
@@ -1398,6 +1409,42 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           resolveAttachmentPath: providerHost.resolveAttachmentPath,
         }).trim();
 
+      /**
+       * am restarts the agent on the same conversation only while it is idle. T3 Code does not
+       * wait for other work to end: the message would then run on a model the thread does not
+       * show, so the turn fails and says why.
+       */
+      const restartOnModel = Effect.fnUntraced(function* (
+        ref: string,
+        detail: AmAgentDetail,
+        change: AmModelChange,
+      ) {
+        const { host } = parseAmAgentRef(ref);
+        if (detail.restartModel !== true)
+          return yield* protocolError(
+            `Agent Motel${host ? ` on ${host}` : ""} cannot move an agent to another model. Update am${host ? " there" : ""}, or pick the model the agent runs.`,
+          );
+        const result = yield* api
+          .restart(ref, change)
+          .pipe(
+            Effect.mapError((error) =>
+              protocolError(
+                error.status === 400
+                  ? `Agent Motel refused the model change for ${ref}: ${error.detail}`
+                  : error.message,
+                error,
+              ),
+            ),
+          );
+        if (!result.restarted)
+          return yield* protocolError(
+            result.reason === "remote_too_old"
+              ? `Agent Motel on ${host} cannot restart an agent only while it is idle. Update am there.`
+              : `The Agent Motel agent ${ref} is busy (${result.error}), so it stays on its current model. It changes models only between turns: send again once it is idle, or pick the model it runs to send now.`,
+          );
+        return { model: result.model, effort: result.effort };
+      });
+
       const start = Effect.fnUntraced(function* (
         turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
       ) {
@@ -1455,22 +1502,37 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           return yield* protocolError(
             `The Agent Motel agent ${ref} works in ${detail.dir}, not this thread's ${dir}. Start a new thread, or remove the agent with \`am rm ${ref}\`.`,
           );
-        if (detail && amTurnPhase(detail.status) === "gone") yield* fromApi(api.resume(ref));
+        const selection = turnInput.modelSelection;
+        let running: Pick<AmAgentDetail, "provider" | "model" | "effort"> | undefined = detail;
+        if (detail) {
+          const mismatch = amProviderMismatch(ref, detail, selection);
+          if (mismatch) return yield* protocolError(mismatch);
+          const change = amModelChange(detail, selection);
+          if (change) running = { ...detail, ...(yield* restartOnModel(ref, detail, change)) };
+          else if (amTurnPhase(detail.status) === "gone") yield* fromApi(api.resume(ref));
+        }
+        let created: AmAgentDetail | undefined;
         if (!detail) {
-          const provider = amProviderForModel(turnInput.modelSelection.model);
+          const wanted = parseAmModelSlug(selection.model);
+          const effort = wanted.provider ? amSelectionEffort(selection) : undefined;
           // No task: am would wrap it in launch instructions and give it no receipt.
           yield* fromApi(
             api.createAgent({
               name,
               ...(host ? { host } : {}),
               dir,
-              ...(provider ? { provider } : {}),
+              ...(wanted.provider ? { provider: wanted.provider } : {}),
+              ...(wanted.model ? { model: wanted.model } : {}),
+              ...(effort ? { effort } : {}),
             }),
           );
+          // am default leaves the provider to am, so only the new agent's detail says what runs.
+          created = Option.getOrUndefined(yield* fromApi(api.getAgent(ref)));
+          running = created;
         }
         if (!receiptsConfirmed) {
           // The fleet host's own am answers the detail, so its flag covers the am that delivers.
-          const remoteDetail = detail ?? Option.getOrUndefined(yield* fromApi(api.getAgent(ref)));
+          const remoteDetail = detail ?? created;
           if (remoteDetail?.messageReceipts !== true)
             return yield* protocolError(
               `Agent Motel on ${host} does not report message receipts, which T3 Code needs to follow a turn. Update am there.`,
@@ -1483,7 +1545,8 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           nativeTurnId: `${ref}:${id}`,
           from: head,
           floor: 0,
-          // A new agent's detail was not read; the run reads it once.
+          ...(running ? { selection: amAgentSelection(options.instanceId, running) } : {}),
+          // A new agent's detail was read before its first prompt; the run reads it again.
           ...(detail
             ? {
                 permissions: detail.permissionRequests ? "supported" : "unsupported",
@@ -1502,6 +1565,8 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           readonly restartCheck?: boolean;
           readonly permissions?: ActiveTurn["permissions"];
           readonly promptsCounted?: boolean;
+          /** What the agent runs, which the thread reports as its native selection. */
+          readonly selection?: ModelSelection | undefined;
         },
       ) {
         const startedAt = yield* DateTime.now;
@@ -1554,6 +1619,9 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           status: "active",
           firstRunOrdinal: thread.firstRunOrdinal ?? turnInput.runOrdinal,
           lastRunOrdinal: turnInput.runOrdinal,
+          ...(init.selection
+            ? { nativeMetadata: { ...thread.nativeMetadata, modelSelection: init.selection } }
+            : {}),
         });
         yield* updateSession("running");
         Queue.offerUnsafe(wake, undefined);

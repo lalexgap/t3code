@@ -19,12 +19,8 @@ import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import type * as ProviderThreadMirror from "@t3tools/provider-core/server/ProviderThreadMirror";
 import { amAutoImportDays, isAmApiUrlAllowed, type AmSettings } from "../settings.ts";
 import type { AmApi, AmFleetRow } from "./api.ts";
-import {
-  AM_DEFAULT_MODEL,
-  amProviderForModel,
-  amTurnPhase,
-  fleetEventPromptedAgent,
-} from "./mapping.ts";
+import { amTurnPhase, fleetEventPromptedAgent } from "./mapping.ts";
+import { AM_DEFAULT_MODEL, amAgentSelection } from "./models.ts";
 import {
   AM_MIRROR_ENTRY_LIMIT,
   AM_REMOVED_MARK,
@@ -201,6 +197,13 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
     const total = (yield* api.transcript(row.ref, TRANSCRIPT_END)).total;
     const tail = yield* api.transcript(row.ref, Math.max(0, total - AM_MIRROR_ENTRY_LIMIT));
     const { history, notice } = amHistory(row.ref, tail.entries, tail.total);
+    // The fleet list does not say which model an agent runs; its detail does.
+    const detail = Option.getOrUndefined(yield* api.getAgent(row.ref));
+    const selection = amAgentSelection(options.instanceId, {
+      provider: detail?.provider ?? row.provider,
+      model: detail?.model ?? null,
+      effort: detail?.effort ?? null,
+    });
     const updatedAt = DateTime.make(row.updatedAt).pipe(Option.getOrUndefined);
     const now = yield* DateTime.now;
     const result = yield* mirror.adopt({
@@ -208,7 +211,8 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
       providerInstanceId: options.instanceId,
       nativeThreadId: row.ref,
       title: row.name,
-      model: amProviderForModel(row.provider) ?? AM_DEFAULT_MODEL,
+      model: selection?.model ?? AM_DEFAULT_MODEL,
+      ...(selection?.options ? { modelOptions: selection.options } : {}),
       runtimeMode: "full-access",
       workspaceRoot,
       worktree: workspace.worktree,

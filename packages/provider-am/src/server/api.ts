@@ -47,6 +47,11 @@ export const AmAgentDetail = Schema.Struct({
   /** Set by an am that relays its agents' permission prompts; a fleet host's reflects that host's am. */
   permissionRequests: Schema.optional(Schema.Boolean),
   pendingPermissions: Schema.optional(Schema.Number),
+  /** The agent's model and effort; null runs its provider's default. Absent from an older am. */
+  model: Schema.optional(Schema.NullOr(Schema.String)),
+  effort: Schema.optional(Schema.NullOr(Schema.String)),
+  /** Set by an am that can restart an agent on another model; a fleet host's reflects that host's am. */
+  restartModel: Schema.optional(Schema.Boolean),
 });
 export type AmAgentDetail = typeof AmAgentDetail.Type;
 
@@ -174,8 +179,46 @@ export type AmHosts = typeof AmHosts.Type;
 export const AmHealth = Schema.Struct({
   messageReceipts: Schema.optional(Schema.Boolean),
   stopIfIdle: Schema.optional(Schema.Boolean),
+  /** Set by an am that lists its providers' models. */
+  models: Schema.optional(Schema.Boolean),
 });
 export type AmHealth = typeof AmHealth.Type;
+
+export const AmCatalogModel = Schema.Struct({
+  id: Schema.String,
+  label: Schema.optional(Schema.String),
+  description: Schema.optional(Schema.String),
+  /** Empty when the provider's own list applies to every model, as Claude's does. */
+  efforts: Schema.Array(Schema.String),
+  defaultEffort: Schema.optional(Schema.String),
+});
+export type AmCatalogModel = typeof AmCatalogModel.Type;
+
+/** One provider's entry in `GET /api/models`; a provider T3 does not know is skipped later. */
+export const AmProviderCatalog = Schema.Struct({
+  provider: Schema.String,
+  models: Schema.Array(AmCatalogModel),
+  efforts: Schema.Array(Schema.String),
+});
+export type AmProviderCatalog = typeof AmProviderCatalog.Type;
+
+export const AmModelCatalog = Schema.Array(AmProviderCatalog);
+export type AmModelCatalog = typeof AmModelCatalog.Type;
+
+/** A restart's model or effort: a value, null for the provider's default, or absent to keep it. */
+export interface AmModelChange {
+  readonly model?: string | null;
+  readonly effort?: string | null;
+}
+
+export type AmRestartResult =
+  | { readonly restarted: true; readonly model: string | null; readonly effort: string | null }
+  | { readonly restarted: false; readonly reason: AmStopRefusalReason; readonly error: string };
+
+const RestartedBody = Schema.Struct({
+  model: Schema.optional(Schema.NullOr(Schema.String)),
+  effort: Schema.optional(Schema.NullOr(Schema.String)),
+});
 
 const SentMessage = Schema.Struct({ id: Schema.String });
 const ErrorBody = Schema.Struct({ error: Schema.String });
@@ -206,6 +249,9 @@ export interface CreateAgentInput {
   readonly host?: string;
   readonly dir: string;
   readonly provider?: AmProvider;
+  /** Absent runs the provider's default. */
+  readonly model?: string;
+  readonly effort?: string;
 }
 
 /** am's 409. `reason` is undefined when am gave none T3 knows; `error` is am's own text. */
@@ -231,6 +277,14 @@ export type AmInterruptResult =
 export interface AmApi {
   readonly health: Effect.Effect<AmHealth, AmApiError>;
   readonly hosts: Effect.Effect<AmHosts, AmApiError>;
+  /**
+   * The providers' models, for a fleet host when `host` is set. `refresh` makes am re-read its
+   * providers rather than answer from its cache.
+   */
+  readonly models: (input: {
+    readonly host?: string;
+    readonly refresh?: boolean;
+  }) => Effect.Effect<AmModelCatalog, AmApiError>;
   /** am's cached fleet view; it never waits on ssh. */
   readonly agents: Effect.Effect<AmFleet, AmApiError>;
   /** None when am has no agent with this name. */
@@ -260,6 +314,14 @@ export interface AmApi {
    * An am without `stopIfIdle` ignores the condition and stops regardless, so check it first.
    */
   readonly stopIfIdle: (ref: string) => Effect.Effect<AmStopResult, AmApiError>;
+  /**
+   * Restarts the agent on another model or effort, resuming its conversation, only if am finds it
+   * idle under the same checks as `stopIfIdle`. A model or effort am rejects fails with HTTP 400.
+   */
+  readonly restart: (
+    ref: string,
+    change: AmModelChange,
+  ) => Effect.Effect<AmRestartResult, AmApiError>;
   readonly transcript: (name: string, after: number) => Effect.Effect<AmTranscript, AmApiError>;
   readonly permissions: (
     ref: string,
@@ -356,6 +418,14 @@ export const makeAmApi = (
     hosts: send("host list", HttpClientRequest.get("/hosts")).pipe(
       Effect.flatMap((response) => decode("host list", AmHosts, response)),
     ),
+    models: ({ host, refresh }) =>
+      send(
+        "model list",
+        HttpClientRequest.get("/models").pipe(
+          host ? HttpClientRequest.setUrlParam("host", host) : (request) => request,
+          refresh ? HttpClientRequest.setUrlParam("refresh", "1") : (request) => request,
+        ),
+      ).pipe(Effect.flatMap((response) => decode("model list", AmModelCatalog, response))),
     agents: send("agent list", HttpClientRequest.get("/agents")).pipe(
       Effect.flatMap((response) => decode("agent list", AmFleet, response)),
     ),
@@ -375,6 +445,8 @@ export const makeAmApi = (
         inPlace: true,
         ...(input.host ? { host: input.host } : {}),
         ...(input.provider ? { provider: input.provider } : {}),
+        ...(input.model ? { model: input.model } : {}),
+        ...(input.effort ? { effort: input.effort } : {}),
       }),
     sendMessage: (ref, text, mode) =>
       send(
@@ -446,6 +518,33 @@ export const makeAmApi = (
                 ),
               )
             : expectOk("stop")(response).pipe(Effect.as({ stopped: true as const })),
+        ),
+      ),
+    restart: (ref, change) =>
+      send(
+        "restart",
+        HttpClientRequest.post(agentPath(ref, "/restart")).pipe(
+          HttpClientRequest.bodyJsonUnsafe({ ...change, ifIdle: true }),
+        ),
+      ).pipe(
+        Effect.flatMap((response): Effect.Effect<AmRestartResult, AmApiError> =>
+          response.status === 409
+            ? decodeBody("restart", ConflictBody, response).pipe(
+                Effect.flatMap(({ error, reason }) =>
+                  isStopRefusalReason(reason)
+                    ? Effect.succeed({ restarted: false as const, reason, error })
+                    : Effect.fail(
+                        new AmApiError({ operation: "restart", status: 409, detail: error }),
+                      ),
+                ),
+              )
+            : decode("restart", RestartedBody, response).pipe(
+                Effect.map((body) => ({
+                  restarted: true as const,
+                  model: body.model ?? null,
+                  effort: body.effort ?? null,
+                })),
+              ),
         ),
       ),
     transcript: (ref, after) =>

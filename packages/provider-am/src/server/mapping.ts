@@ -6,18 +6,7 @@ import type {
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
-import type {
-  AmPermissionOption,
-  AmPermissionRequest,
-  AmProvider,
-  AmTranscriptEntry,
-} from "./api.ts";
-
-/** Let am pick its configured default provider. Never sent to am. */
-export const AM_DEFAULT_MODEL = "default";
-
-export const amProviderForModel = (model: string): AmProvider | undefined =>
-  model === "claude" || model === "codex" ? model : undefined;
+import type { AmPermissionOption, AmPermissionRequest, AmTranscriptEntry } from "./api.ts";
 
 const fnv1a = (value: string) => {
   let hash = 0x811c9dc5;

@@ -42,9 +42,6 @@ The first message in a thread starts an am agent named after the thread, such as
 including after T3 Code restarts. If the agent has stopped, T3 Code resumes it. T3 Code does not
 take over an existing agent of that name that works in another directory.
 
-Pick **Claude Code** or **Codex** in the model picker, or **am default** for the provider set in
-am's config. An agent keeps its provider, so start a new thread to switch.
-
 Replies, commands, and tool calls appear as am records them in the agent's transcript, not
 token by token. Messages that reach the agent from elsewhere, such as another agent or its
 terminal, show as notes in the thread. Work the agent does between T3 Code turns shows as an
@@ -54,6 +51,31 @@ If the agent is busy with other work, the message waits in am's queue and the tu
 delivers it. Sending while the turn runs steers it. **Stop** withdraws a message am has not
 delivered yet, and otherwise sends Esc to the agent only while that message's turn is running. If
 the agent's session ends mid-turn, the turn fails.
+
+## Models
+
+The model picker lists the models am offers for the instance's machine or Fleet host, such as
+**Claude · Opus** or **Codex · GPT-6.1-Sol**, each with the efforts it supports. **Claude Code**
+and **Codex** run that provider's default model, and **am default** lets am pick the provider set
+in its config. **Refresh** in **Settings → Providers** reads the list again, for example after
+you update Claude Code or Codex. An older am, or one T3 Code cannot reach, offers only the
+defaults.
+
+You can change the model in a running thread:
+
+- **Another model or effort of the same provider** restarts the agent on it between turns, and it
+  keeps its conversation. am does this only while the agent is idle: if the agent is busy with
+  work T3 Code did not send, the message is not sent and the thread says why. Send it again once
+  the agent is idle, or pick the model it runs to send now. A change made while a T3 Code turn runs
+  applies to the next turn.
+- **The other provider**, Claude Code to Codex or back, starts another agent for the thread and
+  passes it the conversation as a handoff. The first agent stays in am, and switching back returns
+  to it with what it missed.
+- **am default** applies only to a new thread's first agent.
+
+A thread shows the model its agent runs, including an agent T3 Code mirrored. A model you change
+with am outside T3 Code is switched back to the thread's model on your next message unless you
+pick it in T3 Code too. Changing models needs a recent am, on the Fleet host too.
 
 ## Settling and archiving
 

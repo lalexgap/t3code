@@ -5,7 +5,12 @@ import type * as NodeNet from "node:net";
 import * as Effect from "effect/Effect";
 import * as Queue from "effect/Queue";
 
-import type { AmMessageState, AmPermissionRequest, AmTranscriptEntry } from "./api.ts";
+import type {
+  AmMessageState,
+  AmModelCatalog,
+  AmPermissionRequest,
+  AmTranscriptEntry,
+} from "./api.ts";
 
 export type FakeEntry = Omit<AmTranscriptEntry, "index">;
 
@@ -24,6 +29,11 @@ export interface FakeAgent {
   repoRoot?: string;
   /** The next conditional stop answers this 409, as when work arrives between T3's checks and am's. */
   stopRefusal?: { readonly error: string; readonly reason: string };
+  /** Null or absent runs the provider's default. */
+  model?: string | null;
+  effort?: string | null;
+  /** The next conditional restart answers this 409. */
+  restartRefusal?: { readonly error: string; readonly reason: string };
 }
 
 export interface FakeMessage {
@@ -69,12 +79,35 @@ export interface FakePermission {
 export interface FakeCall {
   readonly method: string;
   readonly path: string;
+  readonly search?: string;
   readonly body: Record<string, unknown> | null;
   /** The receipt id a message POST answered with. */
   readonly messageId?: string;
 }
 
 export const FAKE_TOKEN = "fake-am-token";
+
+/** Shaped like a real `GET /api/models`: Claude's efforts are the provider's, Codex's per model. */
+export const FAKE_MODEL_CATALOG: AmModelCatalog = [
+  {
+    provider: "claude",
+    models: [
+      { id: "opus", label: "Opus", efforts: [] },
+      { id: "sonnet", efforts: [] },
+      { id: "claude-fable-5-1[1m]", label: "Fable 5.1 (1M context)", efforts: [] },
+    ],
+    efforts: ["low", "medium", "high", "xhigh", "max"],
+  },
+  {
+    provider: "codex",
+    models: [
+      { id: "gpt-6.1-sol", efforts: ["low", "medium", "high", "ultra"], defaultEffort: "medium" },
+      { id: "gpt-6-luna", efforts: ["low", "high"], defaultEffort: "low" },
+    ],
+    efforts: [],
+  },
+  { provider: "gemini", models: [{ id: "pro", efforts: [] }], efforts: [] },
+];
 
 /** An `am serve` stand-in on a loopback port, following the route contract in am's src/server.ts. */
 export const makeFakeAm = Effect.fnUntraced(function* (
@@ -86,11 +119,17 @@ export const makeFakeAm = Effect.fnUntraced(function* (
     readonly stopIfIdle?: boolean;
     /** True plays an am that relays its agents' permission prompts; older ones have no routes. */
     readonly permissionRequests?: boolean;
+    /**
+     * Plays an am that lists its providers' models, with this list for each host (undefined for
+     * its own machine) and restarts agents on another model. Older ones have neither route.
+     */
+    readonly models?: (host: string | undefined) => AmModelCatalog;
   } = {},
 ) {
   const receiptsFlag = options.messageReceipts === false ? {} : { messageReceipts: true };
   const stopIfIdle = options.stopIfIdle !== false;
   const capabilities = { ...receiptsFlag, ...(stopIfIdle ? { stopIfIdle: true } : {}) };
+  const modelFlags = options.models ? { restartModel: true } : {};
   /** Keyed by am's request id. */
   const permissions = new Map<string, FakePermission>();
   let permissionSeq = 0;
@@ -134,11 +173,24 @@ export const makeFakeAm = Effect.fnUntraced(function* (
     const sendsMessage =
       method === "POST" && parts[0] === "agents" && parts[2] === "messages" && parts.length === 3;
     const messageId = sendsMessage ? `msg-${++messageSeq}` : undefined;
-    const call = { method, path: url.pathname, body, ...(messageId ? { messageId } : {}) };
+    const call = {
+      method,
+      path: url.pathname,
+      ...(url.search ? { search: url.search } : {}),
+      body,
+      ...(messageId ? { messageId } : {}),
+    };
     log.push(call);
     Queue.offerUnsafe(calls, call);
     if (parts[0] === "health" && method === "GET")
-      return json(res, 200, { ok: true, name: "am", ...capabilities });
+      return json(res, 200, {
+        ok: true,
+        name: "am",
+        ...capabilities,
+        ...(options.models ? { models: true } : {}),
+      });
+    if (parts[0] === "models" && method === "GET" && options.models)
+      return json(res, 200, options.models(url.searchParams.get("host") ?? undefined));
     if (parts[0] === "hosts" && method === "GET")
       return json(res, 200, { local: "fake-local", hosts: options.hosts ?? [] });
     if (parts[0] === "events" && method === "GET") {
@@ -182,6 +234,8 @@ export const makeFakeAm = Effect.fnUntraced(function* (
         dir: String(body?.dir),
         provider: typeof body?.provider === "string" ? body.provider : "codex",
         entries: [],
+        ...(typeof body?.model === "string" ? { model: body.model } : {}),
+        ...(typeof body?.effort === "string" ? { effort: body.effort } : {}),
       });
       return json(res, 201, { ok: true, name });
     }
@@ -198,6 +252,8 @@ export const makeFakeAm = Effect.fnUntraced(function* (
         queue: agent.queue ?? [],
         pane: null,
         ...capabilities,
+        ...(options.models ? { model: agent.model ?? null, effort: agent.effort ?? null } : {}),
+        ...modelFlags,
         ...(options.permissionRequests
           ? { permissionRequests: true, pendingPermissions: pendingOf(name).length }
           : {}),
@@ -363,6 +419,32 @@ export const makeFakeAm = Effect.fnUntraced(function* (
         agent.status = "idle";
       }
       return json(res, 200, { ok: true });
+    }
+    if (parts[2] === "restart" && method === "POST" && options.models) {
+      if (body?.ifIdle !== true) return json(res, 400, { error: "T3 restarts only if idle" });
+      const refuse = (error: string, reason: string) => json(res, 409, { error, reason });
+      if (agent.restartRefusal) {
+        const { error, reason } = agent.restartRefusal;
+        delete agent.restartRefusal;
+        return refuse(error, reason);
+      }
+      if (["working", "starting", "waiting", "needs-attention"].includes(agent.status))
+        return refuse(`agent "${name}" is ${agent.status}`, "busy");
+      if ((agent.queue?.length ?? 0) > 0)
+        return refuse(`agent "${name}" has queued messages`, "queued");
+      for (const message of messages.values())
+        if (message.agent === name && message.state === "delivered")
+          return refuse(`agent "${name}" has a turn that has not finished`, "in_turn");
+      const colon = name.indexOf(":");
+      const listed = options
+        .models(colon === -1 ? undefined : name.slice(0, colon))
+        .find((entry) => entry.provider === agent.provider);
+      if (typeof body.model === "string" && !listed?.models.some((m) => m.id === body.model))
+        return json(res, 400, { error: `unknown ${agent.provider} model "${body.model}"` });
+      if (body.model !== undefined) agent.model = body.model as string | null;
+      if (body.effort !== undefined) agent.effort = body.effort as string | null;
+      agent.status = "starting";
+      return json(res, 200, { ok: true, model: agent.model ?? null, effort: agent.effort ?? null });
     }
     if (parts[2] === "stop" && method === "POST") {
       if (stopIfIdle && body?.ifIdle === true) {
