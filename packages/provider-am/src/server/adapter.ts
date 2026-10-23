@@ -778,7 +778,9 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         const now = yield* DateTime.now;
         const createdAt = DateTime.make(listed.createdAt).pipe(Option.getOrElse(() => now));
         const requestKind = amPermissionRequestKind(listed.tool);
-        const choices = amApprovalChoices(listed.options);
+        const { prompt, truncated } = amPermissionPrompt(listed);
+        // Nobody may approve what the card cannot show in full.
+        const choices = amApprovalChoices(listed.options, { denyOnly: truncated });
         const runtimeRequest: OrchestrationV2RuntimeRequest = {
           id: requestId,
           nodeId,
@@ -819,12 +821,16 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           completedAt: null,
           requestId,
           requestKind,
-          prompt: amPermissionPrompt(listed),
-          ...(choices.hidden > 0
+          prompt,
+          ...(truncated
             ? {
-                reason: `The agent offers ${choices.hidden} more ${choices.hidden === 1 ? "choice" : "choices"} in its session: \`am j ${agentRef}\`.`,
+                reason: `Input too long to review here — answer in its session: \`am j ${agentRef}\``,
               }
-            : {}),
+            : choices.hidden > 0
+              ? {
+                  reason: `The agent offers ${choices.hidden} more ${choices.hidden === 1 ? "choice" : "choices"} in its session: \`am j ${agentRef}\`.`,
+                }
+              : {}),
           options: choices.options,
         };
         const expiresAt =

@@ -1628,6 +1628,23 @@ describe("AmAdapterV2", () => {
       }).pipe(Effect.scoped, Effect.provide(testLayer)),
     );
 
+    it.live("offers only a denial for a prompt whose input the card cannot show in full", () =>
+      Effect.gen(function* () {
+        const { card, respond, answers } = yield* promptedTurn({
+          input: { command: `echo ${"x".repeat(5_000)} && rm -rf ~` },
+        });
+        assert.deepStrictEqual(card.options, [{ decision: "decline", label: "No" }]);
+        assert.strictEqual(
+          card.reason,
+          `Input too long to review here — answer in its session: \`am j ${AGENT}\``,
+        );
+        const error = yield* respond("accept").pipe(Effect.flip);
+        assert.include(String(error.cause), 'no choice for "accept"');
+        yield* respond("acceptForSession").pipe(Effect.flip);
+        assert.strictEqual(answers().length, 0);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
     it.live("declines with the agent's own deny when T3 cancels", () =>
       Effect.gen(function* () {
         const { respond, answers } = yield* promptedTurn();

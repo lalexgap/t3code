@@ -164,6 +164,26 @@ describe("amApprovalChoices", () => {
     assert.deepStrictEqual(choices.options, [{ decision: "accept", label: "Yes" }]);
     assert.strictEqual(choices.hidden, 3);
   });
+
+  it("offers only the agent's denials when asked to withhold approval", () => {
+    const choices = amApprovalChoices(
+      [
+        { id: "allow", label: "Yes", kind: "allow" },
+        { id: "suggestion-0", label: "Yes, always", kind: "allow_always" },
+        { id: "deny", label: "No", kind: "deny" },
+      ],
+      { denyOnly: true },
+    );
+    assert.deepStrictEqual(choices.options, [{ decision: "decline", label: "No" }]);
+    assert.deepStrictEqual([...choices.optionIds.keys()], ["decline"]);
+    assert.strictEqual(amOptionForDecision(choices.optionIds, "accept"), undefined);
+    assert.strictEqual(amOptionForDecision(choices.optionIds, "cancel"), "deny");
+    const none = amApprovalChoices([{ id: "allow", label: "Yes", kind: "allow" }], {
+      denyOnly: true,
+    });
+    assert.deepStrictEqual(none.options, []);
+    assert.strictEqual(none.optionIds.size, 0);
+  });
 });
 
 describe("amPermissionPrompt", () => {
@@ -180,11 +200,15 @@ describe("amPermissionPrompt", () => {
 
   it("shows a long command in full", () => {
     const command = `echo ${"x".repeat(2_000)} && rm -rf ~`;
-    assert.strictEqual(amPermissionPrompt(request(command)), `Bash\n\n${command}`);
+    assert.deepStrictEqual(amPermissionPrompt(request(command)), {
+      prompt: `Bash\n\n${command}`,
+      truncated: false,
+    });
   });
 
   it("marks where it cuts an input too long for a card", () => {
-    const prompt = amPermissionPrompt(request("y".repeat(10_000)));
+    const { prompt, truncated } = amPermissionPrompt(request("y".repeat(10_000)));
+    assert.isTrue(truncated);
     assert.isTrue(prompt.endsWith("..."));
     assert.isBelow(prompt.length, 10_000);
   });

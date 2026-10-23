@@ -174,20 +174,25 @@ const DECISION_SLOTS = new Map<string, ReadonlyArray<ProviderApprovalDecision>>(
 
 /**
  * am's options in am's order and with am's labels, each on a decision of its kind. Options beyond
- * their kind's slots, or of a kind T3 does not know, are left to the agent's terminal.
+ * their kind's slots, or of a kind T3 does not know, are left to the agent's terminal. `denyOnly`
+ * leaves every approval there too.
  */
-export const amApprovalChoices = (options: ReadonlyArray<AmPermissionOption>) => {
+export const amApprovalChoices = (
+  options: ReadonlyArray<AmPermissionOption>,
+  { denyOnly = false }: { readonly denyOnly?: boolean } = {},
+) => {
   const assigned = new Map<AmPermissionOption, ProviderApprovalDecision>();
   const taken = new Set<ProviderApprovalDecision>();
   const take = (option: AmPermissionOption, decision: ProviderApprovalDecision) => {
     assigned.set(option, decision);
     taken.add(decision);
   };
-  for (const option of options) {
+  const offered = denyOnly ? options.filter((option) => option.kind === "deny") : options;
+  for (const option of offered) {
     const named = DECISION_SLOTS.get(option.kind)?.find((decision) => decision === option.id);
     if (named && !taken.has(named)) take(option, named);
   }
-  for (const option of options) {
+  for (const option of offered) {
     if (assigned.has(option)) continue;
     const free = DECISION_SLOTS.get(option.kind)?.find((decision) => !taken.has(decision));
     if (free) take(option, free);
@@ -235,9 +240,16 @@ const PROMPT_INPUT_LIMIT = 4_000;
 /** am's one-line summary, then as much of the tool's input as a card can show. */
 export const amPermissionPrompt = (request: AmPermissionRequest) => {
   const summary = request.summary.trim() || request.tool;
-  if (request.input === undefined || request.input === null) return summary;
   const input =
-    typeof request.input === "string" ? request.input : (JSON.stringify(request.input) ?? "");
-  if (input === "" || input === "{}") return summary;
-  return `${summary}\n\n${input.length <= PROMPT_INPUT_LIMIT ? input : `${input.slice(0, PROMPT_INPUT_LIMIT - 3)}...`}`;
+    request.input === undefined || request.input === null
+      ? ""
+      : typeof request.input === "string"
+        ? request.input
+        : (JSON.stringify(request.input) ?? "");
+  if (input === "" || input === "{}") return { prompt: summary, truncated: false };
+  const truncated = input.length > PROMPT_INPUT_LIMIT;
+  return {
+    prompt: `${summary}\n\n${truncated ? `${input.slice(0, PROMPT_INPUT_LIMIT - 3)}...` : input}`,
+    truncated,
+  };
 };
