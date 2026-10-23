@@ -7,6 +7,7 @@ import {
   ProviderInstanceId,
   ProviderThreadId,
   ThreadId,
+  TurnItemId,
   type OrchestrationV2DomainEvent,
 } from "@t3tools/contracts";
 import * as ProviderThreadLifecycle from "@t3tools/provider-core/server/ProviderThreadLifecycle";
@@ -197,11 +198,44 @@ it.effect("reports a settle once, with the agent's ref, and leaves its notice on
   ),
 );
 
-it.effect("skips a repeat settle after a restart", () =>
+it.effect("skips a settle a notice already answered, as after a restart", () =>
   withService(({ domainEvents, changes }) =>
     Effect.gen(function* () {
       const threadId = yield* seedThread(ThreadId.make("thread-a"), "t3-a");
       yield* commit(threadId, "thread.settled");
+      const eventSink = yield* EventSink.EventSinkV2;
+      const itemId = TurnItemId.make(
+        `provider-thread-lifecycle:notice:${threadId}:settled:${DateTime.toEpochMillis(now)}`,
+      );
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make(`${threadId}:notice`),
+            type: "turn-item.updated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              id: itemId,
+              threadId,
+              runId: null,
+              nodeId: null,
+              providerThreadId: ProviderThreadId.make(`${threadId}:provider`),
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: 0,
+              status: "completed",
+              title: null,
+              type: "system_notice",
+              message: "Stopped.",
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+            },
+          },
+        ],
+      });
+      // Settling a snoozed settled thread keeps settledAt but moves updatedAt.
       const later = DateTime.add(now, { minutes: 5 });
       const thread = yield* (yield* ProjectionStore.ProjectionStoreV2).getThread(threadId);
       yield* Queue.offer(domainEvents, {
@@ -210,7 +244,7 @@ it.effect("skips a repeat settle after a restart", () =>
         threadId,
         providerInstanceId: thread.providerInstanceId,
         occurredAt: later,
-        payload: thread,
+        payload: { ...thread, updatedAt: later },
       });
 
       const next = yield* seedThread(ThreadId.make("thread-b"), "t3-b");

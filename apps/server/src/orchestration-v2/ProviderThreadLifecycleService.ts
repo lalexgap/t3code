@@ -95,6 +95,7 @@ export const layer = Layer.effectDiscard(
     const writeNotice = Effect.fnUntraced(function* (
       threadId: ThreadId,
       providerThreadId: OrchestrationV2AppThread["activeProviderThreadId"],
+      itemId: TurnItemId,
       message: string,
     ) {
       const { runs } = yield* projections.getThreadRecords(threadId, ["runs"]);
@@ -112,7 +113,7 @@ export const layer = Layer.effectDiscard(
             threadId,
             occurredAt: now,
             payload: {
-              id: TurnItemId.make(`${EVENT_PREFIX}:notice:${id}`),
+              id: itemId,
               threadId,
               runId: latestRun?.id ?? null,
               nodeId: null,
@@ -150,6 +151,9 @@ export const layer = Layer.effectDiscard(
         if (providerThread === undefined || nativeThreadId == null) return;
         if (!(yield* lifecycle.handles(providerThread.providerInstanceId))) return;
         reported.set(threadId, key);
+        // The notice records a handled change, so a restart does not repeat it.
+        const noticeId = TurnItemId.make(`${EVENT_PREFIX}:notice:${threadId}:${key}`);
+        if ((yield* projections.getTurnItem({ threadId, itemId: noticeId })) !== null) return;
         const notice = yield* lifecycle.notify(providerThread.providerInstanceId, {
           event,
           threadId,
@@ -162,7 +166,7 @@ export const layer = Layer.effectDiscard(
           ),
           stillApplies: stillApplies(event, threadId, providerThread, nativeThreadId),
         });
-        if (notice !== null) yield* writeNotice(threadId, providerThread.id, notice);
+        if (notice !== null) yield* writeNotice(threadId, providerThread.id, noticeId, notice);
       },
       (effect, event, threadId) =>
         effect.pipe(
@@ -181,10 +185,7 @@ export const layer = Layer.effectDiscard(
     const processEvent = (event: OrchestrationV2DomainEvent) => {
       switch (event.type) {
         case "thread.settled":
-          // A repeat settle keeps the thread's updatedAt, which a restart's empty map cannot tell.
-          return DateTime.isLessThan(event.payload.updatedAt, event.occurredAt)
-            ? Effect.void
-            : report("settled", event.threadId);
+          return report("settled", event.threadId);
         case "thread.archived":
           return report("archived", event.threadId);
         case "thread.unsettled":
