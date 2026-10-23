@@ -32,7 +32,7 @@ import { makeAmAdapterV2 } from "./adapter.ts";
 import { makeAmApi } from "./api.ts";
 import { FAKE_TOKEN, makeFakeAm, type FakeAgent, type FakeEntry } from "./fakeAm.testkit.ts";
 import { amAgentName } from "./mapping.ts";
-import { AM_MIRROR_ENTRY_LIMIT, amConversationHead } from "./mirrorPlan.ts";
+import { AM_MIRROR_ENTRY_LIMIT, AM_TEXT_BYTE_LIMIT, amConversationHead } from "./mirrorPlan.ts";
 
 const testLayer = Layer.mergeAll(
   NodeServices.layer,
@@ -1264,6 +1264,47 @@ describe("AmAdapterV2", () => {
         harness
           .notices()
           .some((notice) => notice.startsWith("200 transcript entries are not shown")),
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("keeps one read's text within budget and clips oversized entries", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, {
+        ...idleAgent([user("Fix it"), assistant("On it.")]),
+        status: "working",
+      });
+      const harness = yield* makeHarness(fake, yield* importedThread(2));
+      const observed = yield* turnInput(harness.providerThread, "Activity outside T3 Code");
+      yield* harness.runtime.startTurn({
+        ...observed,
+        message: { ...observed.message, createdBy: "agent", creationSource: "provider" },
+      });
+      yield* fake.update(AGENT, (agent) => {
+        agent.entries.push({
+          kind: "tool",
+          name: "Bash",
+          input: "cat big",
+          output: "x".repeat(100_000),
+        });
+        // Each clips to 16k characters of four-byte emoji, about 32KB.
+        for (let index = 0; index < 60; index++)
+          agent.entries.push(assistant(`${index} `.padEnd(40_000, "😀")));
+        agent.status = "idle";
+      });
+      const end = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(end.status, "completed");
+      const replies = [...new Set(harness.replies())];
+      const bytes = replies.reduce((sum, text) => sum + new TextEncoder().encode(text).length, 0);
+      assert.isAtMost(bytes, AM_TEXT_BYTE_LIMIT);
+      assert.isTrue(replies.every((text) => text.length <= 16_010));
+      assert.isTrue(replies.at(-1)!.startsWith("59 "));
+      const skipped = 61 - replies.length;
+      assert.isTrue(
+        harness
+          .notices()
+          .some((notice) => notice.startsWith(`${skipped} transcript entries are not shown`)),
       );
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );

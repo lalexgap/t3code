@@ -11,9 +11,11 @@ import { amAgentRef, amTurnPhase } from "./mapping.ts";
 /** Imported history and a catch-up after a gap both keep at most this many transcript entries. */
 export const AM_MIRROR_ENTRY_LIMIT = 200;
 const MESSAGE_TEXT_LIMIT = 16_000;
-// Each message is written twice (message and turn item), and one adoption must stay well inside
-// a live subscriber's 8MB buffer.
-const HISTORY_TEXT_BYTE_LIMIT = 1_000_000;
+/**
+ * Text one adoption or one transcript read sends, in UTF-8 bytes. Each message is written twice
+ * (message and turn item), and either must stay well inside a live subscriber's 8MB buffer.
+ */
+export const AM_TEXT_BYTE_LIMIT = 1_000_000;
 const DAY_MS = 86_400_000;
 /** Marks a conversation head whose thread the mirror archived because am no longer has the agent. */
 export const AM_REMOVED_MARK = "am-removed";
@@ -196,7 +198,20 @@ export const amWorkspace = (row: AmFleetRow, remote: boolean): AmWorkspace | nul
 const clip = (text: string) =>
   text.length > MESSAGE_TEXT_LIMIT ? `${text.slice(0, MESSAGE_TEXT_LIMIT)}\n\n[…]` : text;
 
+/** A transcript entry with its text and tool fields clipped as history clips messages. */
+export const amClipEntry = (entry: AmTranscriptEntry): AmTranscriptEntry => ({
+  ...entry,
+  ...(entry.text === undefined ? {} : { text: clip(entry.text) }),
+  ...(entry.input === undefined ? {} : { input: clip(entry.input) }),
+  ...(entry.output === undefined ? {} : { output: clip(entry.output) }),
+});
+
 const utf8 = new TextEncoder();
+
+/** The UTF-8 bytes of an entry's text and tool fields. */
+export const amEntryTextBytes = (entry: AmTranscriptEntry) =>
+  utf8.encode(`${entry.text ?? ""}${entry.name ?? ""}${entry.input ?? ""}${entry.output ?? ""}`)
+    .length;
 
 /**
  * The newest entries of a transcript tail as plain history, within the entry and text budgets;
@@ -209,7 +224,7 @@ export const amHistory = (
   total: number,
 ) => {
   const tail = entries.slice(-AM_MIRROR_ENTRY_LIMIT);
-  let budget = HISTORY_TEXT_BYTE_LIMIT;
+  let budget = AM_TEXT_BYTE_LIMIT;
   let start = tail.length;
   for (let index = tail.length - 1; index >= 0; index--) {
     const text = tail[index]!.kind === "tool" ? undefined : tail[index]!.text?.trim();

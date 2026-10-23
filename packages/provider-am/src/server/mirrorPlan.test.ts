@@ -6,6 +6,7 @@ import {
   AM_MIRROR_ENTRY_LIMIT,
   AM_REMOVED_MARK,
   amConversationHead,
+  amClipEntry,
   amHistory,
   amWorkspace,
   fleetHostPathHere,
@@ -305,5 +306,20 @@ describe("amHistory", () => {
       notice,
       `${shown} earlier transcript entries are not shown. Read them with \`am transcript worker\`.`,
     );
+  });
+});
+
+describe("amClipEntry", () => {
+  it("clips a tool's input and output as it clips message text", () => {
+    const clipped = amClipEntry({
+      index: 0,
+      kind: "tool",
+      name: "Bash",
+      input: "i".repeat(50_000),
+      output: "o".repeat(50_000),
+    });
+    assert.isAtMost(clipped.input!.length, 16_010);
+    assert.isAtMost(clipped.output!.length, 16_010);
+    assert.strictEqual(clipped.name, "Bash");
   });
 });

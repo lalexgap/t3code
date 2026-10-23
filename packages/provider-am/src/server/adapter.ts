@@ -37,7 +37,14 @@ import type {
   AmMessageState,
   AmTranscriptEntry,
 } from "./api.ts";
-import { AM_MIRROR_ENTRY_LIMIT, amConversationHead, amMirroredThrough } from "./mirrorPlan.ts";
+import {
+  AM_MIRROR_ENTRY_LIMIT,
+  AM_TEXT_BYTE_LIMIT,
+  amClipEntry,
+  amConversationHead,
+  amEntryTextBytes,
+  amMirroredThrough,
+} from "./mirrorPlan.ts";
 import {
   amAgentName,
   amAgentRef,
@@ -521,10 +528,21 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
             `${skipped} transcript ${skipped === 1 ? "entry" : "entries"} from before this run ${skipped === 1 ? "is" : "are"} not shown. Read them with \`am transcript ${agentRef}\`.`,
           );
         }
-        // A transcript that grew a lot between reads shows only its newest entries, so one read
-        // stays within what a live client can take.
+        // A transcript that grew a lot between reads shows only its newest entries, within an
+        // entry and a text budget, so one read stays within what a live client can take.
+        const clipped = entries.map(amClipEntry);
         const reading = Math.max(start, turn.cursor ?? start);
-        const shown = Math.max(reading, total - AM_MIRROR_ENTRY_LIMIT);
+        let shown = Math.max(reading, total - AM_MIRROR_ENTRY_LIMIT);
+        let budget = AM_TEXT_BYTE_LIMIT;
+        for (let index = clipped.length - 1; index >= 0; index--) {
+          const entry = clipped[index]!;
+          if (entry.index < shown) break;
+          budget -= amEntryTextBytes(entry);
+          if (budget < 0) {
+            shown = entry.index + 1;
+            break;
+          }
+        }
         if (shown > reading) {
           const skipped = shown - reading;
           for (const [index, { entry, settled: wasSettled }] of turn.published)
@@ -539,14 +557,14 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
             `${skipped} transcript ${skipped === 1 ? "entry" : "entries"} ${skipped === 1 ? "is" : "are"} not shown. Read them with \`am transcript ${agentRef}\`.`,
           );
         }
-        for (const entry of entries) {
+        for (const entry of clipped) {
           if (entry.index < shown) continue;
           const previous = turn.published.get(entry.index);
           if (previous?.settled === settled && sameEntry(previous.entry, entry)) continue;
           turn.published.set(entry.index, { entry, settled });
           yield* publishEntry(turn, entry, settled);
         }
-        const open = entries.filter((entry) => entry.index >= shown && isEntryOpen(entry));
+        const open = clipped.filter((entry) => entry.index >= shown && isEntryOpen(entry));
         turn.cursor = Math.max(
           shown,
           open.length > 0 ? Math.min(...open.map((entry) => entry.index)) : total,
