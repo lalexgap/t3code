@@ -1,5 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import {
+  CommandId,
   EventId,
   ProjectId,
   ProviderDriverKind,
@@ -15,6 +16,7 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Result from "effect/Result";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectService from "../project/ProjectService.ts";
@@ -420,5 +422,44 @@ it.effect("leaves a thread alone when its provider changes while the mirror mark
         ?.fingerprint,
     );
     assert.isEmpty(archives.filter((entry) => entry.threadId === threadId));
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("commits a command expecting an active provider thread only while it is active", () =>
+  Effect.gen(function* () {
+    const mirror = yield* ProviderThreadMirror.ProviderThreadMirror;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const adopted = yield* mirror.adopt(adoption("guarded-commit"));
+    const threadId = adopted._tag === "Adopted" ? adopted.threadId : ThreadId.make("none");
+    const { providerThreads } = yield* projections.getThreadRecords(threadId, ["providerThreads"]);
+    const am = providerThreads[0]!;
+    const commit = (id: string, expected: ProviderThreadId) =>
+      eventSink.commitCommand({
+        commandId: CommandId.make(`guarded-commit:${id}`),
+        threadId,
+        commandType: "thread.archive",
+        acceptedAt: now,
+        events: [
+          {
+            id: EventId.make(`guarded-commit:${id}`),
+            type: "provider-thread.updated",
+            threadId,
+            driver: am.driver,
+            providerInstanceId: am.providerInstanceId,
+            occurredAt: now,
+            payload: am,
+          },
+        ],
+        effects: [],
+        expectActiveProviderThreadId: expected,
+      });
+    // Something outside the command queue made another provider thread active.
+    const refused = yield* Effect.result(
+      commit("stale", ProviderThreadId.make("provider-thread:no-longer-active")),
+    );
+    assert.isTrue(Result.isFailure(refused));
+    const accepted = yield* commit("current", am.id);
+    assert.isTrue(accepted.committed);
   }).pipe(Effect.provide(testLayer)),
 );

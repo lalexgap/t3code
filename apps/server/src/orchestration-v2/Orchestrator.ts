@@ -11766,6 +11766,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(plan.cancelUnsettledEffects === undefined
           ? {}
           : { cancelUnsettledEffects: plan.cancelUnsettledEffects }),
+        ...((command.type === "thread.archive" || command.type === "thread.unarchive") &&
+        command.expectedActiveProviderThreadId !== undefined
+          ? { expectActiveProviderThreadId: command.expectedActiveProviderThreadId }
+          : {}),
       })
       .pipe(
         Effect.mapError(
