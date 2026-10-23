@@ -11,6 +11,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
+import * as ProviderThreadLifecycle from "@t3tools/provider-core/server/ProviderThreadLifecycle";
 import * as ProviderThreadMirror from "@t3tools/provider-core/server/ProviderThreadMirror";
 import { ProviderDriverError } from "@t3tools/provider-core/server/errors";
 import { spawnAndCollect } from "@t3tools/provider-core/server/snapshotProbe";
@@ -32,6 +33,7 @@ import { AmSettings, amApiUrl } from "../settings.ts";
 import { makeAmAdapterV2 } from "./adapter.ts";
 import { makeAmApi } from "./api.ts";
 import { makeAmFleetMirror } from "./fleetMirror.ts";
+import { makeAmThreadLifecycle } from "./lifecycle.ts";
 import { amGitToplevel } from "./mirrorPlan.ts";
 import { checkAmProviderStatus, makePendingAmProvider } from "./status.ts";
 
@@ -119,6 +121,10 @@ export const AmDriver: ProviderDriver<AmSettings, AmDriverEnv> = {
       home: NodeOS.homedir(),
       gitRoot,
     });
+    yield* (yield* ProviderThreadLifecycle.ProviderThreadLifecycle).register(
+      instanceId,
+      makeAmThreadLifecycle({ settings: effectiveConfig, api, busyAgents }),
+    );
     const snapshotSettings = yield* makeProviderSnapshotSettingsSource(effectiveConfig);
     const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<AmSettings>>({
       resolveMaintenance: () => Effect.succeed(MAINTENANCE),

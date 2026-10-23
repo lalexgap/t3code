@@ -186,6 +186,8 @@ export interface AmApi {
     id: string,
   ) => Effect.Effect<AmInterruptResult, AmApiError>;
   readonly resume: (name: string) => Effect.Effect<void, AmApiError>;
+  /** Ends the agent's tmux session; am keeps its state, conversation and worktree to resume. */
+  readonly stop: (ref: string) => Effect.Effect<void, AmApiError>;
   readonly transcript: (name: string, after: number) => Effect.Effect<AmTranscript, AmApiError>;
   /** Every fleet event, as a bare wake signal; reconnecting is the caller's concern. */
   readonly events: Stream.Stream<Sse.Event, AmApiError>;
@@ -344,6 +346,7 @@ export const makeAmApi = (
         ),
       ),
     resume: (ref) => post("resume", agentPath(ref, "/resume"), {}),
+    stop: (ref) => post("stop", agentPath(ref, "/stop"), {}),
     transcript: (ref, after) =>
       send(
         "transcript read",

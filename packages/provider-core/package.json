@@ -123,6 +123,10 @@
       "types": "./src/server/ProviderLatestVersions.ts",
       "import": "./src/server/ProviderLatestVersions.ts"
     },
+    "./server/ProviderThreadLifecycle": {
+      "types": "./src/server/ProviderThreadLifecycle.ts",
+      "import": "./src/server/ProviderThreadLifecycle.ts"
+    },
     "./server/ProviderThreadMirror": {
       "types": "./src/server/ProviderThreadMirror.ts",
       "import": "./src/server/ProviderThreadMirror.ts"

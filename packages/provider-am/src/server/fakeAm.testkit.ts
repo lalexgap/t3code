@@ -285,7 +285,10 @@ export const makeFakeAm = Effect.fnUntraced(function* (
       }
       return json(res, 200, { ok: true });
     }
-    if (parts[2] === "stop" && method === "POST") return json(res, 200, { ok: true });
+    if (parts[2] === "stop" && method === "POST") {
+      agent.status = "exited";
+      return json(res, 200, { ok: true });
+    }
     return json(res, 404, { error: "not found" });
   };
   const server = NodeHttp.createServer((req, res) => {
