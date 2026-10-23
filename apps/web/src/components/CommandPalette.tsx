@@ -60,6 +60,7 @@ import {
   LinkIcon,
   MessageSquareIcon,
   PaletteIcon,
+  RefreshCwIcon,
   RotateCcwIcon,
   SettingsIcon,
   SquarePenIcon,
@@ -1376,6 +1377,28 @@ function OpenCommandPaletteDialog(props: {
           },
         });
         if (refreshed._tag === "Failure") throw squashAtomCommandFailure(refreshed);
+      },
+    });
+  }
+
+  // A status refresh also reconciles an Agent Motel instance's fleet, so this is its Sync now.
+  const fleetMirrors = [...providersByEnvironment].flatMap(([environmentId, providers]) =>
+    providers
+      .filter((provider) => provider.driver === "am" && provider.enabled)
+      .map((provider) => ({ environmentId, instanceId: provider.instanceId })),
+  );
+  if (fleetMirrors.length > 0) {
+    actionItems.push({
+      kind: "action",
+      value: "action:sync-agent-motel",
+      searchTerms: ["agent motel", "am", "fleet", "sync", "import", "agents"],
+      title: "Sync Agent Motel agents",
+      icon: <RefreshCwIcon className={ITEM_ICON_CLASS} />,
+      run: async () => {
+        for (const { environmentId, instanceId } of fleetMirrors) {
+          const refreshed = await refreshProviders({ environmentId, input: { instanceId } });
+          if (refreshed._tag === "Failure") throw squashAtomCommandFailure(refreshed);
+        }
       },
     });
   }

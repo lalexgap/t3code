@@ -43,6 +43,30 @@ export const AmAgentDetail = Schema.Struct({
 });
 export type AmAgentDetail = typeof AmAgentDetail.Type;
 
+/** One row of `GET /api/agents`, am's cached fleet view; `host` is set on a fleet host's rows. */
+export const AmFleetRow = Schema.Struct({
+  name: Schema.String,
+  host: Schema.optional(Schema.String),
+  status: Schema.String,
+  provider: Schema.String,
+  dir: Schema.String,
+  createdAt: Schema.optional(Schema.String),
+  updatedAt: Schema.String,
+  statusChangedAt: Schema.optional(Schema.String),
+  /** Set only for agents am started in a worktree of its own. */
+  worktreePath: Schema.optional(Schema.String),
+  worktreeBranch: Schema.optional(Schema.String),
+  repoRoot: Schema.optional(Schema.String),
+});
+export type AmFleetRow = typeof AmFleetRow.Type;
+
+export const AmFleet = Schema.Struct({
+  rows: Schema.Array(AmFleetRow),
+  /** Fleet hosts whose rows am could not read; their agents are missing from `rows`. */
+  unreachable: Schema.Array(Schema.String),
+});
+export type AmFleet = typeof AmFleet.Type;
+
 export const AmMessageState = Schema.Literals([
   "queued",
   "delivered",
@@ -139,6 +163,8 @@ export type AmInterruptResult =
 export interface AmApi {
   readonly health: Effect.Effect<AmHealth, AmApiError>;
   readonly hosts: Effect.Effect<AmHosts, AmApiError>;
+  /** am's cached fleet view; it never waits on ssh. */
+  readonly agents: Effect.Effect<AmFleet, AmApiError>;
   /** None when am has no agent with this name. */
   readonly getAgent: (ref: string) => Effect.Effect<Option.Option<AmAgentDetail>, AmApiError>;
   readonly createAgent: (input: CreateAgentInput) => Effect.Effect<void, AmApiError>;
@@ -246,6 +272,9 @@ export const makeAmApi = (
     ),
     hosts: send("host list", HttpClientRequest.get("/hosts")).pipe(
       Effect.flatMap((response) => decode("host list", AmHosts, response)),
+    ),
+    agents: send("agent list", HttpClientRequest.get("/agents")).pipe(
+      Effect.flatMap((response) => decode("agent list", AmFleet, response)),
     ),
     getAgent: (ref) =>
       send("agent lookup", HttpClientRequest.get(agentPath(ref))).pipe(

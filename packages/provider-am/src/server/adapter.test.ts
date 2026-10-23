@@ -32,6 +32,7 @@ import { makeAmAdapterV2 } from "./adapter.ts";
 import { makeAmApi } from "./api.ts";
 import { FAKE_TOKEN, makeFakeAm, type FakeAgent, type FakeEntry } from "./fakeAm.testkit.ts";
 import { amAgentName } from "./mapping.ts";
+import { AM_MIRROR_ENTRY_LIMIT, AM_EMITTED_BYTE_LIMIT, amConversationHead } from "./mirrorPlan.ts";
 
 const testLayer = Layer.mergeAll(
   NodeServices.layer,
@@ -183,6 +184,28 @@ const turnInput = Effect.fnUntraced(function* (
     modelSelection,
     runtimePolicy,
   };
+});
+
+/** A thread the fleet mirror imported, mirrored through `head`. */
+const importedThread = Effect.fnUntraced(function* (head: number) {
+  const now = yield* DateTime.now;
+  return {
+    id: ProviderThreadId.make("provider-thread-imported"),
+    driver: ProviderDriverKind.make("am"),
+    providerInstanceId: INSTANCE_ID,
+    providerSessionId: null,
+    appThreadId: THREAD_ID,
+    ownerNodeId: null,
+    nativeThreadRef: { driver: ProviderDriverKind.make("am"), nativeId: AGENT, strength: "strong" },
+    nativeConversationHeadRef: amConversationHead(AGENT, head),
+    status: "active",
+    firstRunOrdinal: 1,
+    lastRunOrdinal: 1,
+    handoffIds: [],
+    forkedFrom: null,
+    createdAt: now,
+    updatedAt: now,
+  } satisfies OrchestrationV2ProviderThread;
 });
 
 const user = (text: string): FakeEntry => ({ kind: "user", text });
@@ -1042,6 +1065,353 @@ describe("AmAdapterV2", () => {
         remote,
       ).pipe(Effect.flip);
       assert.include(String((failure as { cause?: unknown }).cause), "Fleet host");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("follows work T3 did not start, then a T3 turn adds only what is new", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, idleAgent([user("Old"), assistant("Old reply")]));
+      const now = yield* DateTime.now;
+      const harness = yield* makeHarness(fake, {
+        id: ProviderThreadId.make("provider-thread-imported"),
+        driver: ProviderDriverKind.make("am"),
+        providerInstanceId: INSTANCE_ID,
+        providerSessionId: null,
+        appThreadId: THREAD_ID,
+        ownerNodeId: null,
+        nativeThreadRef: {
+          driver: ProviderDriverKind.make("am"),
+          nativeId: AGENT,
+          strength: "strong",
+        },
+        // Imported with its history, so the thread already shows the first two entries.
+        nativeConversationHeadRef: amConversationHead(AGENT, 2),
+        status: "idle",
+        firstRunOrdinal: null,
+        lastRunOrdinal: null,
+        handoffIds: [],
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+      const heads = () =>
+        harness.allEvents.flatMap((event) =>
+          event.type === "provider_thread.updated"
+            ? [event.providerThread.nativeConversationHeadRef?.ordinal]
+            : [],
+        );
+      const repliesById = () =>
+        new Map(
+          harness
+            .items()
+            .flatMap((item) => (item.type === "assistant_message" ? [[item.id, item.text]] : [])),
+        );
+
+      // A peer's message set the agent working, so the fleet mirror asked for a run to follow it:
+      // a provider-created message, which T3 never sends to the agent.
+      const working = fake.agents.get(AGENT)!;
+      working.status = "working";
+      working.entries.push(user("[am · from reviewer] check CI"), {
+        kind: "tool",
+        name: "Bash",
+        input: '{"command":"gh pr checks"}',
+      });
+      const observed = yield* turnInput(harness.providerThread, "Activity outside T3 Code");
+      yield* harness.runtime.startTurn({
+        ...observed,
+        message: { ...observed.message, createdBy: "agent", creationSource: "provider" },
+      });
+      yield* harness.takeItem((event) => event.turnItem.type === "command_execution");
+      yield* fake.update(AGENT, (agent) => {
+        agent.entries[3] = { ...agent.entries[3]!, output: "all green" };
+        agent.entries.push(assistant("CI is green."));
+        agent.status = "idle";
+      });
+      const observedEnd = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(observedEnd.status, "completed");
+      assert.isFalse(fake.log.some((call) => call.method === "POST"));
+      assert.deepStrictEqual([...repliesById().values()], ["CI is green."]);
+      assert.deepStrictEqual(harness.notices(), ["[am · from reviewer] check CI"]);
+      const afterObserve = harness.allEvents.findLast(
+        (event) => event.type === "provider_thread.updated",
+      );
+      assert.strictEqual(heads().at(-1), 5);
+
+      // Between runs someone types into the agent's terminal and it answers.
+      fake.agents
+        .get(AGENT)!
+        .entries.push(user("Typed in the terminal"), assistant("Terminal reply."));
+      yield* harness.runtime.startTurn(
+        yield* turnInput(
+          afterObserve?.type === "provider_thread.updated"
+            ? afterObserve.providerThread
+            : harness.providerThread,
+          "Next step",
+          2,
+        ),
+      );
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      yield* deliver(fake, sent.messageId!, user("Next step"), assistant("Next reply."));
+      yield* complete(fake, sent.messageId!);
+      yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
+
+      // Every entry after the head shows once, in the run that saw it.
+      assert.deepStrictEqual(
+        [...repliesById().values()],
+        ["CI is green.", "Terminal reply.", "Next reply."],
+      );
+      assert.deepStrictEqual(harness.notices(), [
+        "[am · from reviewer] check CI",
+        "Typed in the terminal",
+      ]);
+      assert.strictEqual(heads().at(-1), 9);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("follows the agent instead of prompting it when T3 continues a run after a restart", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, {
+        ...idleAgent([user("Fix it"), assistant("On it.")]),
+        status: "working",
+      });
+      const now = yield* DateTime.now;
+      const harness = yield* makeHarness(fake, {
+        id: ProviderThreadId.make("provider-thread-restarted"),
+        driver: ProviderDriverKind.make("am"),
+        providerInstanceId: INSTANCE_ID,
+        providerSessionId: null,
+        appThreadId: THREAD_ID,
+        ownerNodeId: null,
+        nativeThreadRef: {
+          driver: ProviderDriverKind.make("am"),
+          nativeId: AGENT,
+          strength: "strong",
+        },
+        nativeConversationHeadRef: amConversationHead(AGENT, 2),
+        status: "active",
+        firstRunOrdinal: 1,
+        lastRunOrdinal: 1,
+        handoffIds: [],
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+      const continued = yield* turnInput(harness.providerThread, "Continue where you left off.", 2);
+      yield* harness.runtime.startTurn({
+        ...continued,
+        restartContinuationOfRunId: RunId.make("run-1"),
+        message: { ...continued.message, createdBy: "agent", creationSource: "server" },
+      });
+      yield* fake.update(AGENT, (agent) => {
+        agent.entries.push(assistant("Fixed."));
+        agent.status = "idle";
+      });
+      const end = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(end.status, "completed");
+      // am's agent kept working through the restart, so nothing is sent to it or started.
+      assert.isFalse(fake.log.some((call) => call.method === "POST"));
+      assert.deepStrictEqual(harness.replies(), ["Fixed."]);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("fails a run T3 continues after a restart when the agent stopped meanwhile", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, {
+        ...idleAgent([user("Fix it"), assistant("On it.")]),
+        status: "exited",
+      });
+      const harness = yield* makeHarness(fake, yield* importedThread(2));
+      const continued = yield* turnInput(harness.providerThread, "Continue where you left off.", 2);
+      yield* harness.runtime.startTurn({
+        ...continued,
+        restartContinuationOfRunId: RunId.make("run-1"),
+        message: { ...continued.message, createdBy: "agent", creationSource: "server" },
+      });
+      const end = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(end.status, "failed");
+      assert.include(end.failure?.message ?? "", "stopped while T3 Code was restarting");
+      assert.isFalse(fake.log.some((call) => call.method === "POST"));
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("fails a continued run whose agent exits after a read but before replying", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, {
+        ...idleAgent([user("Fix it"), assistant("On it.")]),
+        status: "working",
+      });
+      const harness = yield* makeHarness(fake, yield* importedThread(2));
+      const continued = yield* turnInput(harness.providerThread, "Continue where you left off.", 2);
+      yield* harness.runtime.startTurn({
+        ...continued,
+        restartContinuationOfRunId: RunId.make("run-1"),
+        message: { ...continued.message, createdBy: "agent", creationSource: "server" },
+      });
+      // A tool runs, so the run has read the working agent, which then exits with no reply.
+      yield* fake.update(AGENT, (agent) => {
+        agent.entries.push({ kind: "tool", name: "Bash", input: "make" });
+      });
+      yield* harness.takeItem((item) => item.turnItem.type === "command_execution");
+      yield* fake.update(AGENT, (agent) => {
+        agent.status = "exited";
+      });
+      const end = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(end.status, "failed");
+      assert.include(end.failure?.message ?? "", "stopped while T3 Code was restarting");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("withdraws a steer queued on a continued run when its agent stops", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, {
+        ...idleAgent([user("Fix it"), assistant("On it.")]),
+        status: "working",
+      });
+      const harness = yield* makeHarness(fake, yield* importedThread(2));
+      const continued = yield* turnInput(harness.providerThread, "Continue where you left off.", 2);
+      yield* harness.runtime.startTurn({
+        ...continued,
+        restartContinuationOfRunId: RunId.make("run-1"),
+        message: { ...continued.message, createdBy: "agent", creationSource: "server" },
+      });
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      yield* harness.runtime.steerTurn({
+        threadId: THREAD_ID,
+        runId: continued.runId,
+        providerThread: harness.providerThread,
+        providerTurnId: started.providerTurn.id,
+        message: {
+          messageId: MessageId.make("steer-after-restart"),
+          text: "Also run the tests",
+          attachments: [],
+          createdBy: "user",
+          creationSource: "web",
+        },
+      });
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      yield* fake.update(AGENT, (agent) => {
+        agent.status = "exited";
+      });
+      yield* fake.takeCall("DELETE", `/api/agents/${AGENT}/messages/${sent.messageId}`);
+      const end = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(end.status, "failed");
+      assert.include(end.failure?.message ?? "", "stopped while T3 Code was restarting");
+      assert.strictEqual(fake.messages.get(sent.messageId!)?.state, "cancelled");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("shows only the newest entries when the transcript outgrows one read", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, {
+        ...idleAgent([user("Fix it"), assistant("On it.")]),
+        status: "working",
+      });
+      const harness = yield* makeHarness(fake, yield* importedThread(2));
+      const observed = yield* turnInput(harness.providerThread, "Activity outside T3 Code");
+      yield* harness.runtime.startTurn({
+        ...observed,
+        message: { ...observed.message, createdBy: "agent", creationSource: "provider" },
+      });
+      yield* fake.update(AGENT, (agent) => {
+        for (let index = 0; index < 400; index++) agent.entries.push(assistant(`reply ${index}`));
+        agent.status = "idle";
+      });
+      const end = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(end.status, "completed");
+      const replies = harness.replies();
+      assert.strictEqual(new Set(replies).size, AM_MIRROR_ENTRY_LIMIT);
+      assert.strictEqual(replies[0], "reply 200");
+      assert.strictEqual(replies.at(-1), "reply 399");
+      assert.isTrue(
+        harness
+          .notices()
+          .some((notice) => notice.startsWith("200 transcript entries are not shown")),
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("budgets a read by its serialized size, not its raw text", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, {
+        ...idleAgent([user("Fix it"), assistant("On it.")]),
+        status: "working",
+      });
+      const harness = yield* makeHarness(fake, yield* importedThread(2));
+      const observed = yield* turnInput(harness.providerThread, "Activity outside T3 Code");
+      yield* harness.runtime.startTurn({
+        ...observed,
+        message: { ...observed.message, createdBy: "agent", creationSource: "provider" },
+      });
+      yield* fake.update(AGENT, (agent) => {
+        // Each NUL is one byte of text and six once JSON escapes it.
+        for (let index = 0; index < 60; index++)
+          agent.entries.push(assistant(`${index} `.padEnd(16_000, "\u0000")));
+        agent.status = "idle";
+      });
+      const end = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(end.status, "completed");
+      const serialized = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length;
+      const emittedText = harness.allEvents.reduce(
+        (sum, event) =>
+          sum +
+          (event.type === "message.updated"
+            ? serialized(event.message.text)
+            : event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+              ? serialized(event.turnItem.text)
+              : 0),
+        0,
+      );
+      assert.isAtMost(emittedText, AM_EMITTED_BYTE_LIMIT);
+      assert.isTrue(harness.replies().at(-1)!.startsWith("59 "));
+      assert.isBelow(serialized(harness.allEvents), 2_000_000);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("keeps one read's text within budget and clips oversized entries", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, {
+        ...idleAgent([user("Fix it"), assistant("On it.")]),
+        status: "working",
+      });
+      const harness = yield* makeHarness(fake, yield* importedThread(2));
+      const observed = yield* turnInput(harness.providerThread, "Activity outside T3 Code");
+      yield* harness.runtime.startTurn({
+        ...observed,
+        message: { ...observed.message, createdBy: "agent", creationSource: "provider" },
+      });
+      yield* fake.update(AGENT, (agent) => {
+        agent.entries.push({
+          kind: "tool",
+          name: "Bash",
+          input: "cat big",
+          output: "x".repeat(100_000),
+        });
+        // Each clips to 16k characters of four-byte emoji, about 32KB.
+        for (let index = 0; index < 60; index++)
+          agent.entries.push(assistant(`${index} `.padEnd(40_000, "😀")));
+        agent.status = "idle";
+      });
+      const end = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(end.status, "completed");
+      const replies = [...new Set(harness.replies())];
+      const bytes = replies.reduce((sum, text) => sum + new TextEncoder().encode(text).length, 0);
+      assert.isAtMost(bytes, AM_EMITTED_BYTE_LIMIT);
+      assert.isTrue(replies.every((text) => text.length <= 16_010));
+      assert.isTrue(replies.at(-1)!.startsWith("59 "));
+      const skipped = 61 - replies.length;
+      assert.isTrue(
+        harness
+          .notices()
+          .some((notice) => notice.startsWith(`${skipped} transcript entries are not shown`)),
+      );
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

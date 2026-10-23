@@ -38,6 +38,14 @@ import type {
   AmTranscriptEntry,
 } from "./api.ts";
 import {
+  AM_MIRROR_ENTRY_LIMIT,
+  AM_EMITTED_BYTE_LIMIT,
+  amClipEntry,
+  amConversationHead,
+  amEntryEmittedBytes,
+  amMirroredThrough,
+} from "./mirrorPlan.ts";
+import {
   amAgentName,
   amAgentRef,
   amEntryStatus,
@@ -183,6 +191,8 @@ export interface AmAdapterV2Options {
   readonly pollIntervalMs?: number;
   /** How long a finished turn waits for its closing reply to reach the transcript. */
   readonly settleGraceMs?: number;
+  /** Shared with the fleet mirror, which leaves an agent alone while a T3 turn follows it. */
+  readonly busyAgents?: Set<string>;
 }
 
 /** A message T3 sent, followed through am's delivery receipt. */
@@ -206,6 +216,17 @@ const isPending = (message: TrackedMessage) =>
 interface ActiveTurn {
   readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
   providerTurn: OrchestrationV2ProviderTurn;
+  /**
+   * Follows work T3 did not send, started by the fleet mirror; it ends when the agent is idle
+   * rather than on a receipt.
+   */
+  readonly observe: boolean;
+  /** The thread's mirrored head when the turn started: later entries belong to this run. */
+  from: number | undefined;
+  /** An observing run skips a backlog this far back rather than replaying all of it. */
+  readonly floor: number;
+  /** Continues a run T3's restart cut off: an agent gone before it shows a reply fails it. */
+  restartCheck: boolean;
   /** The prompt first, then any steering; the run ends when every one of them has. */
   readonly messages: Array<TrackedMessage>;
   /** Lowest transcript index that can still change; unset until am delivers the prompt. */
@@ -224,6 +245,10 @@ interface ActiveTurn {
 
 const trimSlashes = (path: string) => path.replace(/\/+$/, "");
 
+/** The fleet mirror asks for an observing run with a provider-created wake message. */
+const isObserveMessage = (message: ProviderAdapter.ProviderAdapterV2TurnMessage) =>
+  message.createdBy === "agent" && message.creationSource === "provider";
+
 const nativeRef = (nativeId: string, strength: "strong" | "weak" = "strong") => ({
   driver: AM_PROVIDER,
   nativeId,
@@ -238,6 +263,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
   const { api } = options;
   const remote = options.settings.host !== "";
   const capabilities = amCapabilities(remote);
+  const busyAgents = options.busyAgents ?? new Set<string>();
   const protocolError = (detail: string, cause?: unknown) =>
     new ProviderAdapter.ProviderAdapterProtocolError({
       driver: AM_PROVIDER,
@@ -471,25 +497,76 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         });
         yield* emit({ type: "turn_item.updated", driver: AM_PROVIDER, turnItem });
       });
+      /**
+       * The first transcript index this run shows. A T3 turn also shows what reached the agent
+       * since the thread's mirrored head, so nothing between runs is lost or shown twice.
+       */
+      const turnStart = (turn: ActiveTurn) => {
+        if (turn.observe)
+          return turn.from === undefined ? undefined : Math.max(turn.from, turn.floor);
+        const prompt = turn.messages[0]?.transcriptIndex;
+        // Before am delivers the prompt, the transcript belongs to work that came before it.
+        if (prompt === null || prompt === undefined) return undefined;
+        if (turn.from === undefined) return prompt;
+        return Math.max(Math.min(turn.from, prompt), prompt - AM_MIRROR_ENTRY_LIMIT);
+      };
       const applyEntries = Effect.fnUntraced(function* (
         turn: ActiveTurn,
         entries: ReadonlyArray<AmTranscriptEntry>,
         total: number,
         settled: boolean,
       ) {
-        const start = turn.messages[0]?.transcriptIndex;
-        // Before am delivers the prompt, the transcript belongs to work that came before it.
-        if (start === null || start === undefined) return;
-        for (const entry of entries) {
-          if (entry.index < start) continue;
+        const start = turnStart(turn);
+        if (start === undefined) return;
+        if (turn.from !== undefined && start > turn.from) {
+          const skipped = start - turn.from;
+          turn.from = start;
+          yield* emitNotice(
+            turn,
+            `gap:${turn.input.runId}`,
+            "Earlier activity not shown",
+            `${skipped} transcript ${skipped === 1 ? "entry" : "entries"} from before this run ${skipped === 1 ? "is" : "are"} not shown. Read them with \`am transcript ${agentRef}\`.`,
+          );
+        }
+        // A transcript that grew a lot between reads shows only its newest entries, within an
+        // entry and a text budget, so one read stays within what a live client can take.
+        const clipped = entries.map(amClipEntry);
+        const reading = Math.max(start, turn.cursor ?? start);
+        let shown = Math.max(reading, total - AM_MIRROR_ENTRY_LIMIT);
+        let budget = AM_EMITTED_BYTE_LIMIT;
+        for (let index = clipped.length - 1; index >= 0; index--) {
+          const entry = clipped[index]!;
+          if (entry.index < shown) break;
+          budget -= amEntryEmittedBytes(entry);
+          if (budget < 0) {
+            shown = entry.index + 1;
+            break;
+          }
+        }
+        if (shown > reading) {
+          const skipped = shown - reading;
+          for (const [index, { entry, settled: wasSettled }] of turn.published)
+            if (index < shown && !wasSettled && isEntryOpen(entry)) {
+              turn.published.set(index, { entry, settled: true });
+              yield* publishEntry(turn, entry, true);
+            }
+          yield* emitNotice(
+            turn,
+            `gap:${turn.input.runId}:${shown}`,
+            "Activity not shown",
+            `${skipped} transcript ${skipped === 1 ? "entry" : "entries"} ${skipped === 1 ? "is" : "are"} not shown. Read them with \`am transcript ${agentRef}\`.`,
+          );
+        }
+        for (const entry of clipped) {
+          if (entry.index < shown) continue;
           const previous = turn.published.get(entry.index);
           if (previous?.settled === settled && sameEntry(previous.entry, entry)) continue;
           turn.published.set(entry.index, { entry, settled });
           yield* publishEntry(turn, entry, settled);
         }
-        const open = entries.filter((entry) => entry.index >= start && isEntryOpen(entry));
+        const open = clipped.filter((entry) => entry.index >= shown && isEntryOpen(entry));
         turn.cursor = Math.max(
-          start,
+          shown,
           open.length > 0 ? Math.min(...open.map((entry) => entry.index)) : total,
         );
       });
@@ -524,6 +601,9 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
               turn.published.set(entry.index, { entry, settled: true });
               yield* publishEntry(turn, entry, true);
             }
+        // Everything before the head is in the thread; a failed last read resumes at the cursor.
+        const head = last._tag === "Some" ? last.value.total : turn.cursor;
+        busyAgents.delete(agentRef!);
         const completedAt = yield* DateTime.now;
         turn.providerTurn = { ...turn.providerTurn, status, completedAt };
         yield* emit({
@@ -532,7 +612,14 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           threadId: turn.input.threadId,
           providerTurn: turn.providerTurn,
         });
-        yield* updateThread({ status: "idle" });
+        yield* updateThread({
+          status: "idle",
+          ...(head === undefined
+            ? {}
+            : {
+                nativeConversationHeadRef: amConversationHead(agentRef!, head),
+              }),
+        });
         yield* updateSession("ready", status === "failed" ? (detail ?? null) : null);
         active = undefined;
         if (status === "failed") {
@@ -707,7 +794,11 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           applyReceipt(message, receipt);
           if (receipt.state !== "failed") continue;
           // A message that failed after delivery lost its session mid-turn, taking the run with it.
-          if (message === turn.messages[0] || wasDelivered || receipt.transcriptIndex !== null)
+          if (
+            (!turn.observe && message === turn.messages[0]) ||
+            wasDelivered ||
+            receipt.transcriptIndex !== null
+          )
             return yield* finish(
               turn,
               "failed",
@@ -723,16 +814,50 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
             receipt.error ?? "Agent Motel could not deliver a follow-up message.",
           );
         }
-        const prompt = turn.messages[0]!;
         // Someone else withdrew it, for example with `am queue --clear`.
-        if (prompt.state === "cancelled") return yield* finish(turn, "cancelled");
-        if (turn.cursor === undefined && prompt.transcriptIndex !== null)
-          turn.cursor = prompt.transcriptIndex;
-        const transcript = yield* api.transcript(ref, turn.cursor ?? TRANSCRIPT_END);
+        if (!turn.observe && turn.messages[0]!.state === "cancelled")
+          return yield* finish(turn, "cancelled");
+        turn.cursor ??= turnStart(turn);
+        const read = yield* api.transcript(ref, turn.cursor ?? TRANSCRIPT_END).pipe(
+          Effect.asSome,
+          Effect.catchIf(
+            (error) => error.status === 404,
+            () => Effect.succeedNone,
+          ),
+        );
         if (active !== turn) return;
+        // Withdraws a steer still queued, as the gone branch does, so a resume does not run it
+        // outside any run.
+        const stoppedOnRestart = () =>
+          withdraw(turn).pipe(
+            Effect.ignore,
+            Effect.andThen(
+              finish(
+                turn,
+                "failed",
+                `The Agent Motel agent ${ref} stopped while T3 Code was restarting. Send a message to resume it.`,
+              ),
+            ),
+          );
+        if (read._tag === "None")
+          return yield* turn.restartCheck
+            ? stoppedOnRestart()
+            : turn.observe
+              ? finish(turn, "completed")
+              : finish(turn, "failed", `Agent Motel no longer has the agent ${ref}.`);
+        const transcript = read.value;
         yield* applyEntries(turn, transcript.entries, transcript.total, false);
+        const phase = amTurnPhase(transcript.status);
+        // Until the continued run shows a reply, an agent that stops left it unfinished.
+        if (turn.restartCheck) {
+          if ([...turn.published.values()].some(({ entry }) => entry.kind === "assistant"))
+            turn.restartCheck = false;
+          else if (phase === "gone") return yield* stoppedOnRestart();
+        }
+        // An observing run lasts while the agent works; a T3 turn, while its messages do.
+        const observedWork = turn.observe && (phase === "running" || phase === "attention");
         // am ends a turn aborted with Esc itself, whoever pressed it (`am interrupt` included).
-        if (!turn.messages.some(isPending)) {
+        if (!observedWork && !turn.messages.some(isPending)) {
           const interrupted = turn.messages.some((message) => message.interrupted);
           if (!interrupted && !showsReply(turn)) {
             const now = yield* Clock.currentTimeMillis;
@@ -755,7 +880,6 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           return yield* finish(turn, interrupted ? "interrupted" : "completed");
         }
         turn.settledAt = undefined;
-        const phase = amTurnPhase(transcript.status);
         if (phase !== "attention") turn.inAttention = false;
         switch (phase) {
           case "running":
@@ -917,9 +1041,33 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           return yield* protocolError("Agent Motel does not support Plan mode");
         if (turnInput.runtimePolicy.runtimeMode !== "full-access")
           return yield* protocolError(FULL_ACCESS_ONLY);
+        const ref = agentRef;
+        const head = amMirroredThrough(turnInput.providerThread.nativeConversationHeadRef, ref);
+        // am's agents run on without T3, so a run T3 continues after its own restart follows the
+        // agent rather than prompting it, which could also resume an agent stopped since.
+        const restarted = turnInput.restartContinuationOfRunId !== undefined;
+        if (isObserveMessage(turnInput.message) || restarted) {
+          const { total } = yield* fromApi(
+            api.transcript(ref, TRANSCRIPT_END).pipe(
+              // The first read in the run reports an agent am no longer has.
+              Effect.catchIf(
+                (error) => restarted && error.status === 404,
+                () => Effect.succeed({ total: 0 }),
+              ),
+            ),
+          );
+          return yield* begin(turnInput, {
+            observe: true,
+            restartCheck: restarted,
+            nativeTurnId: `${ref}:observe:${turnInput.runId}`,
+            // A transcript shorter than the head is a new session's, so it is all new.
+            from: head === undefined ? total : head > total ? 0 : head,
+            floor: total - AM_MIRROR_ENTRY_LIMIT,
+            messages: [],
+          });
+        }
         const text = promptText(turnInput.message);
         if (!text) return yield* protocolError("Agent Motel needs a text message");
-        const ref = agentRef;
         const { host, name } = parseAmAgentRef(ref);
         const dir = turnInput.runtimePolicy.cwd ?? cwd;
         if (!receiptsConfirmed && !host) {
@@ -958,16 +1106,33 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           receiptsConfirmed = true;
         }
         const id = yield* fromApi(api.sendMessage(ref, text, "queue"));
+        yield* begin(turnInput, {
+          observe: false,
+          nativeTurnId: `${ref}:${id}`,
+          from: head,
+          floor: 0,
+          messages: [
+            { id, mode: "queue", state: "queued", transcriptIndex: null, shownAt: undefined },
+          ],
+        });
+      });
+      const begin = Effect.fnUntraced(function* (
+        turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+        init: Pick<ActiveTurn, "observe" | "from" | "floor" | "messages"> & {
+          readonly nativeTurnId: string;
+          readonly restartCheck?: boolean;
+        },
+      ) {
         const startedAt = yield* DateTime.now;
         const providerTurn: OrchestrationV2ProviderTurn = {
           id: idAllocator.derive.providerTurn({
             driver: AM_PROVIDER,
-            nativeTurnId: `${options.instanceId}:${ref}:${id}`,
+            nativeTurnId: `${options.instanceId}:${init.nativeTurnId}`,
           }),
           providerThreadId: turnInput.providerThread.id,
           nodeId: turnInput.rootNodeId,
           runAttemptId: turnInput.attemptId,
-          nativeTurnRef: nativeRef(`${ref}:${id}`, "weak"),
+          nativeTurnRef: nativeRef(init.nativeTurnId, "weak"),
           ordinal: turnInput.providerTurnOrdinal,
           status: "running",
           startedAt,
@@ -976,9 +1141,11 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         const turn: ActiveTurn = {
           input: turnInput,
           providerTurn,
-          messages: [
-            { id, mode: "queue", state: "queued", transcriptIndex: null, shownAt: undefined },
-          ],
+          observe: init.observe,
+          from: init.from,
+          floor: init.floor,
+          restartCheck: init.restartCheck ?? false,
+          messages: init.messages,
           cursor: undefined,
           published: new Map(),
           ordinals: new Map(),
@@ -991,6 +1158,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         };
         thread = turnInput.providerThread;
         active = turn;
+        busyAgents.add(agentRef!);
         yield* emit({
           type: "provider_turn.updated",
           driver: AM_PROVIDER,
@@ -1110,7 +1278,8 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
               return yield* protocolError("This Agent Motel turn cannot be steered");
             const text = promptText(args.message);
             if (!text) return yield* protocolError("Agent Motel needs a text message");
-            const mode = turn.messages[0]?.state === "queued" ? "queue" : "now";
+            // An observing run follows someone else's work, so its steer waits for the agent.
+            const mode = turn.observe || turn.messages[0]?.state === "queued" ? "queue" : "now";
             const id = yield* fromApi(api.sendMessage(agentRef!, text, mode));
             turn.settledAt = undefined;
             turn.messages.push({

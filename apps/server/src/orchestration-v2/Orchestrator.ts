@@ -2443,6 +2443,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
     }
 
+    // A thread opened on another tool's worktree must not make it removable either.
+    const externalWorktree =
+      command.worktreePath !== null &&
+      (yield* projectionStore
+        .isExternalWorktree(command.worktreePath)
+        .pipe(mapDispatchError(command)));
     const now = yield* DateTime.now;
     const emitEvent = emit(events, command);
     const thread: OrchestrationV2AppThread = {
@@ -2457,6 +2463,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       interactionMode: command.interactionMode,
       branch: command.branch,
       worktreePath: command.worktreePath,
+      ...(externalWorktree ? { externalWorktree: true } : {}),
       activeProviderThreadId: null,
       pullRequests: [],
       lineage: {
@@ -2764,6 +2771,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: `Thread ${command.threadId} is already archived.`,
       });
     }
+    if (
+      (command.type === "thread.archive" || command.type === "thread.unarchive") &&
+      command.expectedActiveProviderThreadId !== undefined &&
+      command.expectedActiveProviderThreadId !== thread.activeProviderThreadId
+    ) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Thread ${command.threadId} moved to another provider thread.`,
+      });
+    }
     if (command.type === "thread.unarchive" && thread.archivedAt === null) {
       return yield* new OrchestratorDispatchError({
         commandId: command.commandId,
@@ -3037,6 +3055,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
       snoozedUntil = parsedSnoozedUntil.value;
     }
+    // Kept once set: T3 cannot tell whether it created a worktree it is moved to.
+    const movesToExternalWorktree =
+      command.type === "thread.metadata.update" &&
+      command.worktreePath != null &&
+      command.worktreePath !== thread.worktreePath &&
+      thread.externalWorktree !== true &&
+      (yield* projectionStore
+        .isExternalWorktree(command.worktreePath)
+        .pipe(mapDispatchError(command)));
     let markUnreadVisitedAt: DateTime.Utc | null = null;
     if (command.type === "thread.mark-unread") {
       const projection = yield* loadProjectionForCommand(command, ["runs"]);
@@ -3207,6 +3234,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 : {}),
             ...(command.branch === undefined ? {} : { branch: command.branch }),
             ...(command.worktreePath === undefined ? {} : { worktreePath: command.worktreePath }),
+            ...(movesToExternalWorktree ? { externalWorktree: true } : {}),
             ...(command.linkedPullRequest === undefined
               ? {}
               : {
@@ -11738,6 +11766,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(plan.cancelUnsettledEffects === undefined
           ? {}
           : { cancelUnsettledEffects: plan.cancelUnsettledEffects }),
+        ...((command.type === "thread.archive" || command.type === "thread.unarchive") &&
+        command.expectedActiveProviderThreadId !== undefined
+          ? { expectActiveProviderThreadId: command.expectedActiveProviderThreadId }
+          : {}),
       })
       .pipe(
         Effect.mapError(

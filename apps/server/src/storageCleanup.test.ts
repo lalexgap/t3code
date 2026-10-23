@@ -330,6 +330,12 @@ const cleanupFixture = (
                 : [],
             ),
           ),
+        getExternalWorktreePaths: () =>
+          Effect.sync(() =>
+            threads.flatMap((thread) =>
+              thread.externalWorktree && thread.worktreePath !== null ? [thread.worktreePath] : [],
+            ),
+          ),
         getThreadShell: (threadId: ThreadId) =>
           Effect.sync(() => threads.find((thread) => thread.id === threadId) ?? null),
       } as unknown as ProjectionStore.ProjectionStoreV2["Service"]),
@@ -1400,6 +1406,46 @@ describe("storage cleanup reports and local file policies", () => {
         expect(report.bytesFreed).toBe(0);
         expect(yield* fs.exists(worktree)).toBe(true);
         expect(yield* fs.readFileString(`${worktree}/notes.txt`)).toBe("untracked\n");
+      }),
+    ),
+  );
+  it.live("keeps a worktree another tool created", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        const fixture = yield* cleanupFixture();
+        fixture.setThreads([
+          shell({ branch: "feature", worktreePath: fixture.worktree, externalWorktree: true }),
+        ]);
+        const report = yield* fixture.service.runNow;
+        expect(report.entries).toMatchObject([
+          { outcome: "kept", reason: "Worktree belongs to another tool" },
+        ]);
+        expect(yield* fixture.fs.exists(fixture.worktree)).toBe(true);
+      }),
+    ),
+  );
+  it.live("keeps a worktree another tool's thread names through a symlinked parent", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        const fixture = yield* cleanupFixture();
+        const alias = yield* fixture.fs.makeTempDirectoryScoped({ prefix: "cleanup-alias-" });
+        const parent = fixture.worktree.slice(0, fixture.worktree.lastIndexOf("/"));
+        yield* fixture.fs.symlink(parent, `${alias}/worktrees`);
+        fixture.setThreads([
+          shell({ branch: "feature", worktreePath: fixture.worktree }),
+          shell({
+            id: ThreadId.make("thread-agent"),
+            branch: "feature",
+            worktreePath: `${alias}/worktrees/feature`,
+            externalWorktree: true,
+          }),
+        ]);
+        const report = yield* fixture.service.runNow;
+        expect(report.entries.find((entry) => entry.path === fixture.worktree)).toMatchObject({
+          outcome: "kept",
+          reason: "Worktree belongs to another tool",
+        });
+        expect(yield* fixture.fs.exists(fixture.worktree)).toBe(true);
       }),
     ),
   );

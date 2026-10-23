@@ -3,6 +3,7 @@ import {
   type ModelSelection,
   type OrchestrationV2ThreadProjection,
   type ProviderInteractionMode,
+  type ProviderThreadId,
   type RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
@@ -40,10 +41,12 @@ export class ThreadLifecycleService extends Context.Service<
     readonly archive: (input: {
       readonly commandId: CommandId;
       readonly threadId: ThreadId;
+      readonly expectedActiveProviderThreadId?: ProviderThreadId;
     }) => Effect.Effect<Pick<OrchestrationV2ThreadProjection, "thread">, ThreadLifecycleError>;
     readonly unarchive: (input: {
       readonly commandId: CommandId;
       readonly threadId: ThreadId;
+      readonly expectedActiveProviderThreadId?: ProviderThreadId;
     }) => Effect.Effect<Pick<OrchestrationV2ThreadProjection, "thread">, ThreadLifecycleError>;
     readonly delete: (input: {
       readonly commandId: CommandId;
@@ -93,12 +96,18 @@ const make = Effect.gen(function* () {
         type: "thread.archive",
         commandId: input.commandId,
         threadId: input.threadId,
+        ...(input.expectedActiveProviderThreadId === undefined
+          ? {}
+          : { expectedActiveProviderThreadId: input.expectedActiveProviderThreadId }),
       }),
     unarchive: (input) =>
       dispatch("unarchive", input.threadId, {
         type: "thread.unarchive",
         commandId: input.commandId,
         threadId: input.threadId,
+        ...(input.expectedActiveProviderThreadId === undefined
+          ? {}
+          : { expectedActiveProviderThreadId: input.expectedActiveProviderThreadId }),
       }),
     delete: (input) =>
       dispatch("delete", input.threadId, {

@@ -1,3 +1,5 @@
+import { normalizeWorktreePathForComparison } from "@t3tools/shared/path";
+
 import type { ThreadShell } from "./types";
 
 function normalizeWorktreePath(path: string | null): string | null {
@@ -5,11 +7,11 @@ function normalizeWorktreePath(path: string | null): string | null {
   if (!trimmed) {
     return null;
   }
-  return trimmed;
+  return normalizeWorktreePathForComparison(trimmed);
 }
 
 export function getOrphanedWorktreePathForThread(
-  threads: ReadonlyArray<Pick<ThreadShell, "id" | "worktreePath">>,
+  threads: ReadonlyArray<Pick<ThreadShell, "id" | "worktreePath" | "externalWorktree">>,
   threadId: ThreadShell["id"],
 ): string | null {
   const targetThread = threads.find((thread) => thread.id === threadId);
@@ -22,14 +24,14 @@ export function getOrphanedWorktreePathForThread(
     return null;
   }
 
-  const isShared = threads.some((thread) => {
-    if (thread.id === threadId) {
-      return false;
-    }
-    return normalizeWorktreePath(thread.worktreePath) === targetWorktreePath;
-  });
+  const linkedThreads = threads.filter(
+    (thread) => normalizeWorktreePath(thread.worktreePath) === targetWorktreePath,
+  );
+  if (linkedThreads.some((thread) => thread.externalWorktree === true)) {
+    return null;
+  }
 
-  return isShared ? null : targetWorktreePath;
+  return linkedThreads.length > 1 ? null : targetThread.worktreePath!.trim();
 }
 
 export function formatWorktreePathForDisplay(worktreePath: string): string {

@@ -48,6 +48,16 @@ export class EventSinkWriteError extends Schema.TaggedError<EventSinkWriteError>
   }
 }
 
+/** A command's expected active provider thread was replaced before it committed. */
+class EventSinkActiveProviderThreadChanged extends Schema.TaggedError<EventSinkActiveProviderThreadChanged>()(
+  "EventSinkActiveProviderThreadChanged",
+  { threadId: ThreadId, expected: ProviderThreadId },
+) {
+  override get message(): string {
+    return `Thread ${this.threadId} no longer runs on provider thread ${this.expected}.`;
+  }
+}
+
 export class EventSinkStreamError extends Schema.TaggedError<EventSinkStreamError>()(
   "EventSinkStreamError",
   {
@@ -137,6 +147,11 @@ export interface EventSinkV2Shape {
    */
   readonly writeIfProviderThreadUnchanged: (input: {
     readonly expected: OrchestrationV2ProviderThread;
+    /**
+     * Also require that its app thread still runs on it: a provider-thread.updated makes its
+     * provider thread the app thread's active one.
+     */
+    readonly whileActive?: boolean;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
   }) => Effect.Effect<
     {
@@ -156,6 +171,11 @@ export interface EventSinkV2Shape {
       readonly effectTypes: ReadonlyArray<EffectOutbox.OrchestrationEffectRequestV2["type"]>;
       readonly reason: string;
     };
+    /**
+     * Fails, committing nothing, unless the thread still runs on this provider thread when the
+     * transaction commits: provider events can change it outside the command queue.
+     */
+    readonly expectActiveProviderThreadId?: ProviderThreadId;
   }) => Effect.Effect<
     {
       readonly receipt: CommandReceiptStore.CommandReceiptV2;
@@ -602,7 +622,16 @@ const layerBase: Layer.Layer<
             WHERE provider_thread_id = ${input.expected.id}
             LIMIT 1
           `;
-          if (rows[0]?.payload_json !== expectedJson) {
+          const active =
+            input.whileActive !== true
+              ? true
+              : (yield* sql<{ readonly active_provider_thread_id: string | null }>`
+                  SELECT active_provider_thread_id
+                  FROM orchestration_v2_projection_threads
+                  WHERE thread_id = ${input.expected.appThreadId}
+                  LIMIT 1
+                `)[0]?.active_provider_thread_id === input.expected.id;
+          if (rows[0]?.payload_json !== expectedJson || !active) {
             return {
               committed: false as const,
               storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
@@ -642,6 +671,20 @@ const layerBase: Layer.Layer<
     ) {
       const result = yield* commitThenPublish(
         Effect.gen(function* () {
+          const expected = input.expectActiveProviderThreadId;
+          if (expected !== undefined) {
+            const rows = yield* sql<{ readonly active_provider_thread_id: string | null }>`
+              SELECT active_provider_thread_id
+              FROM orchestration_v2_projection_threads
+              WHERE thread_id = ${input.threadId}
+              LIMIT 1
+            `;
+            if (rows[0]?.active_provider_thread_id !== expected)
+              return yield* new EventSinkActiveProviderThreadChanged({
+                threadId: input.threadId,
+                expected,
+              });
+          }
           const reserved = yield* commandReceipts.insertIfAbsent({
             commandId: input.commandId,
             threadId: input.threadId,

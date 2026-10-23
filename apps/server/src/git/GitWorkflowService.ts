@@ -2,6 +2,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 
 import {
   GitManagerError,
@@ -29,9 +30,11 @@ import {
   type VcsStatusResult,
 } from "@t3tools/contracts";
 
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as GitManager from "./GitManager.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
+import { isExternalWorktreePath, worktreeLeaseKey } from "../workspace/externalWorktree.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 
 export class GitWorkflowService extends Context.Service<
@@ -174,6 +177,35 @@ export const make = Effect.gen(function* () {
   const git = yield* GitVcsDriver.GitVcsDriver;
   const gitManager = yield* GitManager.GitManager;
   const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const projections = yield* ProjectionStore.ProjectionStoreV2;
+
+  // Every caller, including a client that missed an archived or deleted thread, goes through here.
+  const refuseExternalWorktree = Effect.fn("GitWorkflowService.refuseExternalWorktree")(function* (
+    input: VcsRemoveWorktreeInput,
+  ) {
+    const refusal = (detail: string, cause?: unknown) =>
+      new GitCommandError({
+        operation: "GitWorkflowService.removeWorktree",
+        command: "git worktree remove",
+        cwd: input.cwd,
+        reason: "worktree_owned_elsewhere",
+        detail,
+        ...(cause === undefined ? {} : { cause }),
+      });
+    const external = yield* isExternalWorktreePath(
+      { projections, fs: fileSystem, path },
+      path.resolve(input.cwd, input.path),
+    ).pipe(
+      Effect.mapError((cause) =>
+        refusal("Could not check whether another tool owns this worktree.", cause),
+      ),
+    );
+    if (external)
+      return yield* refusal(
+        "Another tool created this worktree and may keep work in it, so T3 Code does not remove it.",
+      );
+  });
 
   // Nested projects and path aliases must share the checkout's branch-mutation lease.
   const withCheckoutLease = <A, E, R>(rootPath: string, effect: Effect.Effect<A, E, R>) =>
@@ -436,7 +468,17 @@ export const make = Effect.gen(function* () {
       ),
     removeWorktree: (input) =>
       ensureGitCommand("GitWorkflowService.removeWorktree", input.cwd).pipe(
-        Effect.andThen(git.removeWorktree(input)),
+        Effect.andThen(
+          worktreeLeaseKey({ fs: fileSystem, path }, path.resolve(input.cwd, input.path)),
+        ),
+        Effect.flatMap((leaseKey) =>
+          // Adoption binds an external worktree under the same lease, so none lands between the
+          // check and the removal.
+          withWorkspaceLease(
+            leaseKey,
+            refuseExternalWorktree(input).pipe(Effect.andThen(git.removeWorktree(input))),
+          ),
+        ),
       ),
     pruneWorktrees: (input) =>
       ensureGitCommand("GitWorkflowService.pruneWorktrees", input.cwd).pipe(

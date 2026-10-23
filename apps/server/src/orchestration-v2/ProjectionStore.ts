@@ -87,6 +87,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import type * as Statement from "effect/sql/Statement";
 
 import { MCP_APP_OUTPUT_KEY } from "@t3tools/shared/mcpApp";
+import { normalizeWorktreePathForComparison } from "@t3tools/shared/path";
 import { threadHtmlRenderAttachmentIds } from "../attachmentStore.ts";
 import {
   isThreadHistoryUserTurn,
@@ -179,6 +180,15 @@ export type ProjectionThreadPullRequests = Pick<
   OrchestrationV2AppThread,
   "id" | "projectId" | "lineage" | "settledOverride" | "settledAt" | "pullRequests"
 >;
+
+export interface ProjectionProviderThreadBinding {
+  readonly providerThread: OrchestrationV2ProviderThread;
+  readonly threadId: ThreadId;
+  readonly archivedAt: DateTime.Utc | null;
+  readonly deletedAt: DateTime.Utc | null;
+  /** Whether the app thread still runs on this provider thread rather than another one. */
+  readonly active: boolean;
+}
 
 export type ProjectionSettlementCandidate = Pick<
   OrchestrationV2ThreadShell,
@@ -451,6 +461,19 @@ export interface ProjectionStoreV2Shape {
   readonly getThreadsWithPullRequests: (
     threadId?: ThreadId,
   ) => Effect.Effect<ReadonlyArray<ProjectionThreadPullRequests>, ProjectionStoreV2Error>;
+  readonly getProviderThreadBindings: (input: {
+    readonly driver: string;
+    readonly providerInstanceId: ProviderInstanceId;
+  }) => Effect.Effect<ReadonlyArray<ProjectionProviderThreadBinding>, ProjectionStoreV2Error>;
+  /** Worktrees any thread, archived or deleted ones included, marks as another tool's. */
+  readonly getExternalWorktreePaths: () => Effect.Effect<
+    ReadonlyArray<string>,
+    ProjectionStoreV2Error
+  >;
+  /** Whether any thread, archived or deleted ones included, marks this worktree as another tool's. */
+  readonly isExternalWorktree: (
+    worktreePath: string,
+  ) => Effect.Effect<boolean, ProjectionStoreV2Error>;
   readonly getThreadWorktreePaths: (options?: {
     readonly includeArchived?: boolean;
   }) => Effect.Effect<
@@ -1580,6 +1603,7 @@ export function threadShellFromProjection(
     interactionMode: projection.thread.interactionMode,
     branch: projection.thread.branch,
     worktreePath: projection.thread.worktreePath,
+    ...(projection.thread.externalWorktree ? { externalWorktree: true } : {}),
     pullRequests: threadPullRequestsOf(projection.thread),
     ...(projection.thread.linkedPullRequest === undefined
       ? {}
@@ -1839,6 +1863,7 @@ function shellFromState(input: {
     interactionMode: input.state.thread.interactionMode,
     branch: input.state.thread.branch,
     worktreePath: input.state.thread.worktreePath,
+    ...(input.state.thread.externalWorktree ? { externalWorktree: true } : {}),
     pullRequests: threadPullRequestsOf(input.state.thread),
     ...(input.state.thread.linkedPullRequest === undefined
       ? {}
@@ -6108,6 +6133,67 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
       );
 
+    const getProviderThreadBindings: ProjectionStoreV2Shape["getProviderThreadBindings"] = (
+      input,
+    ) =>
+      sql<{
+        readonly payload_json: string;
+        readonly thread_id: string;
+        readonly archived_at: string | null;
+        readonly deleted_at: string | null;
+        readonly active_provider_thread_id: string | null;
+      }>`
+        SELECT
+          provider_threads.payload_json AS payload_json,
+          threads.thread_id AS thread_id,
+          json_extract(threads.payload_json, '$.archivedAt') AS archived_at,
+          threads.deleted_at AS deleted_at,
+          json_extract(threads.payload_json, '$.activeProviderThreadId') AS active_provider_thread_id
+        FROM orchestration_v2_projection_provider_threads AS provider_threads
+        JOIN orchestration_v2_projection_threads AS threads
+          ON threads.thread_id = provider_threads.thread_id
+        WHERE provider_threads.driver = ${input.driver}
+          AND provider_threads.provider_instance_id = ${input.providerInstanceId}
+      `.pipe(
+        Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+        Effect.flatMap((rows) =>
+          Effect.forEach(rows, (row) =>
+            decodeProviderThreadPayload(row.payload_json).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProjectionStoreReadError({ threadId: ThreadId.make(row.thread_id), cause }),
+              ),
+              Effect.map((providerThread): ProjectionProviderThreadBinding => ({
+                providerThread,
+                threadId: ThreadId.make(row.thread_id),
+                archivedAt: row.archived_at === null ? null : DateTime.makeUnsafe(row.archived_at),
+                deletedAt: row.deleted_at === null ? null : DateTime.makeUnsafe(row.deleted_at),
+                active: row.active_provider_thread_id === providerThread.id,
+              })),
+            ),
+          ),
+        ),
+      );
+
+    const getExternalWorktreePaths: ProjectionStoreV2Shape["getExternalWorktreePaths"] = () =>
+      sql<{ readonly worktree_path: string }>`
+        SELECT DISTINCT json_extract(payload_json, '$.worktreePath') AS worktree_path
+        FROM orchestration_v2_projection_threads
+        WHERE json_extract(payload_json, '$.externalWorktree') = 1
+          AND json_extract(payload_json, '$.worktreePath') IS NOT NULL
+      `.pipe(
+        Effect.map((rows) => rows.map((row) => row.worktree_path)),
+        Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+      );
+
+    const isExternalWorktree: ProjectionStoreV2Shape["isExternalWorktree"] = (worktreePath) =>
+      getExternalWorktreePaths().pipe(
+        Effect.map((paths) => {
+          const target = normalizeWorktreePathForComparison(worktreePath);
+          return paths.some((path) => normalizeWorktreePathForComparison(path) === target);
+        }),
+      );
+
     const getThreadWorktreePaths: ProjectionStoreV2Shape["getThreadWorktreePaths"] = (options) =>
       sql<{ readonly thread_id: string; readonly worktree_path: string }>`
         SELECT thread_id, json_extract(payload_json, '$.worktreePath') AS worktree_path
@@ -6490,6 +6576,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getThread,
       getSettlementCandidates,
       getThreadsWithPullRequests,
+      getProviderThreadBindings,
+      getExternalWorktreePaths,
+      isExternalWorktree,
       getThreadWorktreePaths,
       getThreadProjection,
       getTurnStartContext,
@@ -6641,6 +6730,49 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
             );
         },
       ),
+      getProviderThreadBindings: (input) =>
+        Ref.get(replayState).pipe(
+          Effect.map((state) =>
+            [...state.projections.values()].flatMap(({ thread, providerThreads }) =>
+              providerThreads
+                .filter(
+                  (providerThread) =>
+                    providerThread.appThreadId === thread.id &&
+                    providerThread.driver === input.driver &&
+                    providerThread.providerInstanceId === input.providerInstanceId,
+                )
+                .map((providerThread): ProjectionProviderThreadBinding => ({
+                  providerThread,
+                  threadId: thread.id,
+                  archivedAt: thread.archivedAt,
+                  deletedAt: thread.deletedAt,
+                  active: thread.activeProviderThreadId === providerThread.id,
+                })),
+            ),
+          ),
+        ),
+      getExternalWorktreePaths: () =>
+        Ref.get(replayState).pipe(
+          Effect.map((state) =>
+            [...state.projections.values()].flatMap(({ thread }) =>
+              thread.externalWorktree === true && thread.worktreePath !== null
+                ? [thread.worktreePath]
+                : [],
+            ),
+          ),
+        ),
+      isExternalWorktree: (worktreePath) =>
+        Ref.get(replayState).pipe(
+          Effect.map((state) =>
+            [...state.projections.values()].some(
+              ({ thread }) =>
+                thread.externalWorktree === true &&
+                thread.worktreePath !== null &&
+                normalizeWorktreePathForComparison(thread.worktreePath) ===
+                  normalizeWorktreePathForComparison(worktreePath),
+            ),
+          ),
+        ),
       getThreadWorktreePaths: (options) =>
         Ref.get(replayState).pipe(
           Effect.map((state) =>

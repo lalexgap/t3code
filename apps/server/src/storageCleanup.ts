@@ -47,6 +47,7 @@ import * as TerminalManager from "./terminal/Manager.ts";
 import { isFilesystemRoot, managedWorktreesDirectories } from "./worktreesDirectory.ts";
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
 import { removeLinkedWorktree } from "./vcs/worktreeRemoval.ts";
+import { isExternalWorktreePath, worktreeLeaseKey } from "./workspace/externalWorktree.ts";
 import { withWorkspaceLease } from "./workspace/workspaceLease.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -778,6 +779,9 @@ const make = Effect.gen(function* () {
       const keep = (reason: string) => entries.push({ ...entry, reason: sentence(reason) });
       yield* Effect.gen(function* () {
         if (!(yield* fs.exists(worktreePath))) return;
+        // Read under the lease adoption also takes, so no external thread lands before removal.
+        if (yield* isExternalWorktreePath({ projections, fs, path }, worktreePath))
+          return keep("worktree belongs to another tool");
         if (deleted && !settings.worktreeOnDelete) return keep("no rules apply");
         if (group.length > 1 && worktreeOwner(group) === undefined)
           return keep(`shared by ${group.length} threads`);
@@ -1035,7 +1039,16 @@ const make = Effect.gen(function* () {
         // from that branch when the thread is resumed.
         yield* Effect.logInfo("storage cleanup removed worktree", { threadId: thread.id });
       }).pipe(
-        (effect) => withWorkspaceLease(worktreePath, effect),
+        // Turns and terminals lease the spelling; adoption and removal lease the physical path.
+        (effect) =>
+          worktreeLeaseKey({ fs, path }, worktreePath).pipe(
+            Effect.flatMap((physical) =>
+              withWorkspaceLease(
+                worktreePath,
+                physical === worktreePath ? effect : withWorkspaceLease(physical, effect),
+              ),
+            ),
+          ),
         Effect.catch((error) =>
           Effect.gen(function* () {
             entries.push({
