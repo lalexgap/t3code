@@ -218,6 +218,8 @@ interface ActiveTurn {
   from: number | undefined;
   /** An observing run skips a backlog this far back rather than replaying all of it. */
   readonly floor: number;
+  /** Continues a run T3's restart cut off: an agent gone by the first read fails it. */
+  restartCheck: boolean;
   /** The prompt first, then any steering; the run ends when every one of them has. */
   readonly messages: Array<TrackedMessage>;
   /** Lowest transcript index that can still change; unset until am delivers the prompt. */
@@ -519,16 +521,34 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
             `${skipped} transcript ${skipped === 1 ? "entry" : "entries"} from before this run ${skipped === 1 ? "is" : "are"} not shown. Read them with \`am transcript ${agentRef}\`.`,
           );
         }
+        // A transcript that grew a lot between reads shows only its newest entries, so one read
+        // stays within what a live client can take.
+        const reading = Math.max(start, turn.cursor ?? start);
+        const shown = Math.max(reading, total - AM_MIRROR_ENTRY_LIMIT);
+        if (shown > reading) {
+          const skipped = shown - reading;
+          for (const [index, { entry, settled: wasSettled }] of turn.published)
+            if (index < shown && !wasSettled && isEntryOpen(entry)) {
+              turn.published.set(index, { entry, settled: true });
+              yield* publishEntry(turn, entry, true);
+            }
+          yield* emitNotice(
+            turn,
+            `gap:${turn.input.runId}:${shown}`,
+            "Activity not shown",
+            `${skipped} transcript ${skipped === 1 ? "entry" : "entries"} ${skipped === 1 ? "is" : "are"} not shown. Read them with \`am transcript ${agentRef}\`.`,
+          );
+        }
         for (const entry of entries) {
-          if (entry.index < start) continue;
+          if (entry.index < shown) continue;
           const previous = turn.published.get(entry.index);
           if (previous?.settled === settled && sameEntry(previous.entry, entry)) continue;
           turn.published.set(entry.index, { entry, settled });
           yield* publishEntry(turn, entry, settled);
         }
-        const open = entries.filter((entry) => entry.index >= start && isEntryOpen(entry));
+        const open = entries.filter((entry) => entry.index >= shown && isEntryOpen(entry));
         turn.cursor = Math.max(
-          start,
+          shown,
           open.length > 0 ? Math.min(...open.map((entry) => entry.index)) : total,
         );
       });
@@ -788,6 +808,15 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           ),
         );
         if (active !== turn) return;
+        if (turn.restartCheck) {
+          turn.restartCheck = false;
+          if (read._tag === "None" || amTurnPhase(read.value.status) === "gone")
+            return yield* finish(
+              turn,
+              "failed",
+              `The Agent Motel agent ${ref} stopped while T3 Code was restarting. Send a message to resume it.`,
+            );
+        }
         if (read._tag === "None")
           return yield* turn.observe
             ? finish(turn, "completed")
@@ -986,13 +1015,20 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         const head = amMirroredThrough(turnInput.providerThread.nativeConversationHeadRef, ref);
         // am's agents run on without T3, so a run T3 continues after its own restart follows the
         // agent rather than prompting it, which could also resume an agent stopped since.
-        if (
-          isObserveMessage(turnInput.message) ||
-          turnInput.restartContinuationOfRunId !== undefined
-        ) {
-          const { total } = yield* fromApi(api.transcript(ref, TRANSCRIPT_END));
+        const restarted = turnInput.restartContinuationOfRunId !== undefined;
+        if (isObserveMessage(turnInput.message) || restarted) {
+          const { total } = yield* fromApi(
+            api.transcript(ref, TRANSCRIPT_END).pipe(
+              // The first read in the run reports an agent am no longer has.
+              Effect.catchIf(
+                (error) => restarted && error.status === 404,
+                () => Effect.succeed({ total: 0 }),
+              ),
+            ),
+          );
           return yield* begin(turnInput, {
             observe: true,
+            restartCheck: restarted,
             nativeTurnId: `${ref}:observe:${turnInput.runId}`,
             // A transcript shorter than the head is a new session's, so it is all new.
             from: head === undefined ? total : head > total ? 0 : head,
@@ -1054,6 +1090,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
         init: Pick<ActiveTurn, "observe" | "from" | "floor" | "messages"> & {
           readonly nativeTurnId: string;
+          readonly restartCheck?: boolean;
         },
       ) {
         const startedAt = yield* DateTime.now;
@@ -1077,6 +1114,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           observe: init.observe,
           from: init.from,
           floor: init.floor,
+          restartCheck: init.restartCheck ?? false,
           messages: init.messages,
           cursor: undefined,
           published: new Map(),

@@ -32,7 +32,7 @@ import { makeAmAdapterV2 } from "./adapter.ts";
 import { makeAmApi } from "./api.ts";
 import { FAKE_TOKEN, makeFakeAm, type FakeAgent, type FakeEntry } from "./fakeAm.testkit.ts";
 import { amAgentName } from "./mapping.ts";
-import { amConversationHead } from "./mirrorPlan.ts";
+import { AM_MIRROR_ENTRY_LIMIT, amConversationHead } from "./mirrorPlan.ts";
 
 const testLayer = Layer.mergeAll(
   NodeServices.layer,
@@ -184,6 +184,28 @@ const turnInput = Effect.fnUntraced(function* (
     modelSelection,
     runtimePolicy,
   };
+});
+
+/** A thread the fleet mirror imported, mirrored through `head`. */
+const importedThread = Effect.fnUntraced(function* (head: number) {
+  const now = yield* DateTime.now;
+  return {
+    id: ProviderThreadId.make("provider-thread-imported"),
+    driver: ProviderDriverKind.make("am"),
+    providerInstanceId: INSTANCE_ID,
+    providerSessionId: null,
+    appThreadId: THREAD_ID,
+    ownerNodeId: null,
+    nativeThreadRef: { driver: ProviderDriverKind.make("am"), nativeId: AGENT, strength: "strong" },
+    nativeConversationHeadRef: amConversationHead(AGENT, head),
+    status: "active",
+    firstRunOrdinal: 1,
+    lastRunOrdinal: 1,
+    handoffIds: [],
+    forkedFrom: null,
+    createdAt: now,
+    updatedAt: now,
+  } satisfies OrchestrationV2ProviderThread;
 });
 
 const user = (text: string): FakeEntry => ({ kind: "user", text });
@@ -1191,6 +1213,58 @@ describe("AmAdapterV2", () => {
       // am's agent kept working through the restart, so nothing is sent to it or started.
       assert.isFalse(fake.log.some((call) => call.method === "POST"));
       assert.deepStrictEqual(harness.replies(), ["Fixed."]);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("fails a run T3 continues after a restart when the agent stopped meanwhile", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, {
+        ...idleAgent([user("Fix it"), assistant("On it.")]),
+        status: "exited",
+      });
+      const harness = yield* makeHarness(fake, yield* importedThread(2));
+      const continued = yield* turnInput(harness.providerThread, "Continue where you left off.", 2);
+      yield* harness.runtime.startTurn({
+        ...continued,
+        restartContinuationOfRunId: RunId.make("run-1"),
+        message: { ...continued.message, createdBy: "agent", creationSource: "server" },
+      });
+      const end = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(end.status, "failed");
+      assert.include(end.failure?.message ?? "", "stopped while T3 Code was restarting");
+      assert.isFalse(fake.log.some((call) => call.method === "POST"));
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("shows only the newest entries when the transcript outgrows one read", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, {
+        ...idleAgent([user("Fix it"), assistant("On it.")]),
+        status: "working",
+      });
+      const harness = yield* makeHarness(fake, yield* importedThread(2));
+      const observed = yield* turnInput(harness.providerThread, "Activity outside T3 Code");
+      yield* harness.runtime.startTurn({
+        ...observed,
+        message: { ...observed.message, createdBy: "agent", creationSource: "provider" },
+      });
+      yield* fake.update(AGENT, (agent) => {
+        for (let index = 0; index < 400; index++) agent.entries.push(assistant(`reply ${index}`));
+        agent.status = "idle";
+      });
+      const end = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(end.status, "completed");
+      const replies = harness.replies();
+      assert.strictEqual(new Set(replies).size, AM_MIRROR_ENTRY_LIMIT);
+      assert.strictEqual(replies[0], "reply 200");
+      assert.strictEqual(replies.at(-1), "reply 399");
+      assert.isTrue(
+        harness
+          .notices()
+          .some((notice) => notice.startsWith("200 transcript entries are not shown")),
+      );
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
