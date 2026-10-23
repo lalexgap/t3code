@@ -1,4 +1,5 @@
 import { assert, it } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   CommandId,
   EventId,
@@ -15,6 +16,7 @@ import * as ProviderThreadMirror from "@t3tools/provider-core/server/ProviderThr
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Result from "effect/Result";
 
@@ -122,6 +124,7 @@ const testLayer = Layer.mergeAll(ProviderThreadMirror.layer, stores, sink, IdAll
       ),
     ),
   ),
+  Layer.provideMerge(NodeServices.layer),
 );
 
 const adoption = (
@@ -462,4 +465,23 @@ it.effect("commits a command expecting an active provider thread only while it i
     const accepted = yield* commit("current", am.id);
     assert.isTrue(accepted.committed);
   }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("binds a worktree adopted through a symlinked path by its physical path", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const mirror = yield* ProviderThreadMirror.ProviderThreadMirror;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const root = yield* fs.realPath(yield* fs.makeTempDirectoryScoped({ prefix: "mirror-wt-" }));
+    yield* fs.makeDirectory(`${root}/real/wt`, { recursive: true });
+    yield* fs.symlink(`${root}/real`, `${root}/alias`);
+    existingRoots.add(`${root}/alias/wt`);
+    const adopted = yield* mirror.adopt(
+      adoption("aliased", { worktree: { path: `${root}/alias/wt`, branch: "am/aliased" } }),
+    );
+    const threadId = adopted._tag === "Adopted" ? adopted.threadId : ThreadId.make("none");
+    const thread = yield* projections.getThread(threadId);
+    assert.strictEqual(thread.worktreePath, `${root}/real/wt`);
+    assert.isTrue(thread.externalWorktree);
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
 );

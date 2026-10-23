@@ -6,6 +6,18 @@ import { normalizeWorktreePathForComparison } from "@t3tools/shared/path";
 import type * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 
 /**
+ * The key a worktree's removal and an adoption that binds it share a workspace lease under: its
+ * physical path, or its resolved spelling once it no longer exists.
+ */
+export const worktreeLeaseKey = Effect.fnUntraced(function* (
+  services: { readonly fs: FileSystem.FileSystem; readonly path: Path.Path },
+  target: string,
+) {
+  const resolved = services.path.resolve(target);
+  return yield* services.fs.realPath(resolved).pipe(Effect.orElseSucceed(() => resolved));
+});
+
+/**
  * Whether a thread marks `target` as another tool's worktree, under any spelling or symlinked
  * alias. A path that no longer resolves is compared by spelling alone.
  */

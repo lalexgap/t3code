@@ -14,6 +14,8 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
@@ -25,6 +27,7 @@ import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ThreadLifecycleService from "./ThreadLifecycleService.ts";
+import { worktreeLeaseKey } from "../workspace/externalWorktree.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 
 const EVENT_PREFIX = "provider-thread-mirror";
@@ -143,6 +146,8 @@ export const layer = Layer.effectDiscard(
     const lifecycle = yield* ThreadLifecycleService.ThreadLifecycleService;
     const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
 
     const list: ProviderThreadMirror.ProviderThreadMirrorHandler["list"] = Effect.fn(
       "ProviderThreadMirror.list",
@@ -204,7 +209,11 @@ export const layer = Layer.effectDiscard(
         const worktreePath =
           input.worktree === null
             ? Option.none<string>()
-            : yield* workspacePaths.normalizeWorkspaceRoot(input.worktree.path).pipe(Effect.option);
+            : yield* workspacePaths.normalizeWorkspaceRoot(input.worktree.path).pipe(
+                // Bound by its physical path, the one removal compares and leases.
+                Effect.flatMap((normalized) => worktreeLeaseKey({ fs, path }, normalized)),
+                Effect.option,
+              );
         const projectId = yield* resolveProject(workspaceRoot.value);
         const now = yield* DateTime.now;
         const modelSelection = { instanceId: input.providerInstanceId, model: input.model };
