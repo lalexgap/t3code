@@ -223,6 +223,7 @@ export const layer = Layer.effectDiscard(
           interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
           branch: Option.isSome(worktreePath) ? (input.worktree?.branch ?? null) : null,
           worktreePath: Option.getOrNull(worktreePath),
+          ...(Option.isSome(worktreePath) ? { externalWorktree: true } : {}),
           linkedPullRequest: null,
           branchPullRequest: null,
           activeProviderThreadId: providerThreadId,

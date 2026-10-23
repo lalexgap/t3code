@@ -65,4 +65,13 @@ describe("getOrphanedWorktreePathForThread", () => {
     const result = getOrphanedWorktreePathForThread(threads, ThreadId.make("thread-1"));
     expect(result).toBe("/tmp/repo/worktrees/feature-a");
   });
+
+  it("never offers a worktree another tool created", () => {
+    const external = makeThread({
+      id: ThreadId.make("thread-1"),
+      worktreePath: "/tmp/repo/worktrees/agent",
+      externalWorktree: true,
+    });
+    expect(getOrphanedWorktreePathForThread([external], external.id)).toBeNull();
+  });
 });

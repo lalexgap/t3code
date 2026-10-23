@@ -1231,3 +1231,62 @@ it.effect("explicit settle clears snooze atomically and stays idempotent after r
     assert.deepInclude((yield* projections.getThreadProjection(threadId)).thread, active);
   }).pipe(Effect.provide(layerTest)),
 );
+
+it.effect("marks threads that move onto another tool's worktree", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const worktreePath = "/work/agent-wt";
+    const create = (id: string, path: string | null) =>
+      orchestrator
+        .dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`create:${id}`),
+          threadId: ThreadId.make(id),
+          projectId: ProjectId.make("project:external-worktree"),
+          title: id,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: path,
+          createdBy: "user",
+          creationSource: "web",
+        })
+        .pipe(Effect.andThen(projections.getThread(ThreadId.make(id))));
+    const t3 = yield* create("thread:t3-on-path", worktreePath);
+    assert.isUndefined(t3.externalWorktree);
+
+    const mirroredId = ThreadId.make("thread:mirrored");
+    yield* eventSink.write({
+      events: [
+        {
+          id: EventId.make("mirrored:created"),
+          type: "thread.created",
+          threadId: mirroredId,
+          providerInstanceId: instanceId,
+          occurredAt: t3.createdAt,
+          payload: {
+            ...t3,
+            id: mirroredId,
+            externalWorktree: true,
+            lineage: { ...t3.lineage, rootThreadId: mirroredId },
+          },
+        },
+      ],
+    });
+
+    assert.isTrue((yield* create("thread:opened-on-agent-wt", worktreePath)).externalWorktree);
+    assert.isUndefined((yield* create("thread:elsewhere", "/work/other-wt")).externalWorktree);
+    const moved = yield* create("thread:moved", null);
+    yield* orchestrator.dispatch({
+      type: "thread.metadata.update",
+      commandId: CommandId.make("move-onto-agent-wt"),
+      threadId: moved.id,
+      worktreePath,
+    });
+    assert.isTrue((yield* projections.getThread(moved.id)).externalWorktree);
+    assert.isTrue((yield* projections.getThreadShell(moved.id))?.externalWorktree);
+  }).pipe(Effect.provide(layerTest)),
+);

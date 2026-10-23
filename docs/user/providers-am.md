@@ -82,8 +82,9 @@ shows how many agents it mirrors.
   agent that ages out of the window keeps its thread.
 - **Your archive wins.** A thread you archive stays archived while its agent keeps running. It is
   unarchived only when the agent stops or disappears and later runs again.
-- **Deleting a thread** keeps the agent in am, and T3 Code never mirrors that agent again. If T3
-  Code offers to remove the thread's worktree, decline for an agent that still uses it.
+- **Deleting a thread** keeps the agent in am, and T3 Code never mirrors that agent again. T3 Code
+  never removes a worktree am created, even one you opened other threads in, and storage cleanup
+  leaves it alone.
 
 ## Permissions and limitations
 

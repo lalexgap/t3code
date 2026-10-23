@@ -199,6 +199,8 @@ it.effect("adopts a native thread once, with its history, project and worktree",
     assert.strictEqual(records.thread.projectId, PROJECT_ID);
     assert.strictEqual(records.thread.worktreePath, "/work/app-wt");
     assert.strictEqual(records.thread.branch, "am/worker");
+    assert.isTrue(records.thread.externalWorktree);
+    assert.isTrue((yield* projections.getThreadShell(threadId))?.externalWorktree);
     assert.deepStrictEqual(
       records.messages.map((message) => [message.role, message.text]),
       [
@@ -231,6 +233,7 @@ it.effect("adopts a native thread once, with its history, project and worktree",
     );
     assert.isNull(plainThread.worktreePath);
     assert.isNull(plainThread.branch);
+    assert.isUndefined(plainThread.externalWorktree);
 
     const listed = yield* mirror.list({ driver: AM, providerInstanceId: INSTANCE_ID });
     assert.deepStrictEqual(

@@ -433,7 +433,13 @@ export function useThreadActions() {
         : undefined;
     const survivingThreads =
       deletedIds && deletedIds.size > 0
-        ? threads.filter((entry) => entry.id === threadRef.threadId || !deletedIds.has(entry.id))
+        ? threads.filter(
+            // A thread on another tool's worktree still guards it while it is deleted alongside.
+            (entry) =>
+              entry.id === threadRef.threadId ||
+              !deletedIds.has(entry.id) ||
+              entry.externalWorktree === true,
+          )
         : threads;
     const orphanedWorktreePath = getOrphanedWorktreePathForThread(
       survivingThreads,
