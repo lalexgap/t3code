@@ -231,25 +231,26 @@ const isUnder = (path: string, dir: string) => dir !== "/" && path.startsWith(`$
 
 /**
  * A project root T3 may create or bind, as T3 should spell it, or why not: never the filesystem
- * root, the home directory, or anything outside it. A local root is checked where its symlinks
- * lead, since a link under home can point anywhere.
+ * root, the home directory, or anything outside it. A local root is checked both as bound and
+ * where its symlinks lead, since a link can point anywhere.
  */
 const amSafeRoot = (
   root: string,
   context: AmWorkspaceContext,
 ): { readonly root: string } | { readonly reason: AmUnsafeRootReason } => {
+  const homes = [context.home, context.realHome ?? context.home].map(normalizePath);
+  const unsafe = (path: string): AmUnsafeRootReason | null => {
+    if (path === "/") return "filesystem-root";
+    if (homes.includes(path)) return "home";
+    return homes.some((home) => isUnder(path, home)) ? null : "outside-home";
+  };
   const local = amLocalPath(root, context.home);
   const real = context.remote ? undefined : context.realPaths?.get(local);
-  const path = real ?? normalizePath(local);
-  const homes = [context.home, context.realHome ?? context.home].map(normalizePath);
-  if (path === "/") return { reason: "filesystem-root" };
-  if (homes.includes(path)) return { reason: "home" };
-  if (!homes.some((home) => isUnder(path, home))) return { reason: "outside-home" };
-  if (context.remote) return { root };
   // A `..` after a symlink climbs from where the link points, which only the real path knows.
-  return {
-    root: real !== undefined && local.split("/").includes("..") ? real : normalizePath(local),
-  };
+  const bound = real !== undefined && local.split("/").includes("..") ? real : normalizePath(local);
+  const reason = (real === undefined ? null : unsafe(real)) ?? unsafe(bound);
+  if (reason) return { reason };
+  return { root: context.remote ? root : bound };
 };
 
 /**

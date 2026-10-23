@@ -376,6 +376,16 @@ describe("makeAmFleetMirror", () => {
         "Mirroring 0 agents. 1 agent works in a project with no copy on this machine. Skipped 1 agent with a project outside your home directory.",
       );
 
+      // One listing that leaves an agent out proves nothing, so it still counts.
+      const outside = fake.agents.get("outside")!;
+      fake.agents.delete("outside");
+      yield* fleetMirror.wake;
+      assert.strictEqual(
+        yield* Queue.take(statuses),
+        "Mirroring 0 agents. 1 agent works in a project with no copy on this machine. Skipped 1 agent with a project outside your home directory.",
+      );
+      fake.agents.set("outside", outside);
+
       yield* TestClock.adjust("30 days");
       yield* fleetMirror.wake;
       assert.strictEqual(yield* Queue.take(statuses), "Mirroring 0 agents.");

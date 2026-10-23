@@ -367,6 +367,11 @@ describe("amWorkspace", () => {
       _tag: "Unsafe",
       reason: "outside-home",
     });
+    // A link outside home is bound by its spelling, so it is refused wherever it leads.
+    assert.deepStrictEqual(resolved("/tmp/link", "/home/me/code/app"), {
+      _tag: "Unsafe",
+      reason: "outside-home",
+    });
     // A `..` after a symlink is where the link leads, not where its spelling suggests.
     assert.deepStrictEqual(resolved("/home/me/link/../app", "/home/me/code/app"), {
       _tag: "Workspace",
