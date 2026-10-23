@@ -71,6 +71,7 @@ import {
   amAgentSelection,
   amModelChange,
   amProviderMismatch,
+  amSelectionChosen,
   amSelectionEffort,
   amSelectionTransition,
   parseAmModelSlug,
@@ -85,6 +86,11 @@ const EVENT_RECONNECT_MS = 2_000;
 // mailbox is busy or the message's turn has not started yet; both are worth retrying.
 const CANCEL_RETRY_MS = 250;
 const CANCEL_ATTEMPTS = 40;
+// am refuses a restart until a turn T3 just saw finish has left its queue and mailbox.
+const RESTART_RETRY_MS = 250;
+const RESTART_ATTEMPTS = 20;
+// am can refuse to restart a stopped agent whose last turn never finished; resumed, it is idle.
+const RESUME_IDLE_MS = 30_000;
 // Claude flushes its session file in batches, so a turn's closing reply can reach the transcript
 // after the Stop hook has marked the receipt done. A finished turn waits this long for it.
 // Each read of a fleet host's agent is an ssh round trip, so a remote turn re-reads less often.
@@ -1421,7 +1427,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           return yield* protocolError(
             `Agent Motel${host ? ` on ${host}` : ""} cannot move an agent to another model. Update am${host ? " there" : ""}, or pick the model the agent runs.`,
           );
-        const result = yield* api
+        const restart = api
           .restart(ref, change)
           .pipe(
             Effect.mapError((error) =>
@@ -1433,6 +1439,31 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
               ),
             ),
           );
+        let result = yield* restart;
+        if (
+          !result.restarted &&
+          result.reason === "in_turn" &&
+          amTurnPhase(detail.status) === "gone"
+        ) {
+          yield* fromApi(api.resume(ref));
+          const deadline = (yield* Clock.currentTimeMillis) + RESUME_IDLE_MS;
+          while ((yield* Clock.currentTimeMillis) < deadline) {
+            const current = Option.getOrUndefined(yield* fromApi(api.getAgent(ref)));
+            if (!current || amTurnPhase(current.status) === "idle") break;
+            yield* Effect.sleep(host ? REMOTE_SETTLE_POLL_MS : SETTLE_POLL_MS);
+          }
+          result = yield* restart;
+        } else
+          for (
+            let attempt = 1;
+            !result.restarted &&
+            (result.reason === "in_turn" || result.reason === "queued") &&
+            attempt < RESTART_ATTEMPTS;
+            attempt++
+          ) {
+            yield* Effect.sleep(RESTART_RETRY_MS);
+            result = yield* restart;
+          }
         if (!result.restarted)
           return yield* protocolError(
             result.reason === "remote_too_old"
@@ -1504,7 +1535,14 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         if (detail) {
           const mismatch = amProviderMismatch(ref, detail, selection);
           if (mismatch) return yield* protocolError(mismatch);
-          const change = amModelChange(detail, selection);
+          // Only a model picked in T3 moves the agent; otherwise the thread takes on what it runs.
+          const change = amSelectionChosen(
+            selection,
+            turnInput.providerThread.nativeMetadata?.modelSelection,
+            detail,
+          )
+            ? amModelChange(detail, selection)
+            : undefined;
           if (change) running = { ...detail, ...(yield* restartOnModel(ref, detail, change)) };
           else if (amTurnPhase(detail.status) === "gone") yield* fromApi(api.resume(ref));
         }

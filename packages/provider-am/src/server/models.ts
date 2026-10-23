@@ -221,6 +221,25 @@ export const amModelChange = (
   };
 };
 
+/**
+ * Whether a turn's selection is a model the user picked in T3. One equal to what T3 last recorded
+ * the agent running, or with no record to compare, is the agent's own, even if am moved it since.
+ */
+export const amSelectionChosen = (
+  selection: ModelSelection,
+  recorded: ModelSelection | null | undefined,
+  detail: Pick<AmAgentDetail, "model">,
+): boolean => {
+  if (!recorded) return false;
+  const { provider, model } = parseAmModelSlug(recorded.model);
+  // Threads mirrored before T3 recorded models name only the provider, whatever the agent runs.
+  if (provider === undefined || (model === null && detail.model)) return false;
+  return (
+    selection.model !== recorded.model ||
+    (amSelectionEffort(selection) ?? null) !== (amSelectionEffort(recorded) ?? null)
+  );
+};
+
 export const amProviderMismatch = (
   ref: string,
   detail: Pick<AmAgentDetail, "provider">,
