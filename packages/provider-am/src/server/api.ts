@@ -44,6 +44,9 @@ export const AmAgentDetail = Schema.Struct({
   messageReceipts: Schema.optional(Schema.Boolean),
   /** Set by an am that can stop an agent only while it is idle; a fleet host's reflects that host's am. */
   stopIfIdle: Schema.optional(Schema.Boolean),
+  /** Set by an am that relays its agents' permission prompts; a fleet host's reflects that host's am. */
+  permissionRequests: Schema.optional(Schema.Boolean),
+  pendingPermissions: Schema.optional(Schema.Number),
 });
 export type AmAgentDetail = typeof AmAgentDetail.Type;
 
@@ -112,6 +115,50 @@ const isConflictReason = Schema.is(AmConflictReason);
 export const AmStopRefusalReason = Schema.Literals(["busy", "queued", "in_turn", "remote_too_old"]);
 export type AmStopRefusalReason = typeof AmStopRefusalReason.Type;
 const isStopRefusalReason = Schema.is(AmStopRefusalReason);
+
+/** A choice the agent's own provider offers; its id goes back to am unchanged. */
+export const AmPermissionOption = Schema.Struct({
+  id: Schema.String,
+  label: Schema.String,
+  // A kind added after this was written is shown nowhere rather than failing the listing.
+  kind: Schema.String,
+});
+export type AmPermissionOption = typeof AmPermissionOption.Type;
+
+/** A permission prompt the agent's provider is holding open until someone answers it. */
+export const AmPermissionRequest = Schema.Struct({
+  id: Schema.String,
+  provider: Schema.String,
+  tool: Schema.String,
+  summary: Schema.String,
+  input: Schema.optional(Schema.Unknown),
+  options: Schema.Array(AmPermissionOption),
+  createdAt: Schema.String,
+  /** Null while the provider waits with no deadline (Codex). */
+  expiresAt: Schema.NullOr(Schema.String),
+});
+export type AmPermissionRequest = typeof AmPermissionRequest.Type;
+
+const AmPermissions = Schema.Struct({ requests: Schema.Array(AmPermissionRequest) });
+
+/** Why am refused an answer (HTTP 409). */
+export const AmPermissionConflictReason = Schema.Literals([
+  "expired",
+  "already_resolved",
+  "not_pending",
+  "remote_too_old",
+]);
+export type AmPermissionConflictReason = typeof AmPermissionConflictReason.Type;
+const isPermissionConflictReason = Schema.is(AmPermissionConflictReason);
+
+export type AmPermissionAnswer =
+  | { readonly answered: true }
+  | {
+      readonly answered: false;
+      /** Undefined when am gave a reason T3 does not know. */
+      readonly reason: AmPermissionConflictReason | undefined;
+      readonly error: string;
+    };
 
 export const AmHosts = Schema.Struct({
   local: Schema.String,
@@ -209,6 +256,15 @@ export interface AmApi {
    */
   readonly stopIfIdle: (ref: string) => Effect.Effect<AmStopResult, AmApiError>;
   readonly transcript: (name: string, after: number) => Effect.Effect<AmTranscript, AmApiError>;
+  readonly permissions: (
+    ref: string,
+  ) => Effect.Effect<ReadonlyArray<AmPermissionRequest>, AmApiError>;
+  /** Succeeds only once the provider took the decision; a 409 reports why it did not. */
+  readonly answerPermission: (
+    ref: string,
+    id: string,
+    optionId: string,
+  ) => Effect.Effect<AmPermissionAnswer, AmApiError>;
   /** Every fleet event, as a bare wake signal; reconnecting is the caller's concern. */
   readonly events: Stream.Stream<Sse.Event, AmApiError>;
 }
@@ -394,6 +450,30 @@ export const makeAmApi = (
           HttpClientRequest.setUrlParam("after", String(after)),
         ),
       ).pipe(Effect.flatMap((response) => decode("transcript read", AmTranscript, response))),
+    permissions: (ref) =>
+      send("permission list", HttpClientRequest.get(agentPath(ref, "/permissions"))).pipe(
+        Effect.flatMap((response) => decode("permission list", AmPermissions, response)),
+        Effect.map((listed) => listed.requests),
+      ),
+    answerPermission: (ref, id, optionId) =>
+      send(
+        "permission answer",
+        HttpClientRequest.post(agentPath(ref, `/permissions/${encodeURIComponent(id)}`)).pipe(
+          HttpClientRequest.bodyJsonUnsafe({ optionId }),
+        ),
+      ).pipe(
+        Effect.flatMap((response): Effect.Effect<AmPermissionAnswer, AmApiError> =>
+          response.status === 409
+            ? decodeBody("permission answer", ConflictBody, response).pipe(
+                Effect.map(({ error, reason }) => ({
+                  answered: false as const,
+                  error,
+                  reason: isPermissionConflictReason(reason) ? reason : undefined,
+                })),
+              )
+            : expectOk("permission answer")(response).pipe(Effect.as({ answered: true as const })),
+        ),
+      ),
     events: send(
       "event stream",
       HttpClientRequest.get("/events").pipe(HttpClientRequest.accept("text/event-stream")),

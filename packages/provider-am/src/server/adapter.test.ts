@@ -14,6 +14,8 @@ import {
   type OrchestrationV2AppThread,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ProviderTurn,
+  type OrchestrationV2TurnItem,
+  type ProviderApprovalDecision,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -61,6 +63,8 @@ const makeHarness = Effect.fnUntraced(function* (
   fake: Fake,
   existingProviderThread?: OrchestrationV2ProviderThread,
   instanceSettings: AmSettings = settings,
+  /** A fleet host's agent has no event stream, so only polling reaches it. */
+  pollIntervalMs = 3_600_000,
 ) {
   const api = makeAmApi(yield* HttpClient.HttpClient, { baseUrl: fake.url, token: FAKE_TOKEN });
   // Turns must settle from am's event stream alone.
@@ -68,7 +72,7 @@ const makeHarness = Effect.fnUntraced(function* (
     instanceId: INSTANCE_ID,
     settings: instanceSettings,
     api,
-    pollIntervalMs: 3_600_000,
+    pollIntervalMs,
     settleGraceMs: 1_000,
   });
   const runtime = yield* adapter.openSession({
@@ -124,6 +128,20 @@ const makeHarness = Effect.fnUntraced(function* (
     items().flatMap((item) => (item.type === "assistant_message" ? [item.text] : []));
   const notices = () =>
     items().flatMap((item) => (item.type === "system_notice" ? [item.message] : []));
+  const requestStates = (requestId: string) =>
+    allEvents.flatMap((event) =>
+      event.type === "runtime_request.updated" && event.runtimeRequest.id === requestId
+        ? [event.runtimeRequest.status]
+        : [],
+    );
+  const takeApproval = (status: OrchestrationV2TurnItem["status"] = "waiting") =>
+    takeItem(
+      (event) => event.turnItem.type === "approval_request" && event.turnItem.status === status,
+    ).pipe(
+      Effect.flatMap((item) =>
+        item.type === "approval_request" ? Effect.succeed(item) : Effect.die("not an approval"),
+      ),
+    );
   return {
     adapter,
     runtime,
@@ -134,6 +152,8 @@ const makeHarness = Effect.fnUntraced(function* (
     items,
     replies,
     notices,
+    requestStates,
+    takeApproval,
   };
 });
 
@@ -250,6 +270,41 @@ const steer = (
       creationSource: "web",
     },
   });
+
+/** Claude's prompt as am relays it: allow once, one remembered suggestion, deny. */
+const CLAUDE_PROMPT = {
+  tool: "Bash",
+  summary: "Bash: rm -rf tmp",
+  input: { command: "rm -rf tmp" },
+  options: [
+    { id: "allow", label: "Yes", kind: "allow" },
+    {
+      id: "suggestion-0",
+      label: "Yes, and always allow Bash(rm:*) for this session",
+      kind: "allow_always",
+    },
+    { id: "deny", label: "No", kind: "deny" },
+  ],
+};
+
+/** A T3 turn whose agent, on an am that relays prompts, is now waiting on CLAUDE_PROMPT. */
+const promptedTurn = Effect.fnUntraced(function* (
+  prompt: Partial<typeof CLAUDE_PROMPT> & { readonly expiresAt?: string } = {},
+) {
+  const fake = yield* makeFakeAm({ permissionRequests: true });
+  fake.agents.set(AGENT, idleAgent());
+  const harness = yield* makeHarness(fake);
+  yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Clean up"));
+  const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+  yield* deliver(fake, sent.messageId!, user("Clean up"));
+  const amId = yield* fake.prompt(AGENT, { ...CLAUDE_PROMPT, ...prompt });
+  const card = yield* harness.takeApproval();
+  const respond = (decision: ProviderApprovalDecision) =>
+    harness.runtime.respondToRuntimeRequest({ requestId: card.requestId, decision });
+  const answers = () =>
+    fake.log.filter((call) => call.method === "POST" && call.path.endsWith(`/permissions/${amId}`));
+  return { fake, harness, sent, amId, card, respond, answers };
+});
 
 describe("AmAdapterV2", () => {
   it.live("starts the agent with no task, sends the prompt, and settles on its receipt", () =>
@@ -1505,4 +1560,393 @@ describe("AmAdapterV2", () => {
       assert.deepStrictEqual(harness.replies(), []);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
+
+  describe("permission prompts", () => {
+    it.live("shows the agent's prompt as an approval with am's own choices", () =>
+      Effect.gen(function* () {
+        const { harness, card } = yield* promptedTurn();
+        assert.strictEqual(card.title, "Bash");
+        assert.strictEqual(card.requestKind, "command");
+        assert.include(card.prompt ?? "", "Bash: rm -rf tmp");
+        assert.include(card.prompt ?? "", '{"command":"rm -rf tmp"}');
+        assert.deepStrictEqual(card.options, [
+          { decision: "accept", label: "Yes" },
+          {
+            decision: "acceptForSession",
+            label: "Yes, and always allow Bash(rm:*) for this session",
+          },
+          { decision: "decline", label: "No" },
+        ]);
+        const request = harness.allEvents.find(
+          (event) =>
+            event.type === "runtime_request.updated" && event.runtimeRequest.id === card.requestId,
+        );
+        assert.strictEqual(
+          request?.type === "runtime_request.updated" &&
+            request.runtimeRequest.responseCapability.type,
+          "live",
+        );
+        yield* harness.takeEvent(
+          "provider_session.updated",
+          (event) => event.providerSession.status === "waiting",
+        );
+        // am lists the prompt again on every read; it shows once.
+        yield* harness.runtime.steerTurn({
+          threadId: THREAD_ID,
+          runId: RunId.make("run-1"),
+          providerThread: harness.providerThread,
+          providerTurnId: card.providerTurnId!,
+          message: {
+            messageId: MessageId.make("steer-wake"),
+            text: "Also tidy logs",
+            attachments: [],
+            createdBy: "user",
+            creationSource: "web",
+          },
+        });
+        assert.strictEqual(
+          harness.items().filter((item) => item.type === "approval_request").length,
+          1,
+        );
+        assert.deepStrictEqual(harness.notices(), []);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("answers with the option id am offered for the chosen decision", () =>
+      Effect.gen(function* () {
+        const { fake, harness, sent, amId, card, respond, answers } = yield* promptedTurn();
+        yield* respond("acceptForSession");
+        assert.deepStrictEqual(
+          answers().map((call) => call.body),
+          [{ optionId: "suggestion-0" }],
+        );
+        assert.strictEqual(fake.permissions.get(amId)?.state, "applied");
+        yield* complete(fake, sent.messageId!, assistant("Cleaned up."));
+        yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
+        // T3 recorded the answer itself; nothing settles the request again.
+        assert.deepStrictEqual(harness.requestStates(card.requestId), ["pending"]);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("offers only a denial for a prompt whose input the card cannot show in full", () =>
+      Effect.gen(function* () {
+        const { card, respond, answers } = yield* promptedTurn({
+          input: { command: `echo ${"x".repeat(5_000)} && rm -rf ~` },
+        });
+        assert.deepStrictEqual(card.options, [{ decision: "decline", label: "No" }]);
+        assert.strictEqual(
+          card.reason,
+          `Input too long to review here — answer in its session: \`am j ${AGENT}\``,
+        );
+        const error = yield* respond("accept").pipe(Effect.flip);
+        assert.include(String(error.cause), 'no choice for "accept"');
+        yield* respond("acceptForSession").pipe(Effect.flip);
+        assert.strictEqual(answers().length, 0);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("declines with the agent's own deny when T3 cancels", () =>
+      Effect.gen(function* () {
+        const { respond, answers } = yield* promptedTurn();
+        yield* respond("cancel");
+        assert.deepStrictEqual(
+          answers().map((call) => call.body),
+          [{ optionId: "deny" }],
+        );
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live.each([
+      ["expired", "expired", "Approval expired"],
+      ["already_resolved", "cancelled", "Answered elsewhere"],
+      ["not_pending", "cancelled", "Approval no longer open"],
+      ["remote_too_old", "cancelled", "Update Agent Motel"],
+    ] as const)(
+      "settles a request am refuses as %s, once and with a note",
+      ([reason, status, title]) =>
+        Effect.gen(function* () {
+          const { fake, harness, amId, card, respond, answers } = yield* promptedTurn();
+          fake.permissions.get(amId)!.conflict = { error: `refused: ${reason}`, reason };
+          yield* respond("accept");
+          yield* harness.takeApproval("cancelled");
+          assert.strictEqual(answers().length, 1);
+          assert.deepStrictEqual(harness.requestStates(card.requestId), ["pending", status]);
+          const settled = harness.items().findLast((item) => item.id === card.id);
+          assert.strictEqual(settled?.status, "cancelled");
+          const note = harness
+            .items()
+            .find((item) => item.type === "system_notice" && item.title === title);
+          assert.isDefined(note);
+          if (reason === "remote_too_old")
+            assert.include(note?.type === "system_notice" ? note.message : "", "Update am");
+        }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("settles a retried answer whose first reply was lost, without blaming anyone", () =>
+      Effect.gen(function* () {
+        const { fake, harness, amId, card, respond, answers } = yield* promptedTurn();
+        fake.permissions.get(amId)!.loseResponse = true;
+        yield* respond("accept").pipe(Effect.flip);
+        assert.strictEqual(fake.permissions.get(amId)?.state, "applied");
+        // T3 retries a failed response.
+        yield* respond("accept");
+        yield* harness.takeApproval("completed");
+        assert.strictEqual(answers().length, 2);
+        assert.deepStrictEqual(harness.requestStates(card.requestId), ["pending", "resolved"]);
+        const notes = harness
+          .items()
+          .flatMap((item) => (item.type === "system_notice" ? [item] : []));
+        assert.deepStrictEqual(
+          notes.map((note) => note.title),
+          ["Answer may have been applied"],
+        );
+        assert.include(notes[0]!.message, "may already have been applied");
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("settles a lost answer am stops listing as resolved, not expired", () =>
+      Effect.gen(function* () {
+        const deadline = DateTime.formatIso(
+          DateTime.add(yield* DateTime.now, { milliseconds: 500 }),
+        );
+        const { fake, harness, amId, card, respond } = yield* promptedTurn({ expiresAt: deadline });
+        fake.permissions.get(amId)!.loseResponse = true;
+        yield* respond("accept").pipe(Effect.flip);
+        // Whichever read finds it gone, before or after its deadline, the lost answer may be why.
+        yield* harness.takeApproval("completed");
+        assert.deepStrictEqual(harness.requestStates(card.requestId), ["pending", "resolved"]);
+        assert.deepStrictEqual(harness.notices(), []);
+        // A retry after that hears am already holds an answer.
+        yield* respond("accept");
+        const retried = yield* harness.takeEvent(
+          "runtime_request.updated",
+          (event) => event.runtimeRequest.id === card.requestId,
+        );
+        assert.strictEqual(retried.runtimeRequest.status, "resolved");
+        assert.isFalse(
+          harness
+            .items()
+            .some((item) => item.type === "system_notice" && item.title === "Answered elsewhere"),
+        );
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("forgets a run's prompts once the run ends", () =>
+      Effect.gen(function* () {
+        const { fake, harness, sent, amId, respond, answers } = yield* promptedTurn();
+        yield* fake.resolvePermission(amId, "stale");
+        yield* harness.takeApproval("completed");
+        yield* complete(fake, sent.messageId!, assistant("Done."));
+        yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
+        const error = yield* respond("accept").pipe(Effect.flip);
+        assert.include(String(error.cause), "No open Agent Motel request");
+        assert.strictEqual(answers().length, 0);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("settles a prompt answered in the agent's pane", () =>
+      Effect.gen(function* () {
+        const { fake, harness, sent, amId, card } = yield* promptedTurn();
+        yield* fake.resolvePermission(amId, "stale");
+        yield* harness.takeApproval("completed");
+        assert.deepStrictEqual(harness.requestStates(card.requestId), ["pending", "resolved"]);
+        assert.deepStrictEqual(harness.notices(), []);
+        yield* complete(fake, sent.messageId!, assistant("Done."));
+        yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("expires a Claude prompt at its deadline, with no event from am", () =>
+      Effect.gen(function* () {
+        const deadline = DateTime.formatIso(
+          DateTime.add(yield* DateTime.now, { milliseconds: 300 }),
+        );
+        const { harness, card } = yield* promptedTurn({ expiresAt: deadline });
+        yield* harness.takeApproval("cancelled");
+        assert.deepStrictEqual(harness.requestStates(card.requestId), ["pending", "expired"]);
+        assert.include(harness.notices().join("\n"), `am j ${AGENT}`);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live(
+      "shows a mirrored agent's prompt in the run that follows it, until it is answered",
+      () =>
+        Effect.gen(function* () {
+          const fake = yield* makeFakeAm({ permissionRequests: true });
+          fake.agents.set(AGENT, { ...idleAgent([user("Old"), assistant("Old reply")]) });
+          const harness = yield* makeHarness(fake, yield* importedThread(2));
+          fake.agents.get(AGENT)!.status = "working";
+          const observed = yield* turnInput(harness.providerThread, "Activity outside T3 Code");
+          yield* harness.runtime.startTurn({
+            ...observed,
+            message: { ...observed.message, createdBy: "agent", creationSource: "provider" },
+          });
+          const amId = yield* fake.prompt(AGENT, CLAUDE_PROMPT);
+          const card = yield* harness.takeApproval();
+          // am can report the agent idle while its provider still waits on the answer.
+          yield* fake.update(AGENT, (agent) => {
+            agent.status = "idle";
+          });
+          yield* harness.runtime.respondToRuntimeRequest({
+            requestId: card.requestId,
+            decision: "decline",
+          });
+          assert.strictEqual(fake.permissions.get(amId)?.optionId, "deny");
+          const end = yield* harness.takeEvent("turn.terminal");
+          assert.strictEqual(end.status, "completed");
+          // Following the agent never sends it a message.
+          assert.isFalse(fake.log.some((call) => call.path.endsWith("/messages")));
+        }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("polls and answers a fleet host's agent by host:name", () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeAm({ permissionRequests: true });
+        const ref = `gapserver:${AGENT}`;
+        fake.agents.set(ref, idleAgent());
+        const remote = decodeSettings({ enabled: true, apiToken: FAKE_TOKEN, host: "gapserver" });
+        const harness = yield* makeHarness(fake, undefined, remote, 100);
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Remote job"));
+        const sent = yield* fake.takeCall(
+          "POST",
+          `/api/agents/${encodeURIComponent(ref)}/messages`,
+        );
+        yield* deliver(fake, sent.messageId!, user("Remote job"));
+        // A fleet host's prompt raises no event here; only the poll finds it.
+        const amId = yield* fake.prompt(ref, CLAUDE_PROMPT, false);
+        fake.agents.get(ref)!.status = "needs-attention";
+        const card = yield* harness.takeApproval();
+        yield* harness.runtime.respondToRuntimeRequest({
+          requestId: card.requestId,
+          decision: "accept",
+        });
+        const answer = fake.log.find(
+          (call) =>
+            call.method === "POST" &&
+            call.path === `/api/agents/${encodeURIComponent(ref)}/permissions/${amId}`,
+        );
+        assert.deepStrictEqual(answer?.body, { optionId: "allow" });
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("lists a fleet host's prompts only once the agent may be waiting on one", () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeAm({ permissionRequests: true });
+        const ref = `gapserver:${AGENT}`;
+        const listPath = `/api/agents/${encodeURIComponent(ref)}/permissions`;
+        const listings = () =>
+          fake.log.filter((call) => call.method === "GET" && call.path === listPath).length;
+        fake.agents.set(ref, idleAgent());
+        const remote = decodeSettings({ enabled: true, apiToken: FAKE_TOKEN, host: "gapserver" });
+        const harness = yield* makeHarness(fake, undefined, remote, 100);
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Remote job"));
+        const sent = yield* fake.takeCall(
+          "POST",
+          `/api/agents/${encodeURIComponent(ref)}/messages`,
+        );
+        yield* deliver(fake, sent.messageId!, user("Remote job"));
+        for (let read = 0; read < 3; read++) yield* fake.takeCall("GET", "/transcript");
+        // Each listing is an ssh round trip, and a working agent with none pending has no prompt.
+        assert.strictEqual(listings(), 0);
+        const amId = yield* fake.prompt(ref, CLAUDE_PROMPT, false);
+        fake.agents.get(ref)!.status = "waiting";
+        const card = yield* harness.takeApproval();
+        assert.isAbove(listings(), 0);
+        // The open card is still read, so an answer given elsewhere settles it.
+        fake.agents.get(ref)!.status = "working";
+        yield* fake.resolvePermission(amId, "stale", false);
+        yield* harness.takeApproval("completed");
+        assert.deepStrictEqual(harness.requestStates(card.requestId), ["pending", "resolved"]);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live(
+      "still finds a fleet host's prompt while another tool call keeps the agent working",
+      () =>
+        Effect.gen(function* () {
+          const fake = yield* makeFakeAm({ permissionRequests: true });
+          const ref = `gapserver:${AGENT}`;
+          fake.agents.set(ref, idleAgent());
+          const remote = decodeSettings({ enabled: true, apiToken: FAKE_TOKEN, host: "gapserver" });
+          const harness = yield* makeHarness(fake, undefined, remote, 100);
+          yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Remote job"));
+          const sent = yield* fake.takeCall(
+            "POST",
+            `/api/agents/${encodeURIComponent(ref)}/messages`,
+          );
+          yield* deliver(fake, sent.messageId!, user("Remote job"));
+          fake.agents.get(ref)!.status = "working";
+          yield* fake.prompt(ref, CLAUDE_PROMPT, false);
+          const card = yield* harness.takeApproval();
+          assert.strictEqual(card.title, "Bash");
+        }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("lists a fleet host's prompt the run's agent detail already counts", () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeAm({ permissionRequests: true });
+        const ref = `gapserver:${AGENT}`;
+        fake.agents.set(ref, { ...idleAgent(), status: "working" });
+        yield* fake.prompt(ref, CLAUDE_PROMPT, false);
+        const remote = decodeSettings({ enabled: true, apiToken: FAKE_TOKEN, host: "gapserver" });
+        const harness = yield* makeHarness(fake, undefined, remote, 100);
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Remote job"));
+        const card = yield* harness.takeApproval();
+        assert.strictEqual(card.title, "Bash");
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("says T3 cannot answer when the agent's am does not relay prompts", () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeAm();
+        fake.agents.set(AGENT, idleAgent());
+        const harness = yield* makeHarness(fake);
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Delete tmp"));
+        const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+        yield* deliver(fake, sent.messageId!, user("Delete tmp"));
+        yield* fake.update(AGENT, (agent) => {
+          agent.status = "needs-attention";
+        });
+        const notice = yield* harness.takeItem((event) => event.turnItem.type === "system_notice");
+        assert.include(
+          notice.type === "system_notice" ? notice.message : "",
+          "T3 Code cannot answer this agent's prompts",
+        );
+        assert.isFalse(fake.log.some((call) => call.path.endsWith("/permissions")));
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("keeps the terminal notice for a prompt am does not relay", () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeAm({ permissionRequests: true });
+        fake.agents.set(AGENT, idleAgent());
+        const harness = yield* makeHarness(fake);
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Delegate"));
+        const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+        yield* deliver(fake, sent.messageId!, user("Delegate"));
+        // A Codex subagent's prompt waits in the pane with nothing listed.
+        yield* fake.update(AGENT, (agent) => {
+          agent.status = "needs-attention";
+        });
+        const notice = yield* harness.takeItem((event) => event.turnItem.type === "system_notice");
+        assert.include(
+          notice.type === "system_notice" ? notice.message : "",
+          `did not pass this prompt to T3 Code. Answer it in its session with \`am j ${AGENT}\``,
+        );
+        assert.isFalse(harness.items().some((item) => item.type === "approval_request"));
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("shows the approval instead of the terminal notice while a prompt is listed", () =>
+      Effect.gen(function* () {
+        const { fake, harness, sent } = yield* promptedTurn();
+        yield* fake.update(AGENT, (agent) => {
+          agent.status = "needs-attention";
+        });
+        yield* complete(fake, sent.messageId!, assistant("Waited."));
+        yield* harness.takeEvent("turn.terminal");
+        assert.deepStrictEqual(harness.notices(), []);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+  });
 });

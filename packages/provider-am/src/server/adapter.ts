@@ -1,11 +1,14 @@
 import {
   ProviderDriverKind,
   type OrchestrationV2ConversationMessage,
+  type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ProviderSession,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ProviderTurn,
+  type OrchestrationV2RuntimeRequest,
   type OrchestrationV2TurnItem,
+  type ProviderApprovalDecision,
   type ProviderInstanceId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -35,6 +38,7 @@ import type {
   AmConflict,
   AmMessageReceipt,
   AmMessageState,
+  AmPermissionRequest,
   AmTranscriptEntry,
 } from "./api.ts";
 import {
@@ -48,7 +52,11 @@ import {
 import {
   amAgentName,
   amAgentRef,
+  amApprovalChoices,
   amEntryStatus,
+  amOptionForDecision,
+  amPermissionPrompt,
+  amPermissionRequestKind,
   amProviderForModel,
   amToolPresentation,
   amTurnPhase,
@@ -82,6 +90,13 @@ const SETTLED_BY_REASON = {
 } as const;
 // am launches agents with their provider's own full access; it has no restricted mode to map to.
 const FULL_ACCESS_ONLY = "Agent Motel only runs in Full access";
+// Claude can mark the agent as waiting just before its permission hook records the prompt, so a
+// waiting agent of an am that relays prompts gets this long to list one before T3 says it cannot.
+const ATTENTION_GRACE_MS = 2_000;
+// am expires a request only when it is read, so T3 reads again once a deadline has passed.
+const EXPIRY_SLACK_MS = 250;
+// Well inside am's two-minute wait for a Claude prompt.
+const FLEET_PROMPTS_REFRESH_POLLS = 6;
 
 const AmProviderCapabilitiesV2 = {
   // The agent's own provider enforces permissions; T3 never answers for it.
@@ -127,12 +142,14 @@ const AmProviderCapabilitiesV2 = {
     supportsMcpTools: false,
     supportsDynamicToolCallbacks: false,
   },
+  // T3 relays the prompts the agent's own provider raises under the mode am gave it, through an
+  // am that lists them; T3 never asks on its own.
   approvals: {
-    supportsCommandApproval: false,
-    supportsFileReadApproval: false,
-    supportsFileChangeApproval: false,
-    supportsApplyPatchApproval: false,
-    approvalsHaveNativeRequestIds: false,
+    supportsCommandApproval: true,
+    supportsFileReadApproval: true,
+    supportsFileChangeApproval: true,
+    supportsApplyPatchApproval: true,
+    approvalsHaveNativeRequestIds: true,
     approvalCallbacksAreLiveOnly: true,
     approvalsCanOriginateFromSubagents: false,
   },
@@ -172,7 +189,7 @@ const AmProviderCapabilitiesV2 = {
     nativeThreadIds: "strong",
     nativeTurnIds: "weak",
     nativeItemIds: "weak",
-    nativeRequestIds: "none",
+    nativeRequestIds: "strong",
   },
 } satisfies OrchestrationV2ProviderCapabilities;
 
@@ -240,7 +257,30 @@ interface ActiveTurn {
   settledAt: number | undefined;
   /** A re-read is already scheduled while the turn waits for its reply. */
   settleWakePending: boolean;
+  /** Whether the agent's am lists its permission prompts; unknown until read once in the run. */
+  permissions: "unknown" | "supported" | "unsupported";
+  /** The run's agent detail counted prompts not listed since. */
+  promptsCounted: boolean;
+  /** When a fleet host's prompts were last counted or listed. */
+  promptsCheckedAt: number;
+  /** When the agent was first seen waiting with no prompt listed, while am relays prompts. */
+  attentionSince: number | undefined;
   readonly done: Deferred.Deferred<void>;
+}
+
+/** One of the agent's permission prompts, shown as a T3 approval request. */
+interface AmPendingRequest {
+  readonly amId: string;
+  readonly turn: ActiveTurn;
+  readonly runtimeRequest: OrchestrationV2RuntimeRequest;
+  readonly node: OrchestrationV2ExecutionNode;
+  readonly item: OrchestrationV2TurnItem;
+  readonly optionIds: ReadonlyMap<ProviderApprovalDecision, string>;
+  readonly expiresAt: number | null;
+  /** `answering` while T3's answer is on its way to am; `settled` once T3 showed its end. */
+  state: "pending" | "answering" | "answered" | "settled";
+  /** An answer whose reply was lost may have been applied, so am ending the request is no news. */
+  maybeAnswered?: boolean;
 }
 
 const trimSlashes = (path: string) => path.replace(/\/+$/, "");
@@ -334,6 +374,21 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
       let closed = false;
       /** Whether am, or the fleet host's am, returns message receipts; checked before the first send. */
       let receiptsConfirmed = false;
+      /** The agent's permission prompts T3 has shown, by runtime request id. */
+      const requests = new Map<string, AmPendingRequest>();
+      const fleetPromptsRefreshMs = (options.pollIntervalMs ?? 5_000) * FLEET_PROMPTS_REFRESH_POLLS;
+      const forgetFinished = (request: AmPendingRequest) => {
+        if (
+          active !== request.turn &&
+          (request.state === "answered" || request.state === "settled")
+        )
+          requests.delete(request.runtimeRequest.id);
+      };
+      const pendingRequestsOf = (turn: ActiveTurn) =>
+        [...requests.values()].filter(
+          (request) =>
+            request.turn === turn && (request.state === "pending" || request.state === "answering"),
+        );
 
       const emit = (event: ProviderAdapter.ProviderAdapterV2Event) =>
         Queue.offer(events, event).pipe(Effect.asVoid);
@@ -601,6 +656,11 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
               turn.published.set(entry.index, { entry, settled: true });
               yield* publishEntry(turn, entry, true);
             }
+        // A prompt still open goes with the run; the next run that follows the agent shows it again.
+        // An answer on its way to am settles it itself.
+        for (const request of pendingRequestsOf(turn))
+          if (request.state === "pending")
+            yield* settleRequest(request, request.maybeAnswered ? "resolved" : "cancelled");
         // Everything before the head is in the thread; a failed last read resumes at the cursor.
         const head = last._tag === "Some" ? last.value.total : turn.cursor;
         busyAgents.delete(agentRef!);
@@ -622,6 +682,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         });
         yield* updateSession("ready", status === "failed" ? (detail ?? null) : null);
         active = undefined;
+        for (const request of requests.values()) if (request.turn === turn) forgetFinished(request);
         if (status === "failed") {
           const failure = makeProviderFailure({
             class: "provider_error",
@@ -668,6 +729,275 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           });
         }
         yield* Deferred.succeed(turn.done, undefined);
+      });
+      /** Ends a request T3 showed, without a decision: am says nothing of one taken elsewhere. */
+      const settleRequest = Effect.fnUntraced(function* (
+        request: AmPendingRequest,
+        status: "resolved" | "expired" | "cancelled",
+        note?: { readonly title: string; readonly message: string },
+      ) {
+        if (request.state === "settled") return;
+        request.state = "settled";
+        // The expiry says to answer in the terminal, so the waiting agent needs no second notice.
+        if (status === "expired") request.turn.inAttention = true;
+        const now = yield* DateTime.now;
+        const itemStatus = status === "resolved" ? "completed" : "cancelled";
+        const { decision: _decision, ...runtimeRequest } = request.runtimeRequest;
+        yield* emit({
+          type: "runtime_request.updated",
+          driver: AM_PROVIDER,
+          threadId: request.turn.input.threadId,
+          runtimeRequest: { ...runtimeRequest, status, resolvedAt: now },
+        });
+        yield* emit({
+          type: "node.updated",
+          driver: AM_PROVIDER,
+          node: { ...request.node, status: itemStatus, completedAt: now },
+        });
+        yield* emit({
+          type: "turn_item.updated",
+          driver: AM_PROVIDER,
+          turnItem: { ...request.item, status: itemStatus, completedAt: now, updatedAt: now },
+        });
+        if (note)
+          yield* emitNotice(
+            request.turn,
+            `permission-note:${request.amId}`,
+            note.title,
+            note.message,
+          );
+      });
+      const expiredNote = () => ({
+        title: "Approval expired",
+        message: `Nobody answered in time, so the agent's own prompt took over. Answer it in its session with \`am j ${agentRef}\`.`,
+      });
+      const showRequest = Effect.fnUntraced(function* (
+        turn: ActiveTurn,
+        listed: AmPermissionRequest,
+      ) {
+        const nativeId = `${agentRef}:${listed.id}`;
+        const requestId = yield* idAllocator.allocate.runtimeRequest({
+          driver: AM_PROVIDER,
+          providerTurnId: turn.providerTurn.id,
+          nativeRequestId: nativeId,
+        });
+        const nodeId = idAllocator.derive.approvalNode({ requestId });
+        const now = yield* DateTime.now;
+        const createdAt = DateTime.make(listed.createdAt).pipe(Option.getOrElse(() => now));
+        const requestKind = amPermissionRequestKind(listed.tool);
+        const { prompt, truncated } = amPermissionPrompt(listed);
+        // Nobody may approve what the card cannot show in full.
+        const choices = amApprovalChoices(listed.options, { denyOnly: truncated });
+        const runtimeRequest: OrchestrationV2RuntimeRequest = {
+          id: requestId,
+          nodeId,
+          providerTurnId: turn.providerTurn.id,
+          nativeRequestRef: nativeRef(nativeId),
+          kind: requestKind,
+          status: "pending",
+          responseCapability: { type: "live", providerSessionId: input.providerSessionId },
+          createdAt,
+          resolvedAt: null,
+        };
+        const node: OrchestrationV2ExecutionNode = {
+          id: nodeId,
+          threadId: turn.input.threadId,
+          runId: turn.input.runId,
+          parentNodeId: turn.input.rootNodeId,
+          rootNodeId: turn.input.rootNodeId,
+          kind: "approval_request",
+          status: "waiting",
+          countsForRun: false,
+          providerThreadId: turn.input.providerThread.id,
+          providerTurnId: turn.providerTurn.id,
+          nativeItemRef: nativeRef(nativeId),
+          runtimeRequestId: requestId,
+          checkpointScopeId: null,
+          startedAt: now,
+          completedAt: null,
+        };
+        const { identity: _identity, ...base } = baseItem(turn, `permission:${listed.id}`, now);
+        const item: OrchestrationV2TurnItem = {
+          ...base,
+          id: idAllocator.derive.approvalTurnItem({ requestId }),
+          nodeId,
+          nativeItemRef: nativeRef(nativeId),
+          type: "approval_request",
+          status: "waiting",
+          title: listed.tool,
+          completedAt: null,
+          requestId,
+          requestKind,
+          prompt,
+          ...(truncated
+            ? {
+                reason: `Input too long to review here — answer in its session: \`am j ${agentRef}\``,
+              }
+            : choices.hidden > 0
+              ? {
+                  reason: `The agent offers ${choices.hidden} more ${choices.hidden === 1 ? "choice" : "choices"} in its session: \`am j ${agentRef}\`.`,
+                }
+              : {}),
+          options: choices.options,
+        };
+        const expiresAt =
+          listed.expiresAt === null
+            ? null
+            : DateTime.make(listed.expiresAt).pipe(
+                Option.map(DateTime.toEpochMillis),
+                Option.getOrNull,
+              );
+        requests.set(requestId, {
+          amId: listed.id,
+          turn,
+          runtimeRequest,
+          node,
+          item,
+          optionIds: choices.optionIds,
+          expiresAt,
+          state: "pending",
+        });
+        yield* emit({ type: "node.updated", driver: AM_PROVIDER, node });
+        yield* emit({
+          type: "runtime_request.updated",
+          driver: AM_PROVIDER,
+          threadId: turn.input.threadId,
+          runtimeRequest,
+        });
+        yield* emit({ type: "turn_item.updated", driver: AM_PROVIDER, turnItem: item });
+        if (expiresAt !== null)
+          yield* Effect.sleep(
+            Math.max(0, expiresAt - (yield* Clock.currentTimeMillis)) + EXPIRY_SLACK_MS,
+          ).pipe(
+            Effect.andThen(Effect.sync(() => Queue.offerUnsafe(wake, undefined))),
+            Effect.forkIn(scope),
+          );
+      });
+      /**
+       * Shows the prompts am lists for the agent and settles the ones it no longer does: answered
+       * in the pane or by another client, expired, or dropped with the provider's wait.
+       */
+      const syncPermissions = Effect.fnUntraced(function* (
+        turn: ActiveTurn,
+        ref: string,
+        status: string,
+      ) {
+        if (turn.permissions === "unknown") {
+          const detail = yield* api.getAgent(ref).pipe(Effect.option);
+          if (detail._tag === "None") return;
+          const value = Option.getOrUndefined(detail.value);
+          turn.permissions = value?.permissionRequests === true ? "supported" : "unsupported";
+          turn.promptsCounted = (value?.pendingPermissions ?? 0) > 0;
+          turn.promptsCheckedAt = yield* Clock.currentTimeMillis;
+        }
+        if (turn.permissions !== "supported") return;
+        // A fleet host's listing is an ssh round trip, so it is read only while a prompt may be open,
+        // and now and then since a sibling tool call's hook can report the agent working meanwhile.
+        if (
+          parseAmAgentRef(ref).host !== undefined &&
+          !turn.promptsCounted &&
+          (yield* Clock.currentTimeMillis) - turn.promptsCheckedAt < fleetPromptsRefreshMs &&
+          status !== "waiting" &&
+          amTurnPhase(status) !== "attention" &&
+          pendingRequestsOf(turn).length === 0
+        )
+          return;
+        const listed = yield* api.permissions(ref).pipe(
+          Effect.asSome,
+          Effect.catch((error) => {
+            // An am serve older than the routes, or a fleet host's am older than its own.
+            if (error.status === 404 || error.status === 409) turn.permissions = "unsupported";
+            // A failed read must not hold up the transcript; the next wake reads again.
+            return Effect.logDebug("Could not list the Agent Motel agent's prompts", error).pipe(
+              Effect.as(Option.none<ReadonlyArray<AmPermissionRequest>>()),
+            );
+          }),
+        );
+        if (listed._tag === "None" || active !== turn) return;
+        turn.promptsCounted = false;
+        turn.promptsCheckedAt = yield* Clock.currentTimeMillis;
+        const shown = new Set(
+          [...requests.values()].filter((request) => request.turn === turn).map((r) => r.amId),
+        );
+        for (const request of listed.value)
+          if (!shown.has(request.id)) yield* showRequest(turn, request);
+        const open = new Set(listed.value.map((request) => request.id));
+        const now = yield* Clock.currentTimeMillis;
+        for (const request of pendingRequestsOf(turn))
+          if (request.state === "pending" && !open.has(request.amId)) {
+            if (!request.maybeAnswered && request.expiresAt !== null && now >= request.expiresAt)
+              yield* settleRequest(request, "expired", expiredNote());
+            else yield* settleRequest(request, "resolved");
+          }
+      });
+      const answerRequest = Effect.fnUntraced(function* (
+        request: AmPendingRequest,
+        decision: ProviderApprovalDecision,
+      ) {
+        const optionId = amOptionForDecision(request.optionIds, decision);
+        if (optionId === undefined)
+          return yield* protocolError(`The agent offered no choice for "${decision}"`);
+        request.state = "answering";
+        const ref = agentRef!;
+        const answer = yield* api.answerPermission(ref, request.amId, optionId).pipe(
+          Effect.catchIf(
+            (error) => error.status !== null && error.status < 500,
+            (error) =>
+              Effect.succeed({
+                answered: false as const,
+                reason: error.status === 404 ? ("not_pending" as const) : undefined,
+                error: error.detail,
+              }),
+          ),
+          // A transport failure is retried by T3, so the request is still T3's to answer.
+          Effect.tapError(() =>
+            Effect.sync(() => {
+              request.maybeAnswered = true;
+              if (request.state === "answering") request.state = "pending";
+            }),
+          ),
+        );
+        if (answer.answered) {
+          request.state = "answered";
+          return;
+        }
+        if (
+          request.maybeAnswered &&
+          (answer.reason === "already_resolved" || answer.reason === "not_pending")
+        )
+          return yield* settleRequest(request, "resolved", {
+            title: "Answer may have been applied",
+            message: `The reply to your earlier answer was lost, and Agent Motel no longer holds this request open, so that answer may already have been applied. Check the agent's session with \`am j ${ref}\`.`,
+          });
+        // Retrying cannot help: the prompt ended without this answer, so T3 shows what happened.
+        switch (answer.reason) {
+          case "expired":
+            return yield* settleRequest(request, "expired", {
+              title: "Approval expired",
+              message: `Your answer arrived after the request expired, so it was not applied. Answer the agent's own prompt in its session with \`am j ${ref}\`.`,
+            });
+          case "already_resolved":
+            return yield* settleRequest(request, "cancelled", {
+              title: "Answered elsewhere",
+              message: "Someone else answered this request first, so your answer was not applied.",
+            });
+          case "not_pending":
+            return yield* settleRequest(request, "cancelled", {
+              title: "Approval no longer open",
+              message: `Your answer was not applied: ${answer.error}. It may have been answered in the agent's session.`,
+            });
+          case "remote_too_old":
+            request.turn.permissions = "unsupported";
+            return yield* settleRequest(request, "cancelled", {
+              title: "Update Agent Motel",
+              message: `${answer.error}. Update am there, or answer in the agent's session with \`am j ${ref}\`.`,
+            });
+          default:
+            return yield* settleRequest(request, "cancelled", {
+              title: "Approval not applied",
+              message: `Agent Motel refused the answer: ${answer.error}. Answer in the agent's session with \`am j ${ref}\`.`,
+            });
+        }
       });
       const applyReceipt = (message: TrackedMessage, receipt: AmMessageReceipt) => {
         message.state = receipt.state;
@@ -847,15 +1177,20 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
               : finish(turn, "failed", `Agent Motel no longer has the agent ${ref}.`);
         const transcript = read.value;
         yield* applyEntries(turn, transcript.entries, transcript.total, false);
+        yield* syncPermissions(turn, ref, transcript.status);
+        if (active !== turn) return;
         const phase = amTurnPhase(transcript.status);
+        const prompting = pendingRequestsOf(turn).length > 0;
         // Until the continued run shows a reply, an agent that stops left it unfinished.
         if (turn.restartCheck) {
           if ([...turn.published.values()].some(({ entry }) => entry.kind === "assistant"))
             turn.restartCheck = false;
           else if (phase === "gone") return yield* stoppedOnRestart();
         }
-        // An observing run lasts while the agent works; a T3 turn, while its messages do.
-        const observedWork = turn.observe && (phase === "running" || phase === "attention");
+        // An observing run lasts while the agent works or waits on a prompt; a T3 turn, while its
+        // messages do.
+        const observedWork =
+          turn.observe && (phase === "running" || phase === "attention" || prompting);
         // am ends a turn aborted with Esc itself, whoever pressed it (`am interrupt` included).
         if (!observedWork && !turn.messages.some(isPending)) {
           const interrupted = turn.messages.some((message) => message.interrupted);
@@ -880,13 +1215,31 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           return yield* finish(turn, interrupted ? "interrupted" : "completed");
         }
         turn.settledAt = undefined;
-        if (phase !== "attention") turn.inAttention = false;
+        if (phase !== "attention") {
+          turn.inAttention = false;
+          turn.attentionSince = undefined;
+        }
+        if (prompting) {
+          turn.attentionSince = undefined;
+          return yield* updateSession("waiting");
+        }
         switch (phase) {
           case "running":
             return yield* updateSession("running");
           case "attention": {
             yield* updateSession("waiting");
             if (turn.inAttention) return;
+            if (turn.permissions === "supported") {
+              const now = yield* Clock.currentTimeMillis;
+              turn.attentionSince ??= now;
+              if (now - turn.attentionSince < ATTENTION_GRACE_MS) {
+                yield* Effect.sleep(ATTENTION_GRACE_MS - (now - turn.attentionSince)).pipe(
+                  Effect.andThen(Effect.sync(() => Queue.offerUnsafe(wake, undefined))),
+                  Effect.forkIn(scope),
+                );
+                return;
+              }
+            }
             turn.inAttention = true;
             const detail = yield* api.getAgent(ref).pipe(Effect.option);
             const reason = Option.getOrUndefined(Option.flatten(detail))?.statusReason;
@@ -894,7 +1247,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
               turn,
               `attention:${turn.input.runId}:${++turn.attentionEpisodes}`,
               "Waiting in its terminal",
-              `${reason ? `${reason}. ` : ""}T3 Code cannot answer this agent's prompts. Answer it in its session with \`am j ${ref}\`.`,
+              `${reason ? `${reason}. ` : ""}${turn.permissions === "supported" ? "Agent Motel did not pass this prompt to T3 Code." : "T3 Code cannot answer this agent's prompts."} Answer it in its session with \`am j ${ref}\`.`,
             );
           }
           case "idle":
@@ -1111,6 +1464,13 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           nativeTurnId: `${ref}:${id}`,
           from: head,
           floor: 0,
+          // A new agent's detail was not read; the run reads it once.
+          ...(detail
+            ? {
+                permissions: detail.permissionRequests ? "supported" : "unsupported",
+                promptsCounted: (detail.pendingPermissions ?? 0) > 0,
+              }
+            : {}),
           messages: [
             { id, mode: "queue", state: "queued", transcriptIndex: null, shownAt: undefined },
           ],
@@ -1121,6 +1481,8 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         init: Pick<ActiveTurn, "observe" | "from" | "floor" | "messages"> & {
           readonly nativeTurnId: string;
           readonly restartCheck?: boolean;
+          readonly permissions?: ActiveTurn["permissions"];
+          readonly promptsCounted?: boolean;
         },
       ) {
         const startedAt = yield* DateTime.now;
@@ -1154,6 +1516,10 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           inAttention: false,
           settledAt: undefined,
           settleWakePending: false,
+          permissions: init.permissions ?? "unknown",
+          promptsCounted: init.promptsCounted ?? false,
+          promptsCheckedAt: yield* Clock.currentTimeMillis,
+          attentionSince: undefined,
           done: yield* Deferred.make<void>(),
         };
         thread = turnInput.providerThread;
@@ -1358,14 +1724,31 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
               ),
             ),
         ),
-        respondToRuntimeRequest: (args) =>
-          Effect.fail(
-            new ProviderAdapter.ProviderAdapterRuntimeRequestResponseError({
-              driver: AM_PROVIDER,
-              requestId: args.requestId,
-              cause: "Agent Motel agents answer their own prompts in their terminal.",
-            }),
-          ),
+        respondToRuntimeRequest: Effect.fn("AmAdapterV2.respondToRuntimeRequest")(
+          function* (args) {
+            const request = requests.get(args.requestId);
+            if (!request || request.state === "answering" || request.state === "answered")
+              return yield* protocolError(`No open Agent Motel request ${args.requestId}`);
+            if (args.decision === undefined)
+              return yield* protocolError("An Agent Motel approval needs a decision");
+            // A request T3 already settled goes to am anyway: am says why it ended, and T3 shows it.
+            if (request.state === "settled") request.state = "pending";
+            yield* answerRequest(request, args.decision).pipe(
+              Effect.ensuring(Effect.sync(() => forgetFinished(request))),
+            );
+          },
+          (effect, args) =>
+            effect.pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapter.ProviderAdapterRuntimeRequestResponseError({
+                    driver: AM_PROVIDER,
+                    requestId: args.requestId,
+                    cause,
+                  }),
+              ),
+            ),
+        ),
         readThreadSnapshot: (args) =>
           (validateThread(args.providerThread)
             ? snapshot(args.providerThread)

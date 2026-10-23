@@ -3,7 +3,10 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   amAgentName,
   amAgentRef,
+  amApprovalChoices,
   amEntryStatus,
+  amOptionForDecision,
+  amPermissionPrompt,
   amToolPresentation,
   amTurnPhase,
   fleetEventConcerns,
@@ -108,5 +111,105 @@ describe("fleetEventConcerns", () => {
   it("never wakes a fleet host's agent, whose events the local stream does not carry", () => {
     assert.isFalse(fleetEventConcerns('{"agent":"t3-a"}', "gapserver:t3-a"));
     assert.isFalse(fleetEventConcerns('{"type":"fleet","event":"changed"}', "gapserver:t3-a"));
+  });
+});
+
+describe("amApprovalChoices", () => {
+  it("keeps Codex's decisions on their own slots and leaves extra choices to the terminal", () => {
+    const choices = amApprovalChoices([
+      { id: "accept", label: "Yes, proceed", kind: "allow" },
+      {
+        id: "acceptWithExecpolicyAmendment",
+        label: "Yes, and don't ask again for `npm test`",
+        kind: "allow_always",
+      },
+      {
+        id: "acceptForSession",
+        label: "Yes, and don't ask again this session",
+        kind: "allow_always",
+      },
+      { id: "networkPolicy-3", label: "No, and always block network access", kind: "deny" },
+      { id: "decline", label: "No, continue without it", kind: "deny" },
+      { id: "cancel", label: "No, and tell Codex what to do differently", kind: "deny" },
+      { id: "later", label: "Ask me later", kind: "snooze" },
+    ]);
+    assert.deepStrictEqual(choices.options, [
+      { decision: "accept", label: "Yes, proceed" },
+      { decision: "acceptAlways", label: "Yes, and don't ask again for `npm test`" },
+      { decision: "acceptForSession", label: "Yes, and don't ask again this session" },
+      { decision: "decline", label: "No, continue without it" },
+      { decision: "cancel", label: "No, and tell Codex what to do differently" },
+    ]);
+    assert.strictEqual(choices.optionIds.get("acceptAlways"), "acceptWithExecpolicyAmendment");
+    assert.strictEqual(choices.hidden, 2);
+  });
+
+  it("declines with the agent's one deny whichever decline T3 sends", () => {
+    const { optionIds } = amApprovalChoices([
+      { id: "allow", label: "Yes", kind: "allow" },
+      { id: "deny", label: "No", kind: "deny" },
+    ]);
+    assert.strictEqual(amOptionForDecision(optionIds, "cancel"), "deny");
+    assert.strictEqual(amOptionForDecision(optionIds, "decline"), "deny");
+    assert.strictEqual(amOptionForDecision(optionIds, "acceptAlways"), undefined);
+  });
+
+  it("leaves an option of a kind named like an Object property to the terminal", () => {
+    const choices = amApprovalChoices([
+      { id: "allow", label: "Yes", kind: "allow" },
+      { id: "constructor", label: "Odd", kind: "constructor" },
+      { id: "toString", label: "Odder", kind: "toString" },
+      { id: "proto", label: "Oddest", kind: "__proto__" },
+    ]);
+    assert.deepStrictEqual(choices.options, [{ decision: "accept", label: "Yes" }]);
+    assert.strictEqual(choices.hidden, 3);
+  });
+
+  it("offers only the agent's denials when asked to withhold approval", () => {
+    const choices = amApprovalChoices(
+      [
+        { id: "allow", label: "Yes", kind: "allow" },
+        { id: "suggestion-0", label: "Yes, always", kind: "allow_always" },
+        { id: "deny", label: "No", kind: "deny" },
+      ],
+      { denyOnly: true },
+    );
+    assert.deepStrictEqual(choices.options, [{ decision: "decline", label: "No" }]);
+    assert.deepStrictEqual([...choices.optionIds.keys()], ["decline"]);
+    assert.strictEqual(amOptionForDecision(choices.optionIds, "accept"), undefined);
+    assert.strictEqual(amOptionForDecision(choices.optionIds, "cancel"), "deny");
+    const none = amApprovalChoices([{ id: "allow", label: "Yes", kind: "allow" }], {
+      denyOnly: true,
+    });
+    assert.deepStrictEqual(none.options, []);
+    assert.strictEqual(none.optionIds.size, 0);
+  });
+});
+
+describe("amPermissionPrompt", () => {
+  const request = (input: string) => ({
+    id: "PERM1",
+    provider: "claude",
+    tool: "Bash",
+    summary: "Bash",
+    input,
+    options: [],
+    createdAt: "2026-01-01T00:00:00.000Z",
+    expiresAt: null,
+  });
+
+  it("shows a long command in full", () => {
+    const command = `echo ${"x".repeat(2_000)} && rm -rf ~`;
+    assert.deepStrictEqual(amPermissionPrompt(request(command)), {
+      prompt: `Bash\n\n${command}`,
+      truncated: false,
+    });
+  });
+
+  it("marks where it cuts an input too long for a card", () => {
+    const { prompt, truncated } = amPermissionPrompt(request("y".repeat(10_000)));
+    assert.isTrue(truncated);
+    assert.isTrue(prompt.endsWith("..."));
+    assert.isBelow(prompt.length, 10_000);
   });
 });

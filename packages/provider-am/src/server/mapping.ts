@@ -1,7 +1,17 @@
-import type { OrchestrationV2TurnItemStatus } from "@t3tools/contracts";
+import type {
+  OrchestrationV2TurnItemStatus,
+  ProviderApprovalDecision,
+  ProviderApprovalOption,
+  ProviderRequestKind,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
-import type { AmProvider, AmTranscriptEntry } from "./api.ts";
+import type {
+  AmPermissionOption,
+  AmPermissionRequest,
+  AmProvider,
+  AmTranscriptEntry,
+} from "./api.ts";
 
 /** Let am pick its configured default provider. Never sent to am. */
 export const AM_DEFAULT_MODEL = "default";
@@ -131,8 +141,18 @@ export const sameEntry = (left: AmTranscriptEntry, right: AmTranscriptEntry) =>
   left.error === right.error;
 
 const decodeFleetEvent = Schema.decodeUnknownOption(
-  Schema.fromJsonString(Schema.Struct({ agent: Schema.optional(Schema.String) })),
+  Schema.fromJsonString(
+    Schema.Struct({ agent: Schema.optional(Schema.String), event: Schema.optional(Schema.String) }),
+  ),
 );
+
+/** The agent a fleet event says raised a permission prompt. */
+export const fleetEventPromptedAgent = (data: string) => {
+  const event = decodeFleetEvent(data);
+  return event._tag === "Some" && event.value.event === "permission-request"
+    ? event.value.agent
+    : undefined;
+};
 
 /** Fleet events name the agent they concern; file-watch events name none and may concern any. */
 export const fleetEventConcerns = (data: string, agentRef: string) => {
@@ -141,4 +161,95 @@ export const fleetEventConcerns = (data: string, agentRef: string) => {
   if (parseAmAgentRef(agentRef).host !== undefined) return false;
   const event = decodeFleetEvent(data);
   return event._tag === "None" || event.value.agent === undefined || event.value.agent === agentRef;
+};
+
+// T3's approval card keys each choice by a decision, so each am option needs one of its kind's
+// slots. Codex names its options after the same decisions; Claude offers one allow-always per
+// suggestion it makes.
+const DECISION_SLOTS = new Map<string, ReadonlyArray<ProviderApprovalDecision>>([
+  ["allow", ["accept"]],
+  ["allow_always", ["acceptForSession", "acceptAlways"]],
+  ["deny", ["decline", "cancel"]],
+]);
+
+/**
+ * am's options in am's order and with am's labels, each on a decision of its kind. Options beyond
+ * their kind's slots, or of a kind T3 does not know, are left to the agent's terminal. `denyOnly`
+ * leaves every approval there too.
+ */
+export const amApprovalChoices = (
+  options: ReadonlyArray<AmPermissionOption>,
+  { denyOnly = false }: { readonly denyOnly?: boolean } = {},
+) => {
+  const assigned = new Map<AmPermissionOption, ProviderApprovalDecision>();
+  const taken = new Set<ProviderApprovalDecision>();
+  const take = (option: AmPermissionOption, decision: ProviderApprovalDecision) => {
+    assigned.set(option, decision);
+    taken.add(decision);
+  };
+  const offered = denyOnly ? options.filter((option) => option.kind === "deny") : options;
+  for (const option of offered) {
+    const named = DECISION_SLOTS.get(option.kind)?.find((decision) => decision === option.id);
+    if (named && !taken.has(named)) take(option, named);
+  }
+  for (const option of offered) {
+    if (assigned.has(option)) continue;
+    const free = DECISION_SLOTS.get(option.kind)?.find((decision) => !taken.has(decision));
+    if (free) take(option, free);
+  }
+  const shown: Array<ProviderApprovalOption> = [];
+  const optionIds = new Map<ProviderApprovalDecision, string>();
+  for (const option of options) {
+    const decision = assigned.get(option);
+    if (!decision) continue;
+    shown.push({ decision, label: option.label.trim() || option.id });
+    optionIds.set(decision, option.id);
+  }
+  return { options: shown, optionIds, hidden: options.length - shown.length };
+};
+
+/**
+ * The am option a T3 decision answers with. T3 itself declines with `cancel`, which falls back to
+ * the agent's own decline when it offers no second one.
+ */
+export const amOptionForDecision = (
+  optionIds: ReadonlyMap<ProviderApprovalDecision, string>,
+  decision: ProviderApprovalDecision,
+) =>
+  optionIds.get(decision) ??
+  (decision === "cancel"
+    ? optionIds.get("decline")
+    : decision === "decline"
+      ? optionIds.get("cancel")
+      : undefined);
+
+const FILE_CHANGE_TOOLS = /^(edit|multiedit|write|notebookedit|apply_patch)$/i;
+const FILE_READ_TOOLS = /^(read|glob|grep|ls|notebookread)$/i;
+
+export const amPermissionRequestKind = (tool: string): ProviderRequestKind =>
+  SHELL_TOOLS.test(tool)
+    ? "command"
+    : FILE_CHANGE_TOOLS.test(tool)
+      ? "file-change"
+      : FILE_READ_TOOLS.test(tool)
+        ? "file-read"
+        : "permission";
+
+const PROMPT_INPUT_LIMIT = 4_000;
+
+/** am's one-line summary, then as much of the tool's input as a card can show. */
+export const amPermissionPrompt = (request: AmPermissionRequest) => {
+  const summary = request.summary.trim() || request.tool;
+  const input =
+    request.input === undefined || request.input === null
+      ? ""
+      : typeof request.input === "string"
+        ? request.input
+        : (JSON.stringify(request.input) ?? "");
+  if (input === "" || input === "{}") return { prompt: summary, truncated: false };
+  const truncated = input.length > PROMPT_INPUT_LIMIT;
+  return {
+    prompt: `${summary}\n\n${truncated ? `${input.slice(0, PROMPT_INPUT_LIMIT - 3)}...` : input}`,
+    truncated,
+  };
 };
