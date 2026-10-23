@@ -1147,6 +1147,53 @@ describe("AmAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.live("follows the agent instead of prompting it when T3 continues a run after a restart", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, {
+        ...idleAgent([user("Fix it"), assistant("On it.")]),
+        status: "working",
+      });
+      const now = yield* DateTime.now;
+      const harness = yield* makeHarness(fake, {
+        id: ProviderThreadId.make("provider-thread-restarted"),
+        driver: ProviderDriverKind.make("am"),
+        providerInstanceId: INSTANCE_ID,
+        providerSessionId: null,
+        appThreadId: THREAD_ID,
+        ownerNodeId: null,
+        nativeThreadRef: {
+          driver: ProviderDriverKind.make("am"),
+          nativeId: AGENT,
+          strength: "strong",
+        },
+        nativeConversationHeadRef: amConversationHead(AGENT, 2),
+        status: "active",
+        firstRunOrdinal: 1,
+        lastRunOrdinal: 1,
+        handoffIds: [],
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+      const continued = yield* turnInput(harness.providerThread, "Continue where you left off.", 2);
+      yield* harness.runtime.startTurn({
+        ...continued,
+        restartContinuationOfRunId: RunId.make("run-1"),
+        message: { ...continued.message, createdBy: "agent", creationSource: "server" },
+      });
+      yield* fake.update(AGENT, (agent) => {
+        agent.entries.push(assistant("Fixed."));
+        agent.status = "idle";
+      });
+      const end = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(end.status, "completed");
+      // am's agent kept working through the restart, so nothing is sent to it or started.
+      assert.isFalse(fake.log.some((call) => call.method === "POST"));
+      assert.deepStrictEqual(harness.replies(), ["Fixed."]);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.live("resumes a stopped agent from the thread's saved name and fails when it dies", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();

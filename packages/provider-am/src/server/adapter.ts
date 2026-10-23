@@ -984,7 +984,12 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           return yield* protocolError(FULL_ACCESS_ONLY);
         const ref = agentRef;
         const head = amMirroredThrough(turnInput.providerThread.nativeConversationHeadRef, ref);
-        if (isObserveMessage(turnInput.message)) {
+        // am's agents run on without T3, so a run T3 continues after its own restart follows the
+        // agent rather than prompting it, which could also resume an agent stopped since.
+        if (
+          isObserveMessage(turnInput.message) ||
+          turnInput.restartContinuationOfRunId !== undefined
+        ) {
           const { total } = yield* fromApi(api.transcript(ref, TRANSCRIPT_END));
           return yield* begin(turnInput, {
             observe: true,
