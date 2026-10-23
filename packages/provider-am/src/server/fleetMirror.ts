@@ -24,11 +24,14 @@ import {
   AM_REMOVED_MARK,
   amConversationHead,
   amHistory,
+  amLocalPath,
   amMirroredThrough,
   amMirrorStatus,
   amWorkspace,
+  fleetHostPathHere,
   planMirror,
   type AmLiveness,
+  type AmUnsafeRootReason,
   type MirrorThreadView,
 } from "./mirrorPlan.ts";
 
@@ -58,6 +61,10 @@ export interface AmFleetMirrorOptions {
   >;
   /** Agents with a T3 turn running, which reads their transcript itself. */
   readonly busyAgents: ReadonlySet<string>;
+  /** This machine's home directory. */
+  readonly home: string;
+  /** The git toplevel of a directory on this machine; null when it is not in a repository. */
+  readonly gitRoot: (path: string) => Effect.Effect<string | null>;
   readonly intervalMs?: number;
 }
 
@@ -90,17 +97,29 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
   const observeRequested = new Map<string, { readonly at: number; readonly head?: number }>();
   /** Agents whose project has no copy here, until am reports a change to them. */
   const missingWorkspaces = new Map<string, string>();
+  /** Agents whose project root is unsafe, until am reports a change to them. */
+  const skipped = new Map<
+    string,
+    { readonly updatedAt: string; readonly reason: AmUnsafeRootReason }
+  >();
   /** Tried since the imports last caught up, so a failing agent cannot hold up the rest. */
   const triedImports = new Set<string>();
 
   /** Reports whether the agent now has a thread. */
   const adopt = Effect.fnUntraced(function* (row: AmFleetRow & { readonly ref: string }) {
     if (missingWorkspaces.get(row.ref) === row.updatedAt) return false;
-    const workspace = amWorkspace(row, host !== "");
-    if (!workspace) {
-      missingWorkspaces.set(row.ref, row.updatedAt);
+    const remote = host !== "";
+    const dirHere = remote ? fleetHostPathHere(row.dir) : row.dir;
+    const gitRoot =
+      dirHere === null || (row.worktreePath && row.repoRoot)
+        ? null
+        : yield* options.gitRoot(amLocalPath(dirHere, options.home));
+    const workspace = amWorkspace(row, { remote, home: options.home, gitRoot });
+    if (workspace._tag === "Unsafe") {
+      skipped.set(row.ref, { updatedAt: row.updatedAt, reason: workspace.reason });
       return false;
     }
+    skipped.delete(row.ref);
     const total = (yield* api.transcript(row.ref, TRANSCRIPT_END)).total;
     const tail = yield* api.transcript(row.ref, Math.max(0, total - AM_MIRROR_ENTRY_LIMIT));
     const { history, notice } = amHistory(row.ref, tail.entries, tail.total);
@@ -227,7 +246,12 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
     let tried = 0;
     let importing = 0;
     for (const row of plan.imports) {
-      if (triedImports.has(row.ref) || missingWorkspaces.get(row.ref) === row.updatedAt) continue;
+      if (
+        triedImports.has(row.ref) ||
+        missingWorkspaces.get(row.ref) === row.updatedAt ||
+        skipped.get(row.ref)?.updatedAt === row.updatedAt
+      )
+        continue;
       if (tried === IMPORTS_PER_STEP) {
         importing++;
         continue;
@@ -243,12 +267,17 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
     previousOmitted = plan.omitted;
     const refs = new Set(plan.liveness.keys());
     for (const ref of missingWorkspaces.keys()) if (!refs.has(ref)) missingWorkspaces.delete(ref);
+    for (const ref of skipped.keys()) if (!refs.has(ref)) skipped.delete(ref);
+    const skippedByReason = new Map<AmUnsafeRootReason, number>();
+    for (const { reason } of skipped.values())
+      skippedByReason.set(reason, (skippedByReason.get(reason) ?? 0) + 1);
     yield* SubscriptionRef.set(
       status,
       amMirrorStatus({
         mirrored: plan.mirrored + plan.unarchive.length + adopted,
         importing,
         missingWorkspaces: missingWorkspaces.size,
+        skipped: skippedByReason,
         host,
       }),
     );

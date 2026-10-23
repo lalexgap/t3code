@@ -7,7 +7,9 @@ import {
   AM_REMOVED_MARK,
   amConversationHead,
   amClipEntry,
+  amGitToplevel,
   amHistory,
+  amMirrorStatus,
   amWorkspace,
   fleetHostPathHere,
   planMirror,
@@ -206,6 +208,10 @@ describe("planMirror", () => {
   });
 });
 
+const HOME = "/home/me";
+const local = { remote: false, home: HOME, gitRoot: null } as const;
+const remote = { remote: true, home: HOME, gitRoot: null } as const;
+
 describe("amWorkspace", () => {
   it("puts an am worktree agent in its repository's project, bound to the worktree", () => {
     assert.deepStrictEqual(
@@ -216,28 +222,108 @@ describe("amWorkspace", () => {
           worktreeBranch: "am/wt",
           repoRoot: "/home/me/code/app",
         }),
-        false,
+        local,
       ),
       {
+        _tag: "Workspace",
         root: "/home/me/code/app",
         worktree: { path: "/home/me/.agent-manager/worktrees/app/wt", branch: "am/wt" },
       },
     );
     // An agent working in a subdirectory still binds the worktree's root.
+    const nested = amWorkspace(
+      row("nested", {
+        dir: "/home/me/repo-wt/packages/ui",
+        worktreePath: "/home/me/repo-wt",
+        repoRoot: "/home/me/repo",
+      }),
+      { ...local, gitRoot: "/home/me/repo-wt" },
+    );
+    assert.deepStrictEqual(nested, {
+      _tag: "Workspace",
+      root: "/home/me/repo",
+      worktree: { path: "/home/me/repo-wt", branch: null },
+    });
+    assert.deepStrictEqual(amWorkspace(row("plain", { dir: "/home/me/notes" }), local), {
+      _tag: "Workspace",
+      root: "/home/me/notes",
+      worktree: null,
+    });
+  });
+
+  it("groups an agent in a repository's subdirectory into the repository's project", () => {
+    assert.deepStrictEqual(
+      amWorkspace(row("ui", { dir: "/home/me/code/app/packages/ui" }), {
+        ...local,
+        gitRoot: "/home/me/code/app",
+      }),
+      { _tag: "Workspace", root: "/home/me/code/app", worktree: null },
+    );
+    // am's repository root wins over the toplevel git reports.
     assert.deepStrictEqual(
       amWorkspace(
-        row("nested", {
-          dir: "/repo-wt/packages/ui",
-          worktreePath: "/repo-wt",
-          repoRoot: "/repo",
-        }),
-        false,
-      )?.worktree?.path,
-      "/repo-wt",
+        row("ui", { dir: "/home/me/code/app/packages/ui", repoRoot: "/home/me/code/app" }),
+        local,
+      ),
+      { _tag: "Workspace", root: "/home/me/code/app", worktree: null },
     );
-    assert.deepStrictEqual(amWorkspace(row("plain", { dir: "/srv/notes" }), false), {
-      root: "/srv/notes",
-      worktree: null,
+    // A fleet host's agent groups by the repository of this machine's copy.
+    assert.deepStrictEqual(
+      amWorkspace(row("ui", { host: "laptop", dir: "/Users/alex/code/app/packages/ui" }), {
+        ...remote,
+        gitRoot: "/home/me/code/app",
+      }),
+      { _tag: "Workspace", root: "~/code/app", worktree: null },
+    );
+    // A repository at home, such as dotfiles, leaves the agent in its own directory.
+    assert.deepStrictEqual(
+      amWorkspace(row("notes", { dir: "/home/me/notes" }), { ...local, gitRoot: HOME }),
+      { _tag: "Workspace", root: "/home/me/notes", worktree: null },
+    );
+  });
+
+  it("never makes a project of the filesystem root, the home directory, or outside it", () => {
+    const unsafe = (patch: Partial<AmFleetRow>, context: Parameters<typeof amWorkspace>[1]) =>
+      amWorkspace(row("agent", patch), context);
+    assert.deepStrictEqual(unsafe({ dir: "/" }, local), {
+      _tag: "Unsafe",
+      reason: "filesystem-root",
+    });
+    assert.deepStrictEqual(unsafe({ dir: "/home/me" }, local), { _tag: "Unsafe", reason: "home" });
+    assert.deepStrictEqual(unsafe({ dir: "/home/me/" }, local), { _tag: "Unsafe", reason: "home" });
+    assert.deepStrictEqual(unsafe({ dir: "/home/me/code/.." }, local), {
+      _tag: "Unsafe",
+      reason: "home",
+    });
+    assert.deepStrictEqual(unsafe({ dir: "/srv/app" }, local), {
+      _tag: "Unsafe",
+      reason: "outside-home",
+    });
+    assert.deepStrictEqual(unsafe({ dir: "/home/meme/app" }, local), {
+      _tag: "Unsafe",
+      reason: "outside-home",
+    });
+    assert.deepStrictEqual(unsafe({ dir: "/srv/app/sub" }, { ...local, gitRoot: "/srv/app" }), {
+      _tag: "Unsafe",
+      reason: "outside-home",
+    });
+    // An am worktree of a repository at home or outside it is skipped, not moved to its directory.
+    assert.deepStrictEqual(
+      unsafe({ dir: "/home/me/wt", worktreePath: "/home/me/wt", repoRoot: "/home/me" }, local),
+      { _tag: "Unsafe", reason: "home" },
+    );
+    // The same rule holds for a fleet host's agents once mapped under this home.
+    assert.deepStrictEqual(unsafe({ host: "laptop", dir: "/Users/alex" }, remote), {
+      _tag: "Unsafe",
+      reason: "home",
+    });
+    assert.deepStrictEqual(unsafe({ host: "laptop", dir: "/srv/app" }, remote), {
+      _tag: "Unsafe",
+      reason: "outside-home",
+    });
+    assert.deepStrictEqual(unsafe({ host: "laptop", dir: "/" }, remote), {
+      _tag: "Unsafe",
+      reason: "outside-home",
     });
   });
 
@@ -256,12 +342,45 @@ describe("amWorkspace", () => {
           worktreePath: "/Users/alex/.agent-manager/worktrees/app/wt",
           repoRoot: "/Users/alex/code/app",
         }),
-        true,
+        remote,
       ),
       // That worktree is on the fleet host; a checkout here may be unrelated.
-      { root: "~/code/app", worktree: null },
+      { _tag: "Workspace", root: "~/code/app", worktree: null },
     );
-    assert.isNull(amWorkspace(row("srv", { host: "laptop", dir: "/srv/app" }), true));
+  });
+});
+
+describe("amGitToplevel", () => {
+  it("strips git's prefix from the directory as it is spelled", () => {
+    assert.strictEqual(amGitToplevel("/home/me/app/packages/ui", "packages/ui/\n"), "/home/me/app");
+    assert.strictEqual(amGitToplevel("/home/me/app/", "\n"), "/home/me/app");
+    assert.isNull(amGitToplevel("/home/me/elsewhere", "packages/ui/\n"));
+  });
+});
+
+describe("amMirrorStatus", () => {
+  it("counts the agents it skipped, with why", () => {
+    assert.strictEqual(
+      amMirrorStatus({
+        mirrored: 2,
+        missingWorkspaces: 0,
+        skipped: new Map([["outside-home", 1]]),
+        host: "",
+      }),
+      "Mirroring 2 agents. Skipped 1 agent with a project outside your home directory.",
+    );
+    assert.strictEqual(
+      amMirrorStatus({
+        mirrored: 1,
+        missingWorkspaces: 0,
+        skipped: new Map([
+          ["home", 2],
+          ["filesystem-root", 1],
+        ]),
+        host: "laptop",
+      }),
+      "Mirroring 1 agent on laptop. Skipped 3 agents with a project at your home directory (2) or at the filesystem root (1).",
+    );
   });
 });
 

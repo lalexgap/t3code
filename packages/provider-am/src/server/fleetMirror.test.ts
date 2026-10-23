@@ -90,7 +90,7 @@ const makeFakeMirror = Effect.fnUntraced(function* (
     adopt: (input) =>
       Effect.sync((): ProviderThreadMirror.ProviderThreadAdoptionResult => {
         Queue.offerUnsafe(adoptions, input);
-        if (input.workspaceRoot.startsWith("/missing"))
+        if (input.workspaceRoot.startsWith("/work/missing"))
           return { _tag: "WorkspaceMissing", workspaceRoot: input.workspaceRoot };
         bind(input.nativeThreadId, input.conversationHeadRef);
         return { _tag: "Adopted", threadId: ThreadId.make(`thread-${input.nativeThreadId}`) };
@@ -138,6 +138,8 @@ const startMirror = Effect.fnUntraced(function* (
       take: Queue.take(requests),
     },
     busyAgents: new Set(),
+    home: "/work",
+    gitRoot: () => Effect.succeed(null),
     // Only explicit wakes and am's events reconcile during a test.
     intervalMs: 3_600_000,
   });
@@ -167,7 +169,7 @@ describe("makeAmFleetMirror", () => {
       fake.agents.set("recent", agent([], { status: "exited", updatedAt: daysAgo(now, 2) }));
       fake.agents.set("old", agent([], { status: "exited", updatedAt: daysAgo(now, 30) }));
       fake.agents.set("t3-owned-abc123", agent());
-      fake.agents.set("elsewhere", agent([], { dir: "/missing/project" }));
+      fake.agents.set("elsewhere", agent([], { dir: "/work/missing/project" }));
       const mirror = yield* makeFakeMirror([{ ref: "t3-owned-abc123", head: null }]);
       const { statuses } = yield* startMirror(fake, mirror);
 

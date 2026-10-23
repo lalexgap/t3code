@@ -66,9 +66,10 @@ now; otherwise it syncs about every 30 seconds, or every minute for a fleet host
 one a second, running ones first. Provider status shows how many agents it mirrors and how many are
 still importing.
 
-- **Projects.** A new thread lands in the project for the agent's directory, which T3 Code adds if
-  you do not have it yet. An agent that am runs in a worktree of its own lands in the repository's
-  project, on that worktree and branch.
+- **Projects.** A new thread lands in the project for the agent's git repository, or its directory
+  outside one, which T3 Code adds if you do not have it yet. An agent that am runs in a worktree of
+  its own lands in the repository's project, on that worktree and branch. An agent whose project
+  would be `/`, your home directory, or outside it is skipped, and provider status counts it.
 - **Fleet hosts.** A fleet host's paths are on that machine, so T3 Code uses this machine's copy at
   the same path under your home directory, as it does for threads it starts there. A fleet host's
   worktree stays on that host, so its agent's thread uses the project, not a worktree. It never creates

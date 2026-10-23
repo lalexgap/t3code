@@ -189,23 +189,102 @@ export interface AmWorkspace {
   readonly worktree: { readonly path: string; readonly branch: string | null } | null;
 }
 
+/** Why an agent's project root is never made a T3 project. */
+export type AmUnsafeRootReason = "filesystem-root" | "home" | "outside-home";
+
+export type AmWorkspaceResult =
+  | ({ readonly _tag: "Workspace" } & AmWorkspace)
+  | { readonly _tag: "Unsafe"; readonly reason: AmUnsafeRootReason };
+
+export interface AmWorkspaceContext {
+  /** True for a fleet host's agent, whose paths are on that host. */
+  readonly remote: boolean;
+  /** This machine's home directory. */
+  readonly home: string;
+  /** The git toplevel of the agent's directory on this machine, if it is in a repository. */
+  readonly gitRoot: string | null;
+}
+
+const trimSlashes = (path: string) => (path.length > 1 ? path.replace(/\/+$/, "") : path);
+
+/** An absolute path with `.`, `..`, repeated and trailing slashes resolved. */
+const normalizePath = (path: string) => {
+  const parts: Array<string> = [];
+  for (const part of path.split("/"))
+    if (part === "..") parts.pop();
+    else if (part !== "" && part !== ".") parts.push(part);
+  return `/${parts.join("/")}`;
+};
+
+/** An absolute or `~`-relative path, absolute on this machine. */
+export const amLocalPath = (path: string, home: string) =>
+  path === "~" || path.startsWith("~/") ? `${trimSlashes(home)}${path.slice(1)}` : path;
+
 /**
- * The project an agent's thread belongs to, and the am worktree it runs in, if any. A fleet host's
- * worktree lives on that host, so its thread is never bound to a checkout here.
+ * A project root T3 must never create or bind: the filesystem root, the home directory, and
+ * anything outside it.
  */
-export const amWorkspace = (row: AmFleetRow, remote: boolean): AmWorkspace | null => {
+const amUnsafeRoot = (root: string, home: string): AmUnsafeRootReason | null => {
+  const path = normalizePath(amLocalPath(root, home));
+  const homeDir = normalizePath(home);
+  if (path === "/") return "filesystem-root";
+  if (path === homeDir) return "home";
+  return homeDir !== "/" && path.startsWith(`${homeDir}/`) ? null : "outside-home";
+};
+
+/**
+ * The project an agent's thread belongs to, and the am worktree it runs in, if any: its am
+ * worktree's repository, else the repository its directory is in, else the directory. A fleet
+ * host's worktree lives on that host, so its thread is never bound to a checkout here.
+ */
+export const amWorkspace = (row: AmFleetRow, context: AmWorkspaceContext): AmWorkspaceResult => {
+  const { remote, home } = context;
   const here = (path: string) => (remote ? fleetHostPathHere(path) : path);
+  const checked = (root: string, worktree: AmWorkspace["worktree"]): AmWorkspaceResult => {
+    const reason = amUnsafeRoot(root, home);
+    return reason ? { _tag: "Unsafe", reason } : { _tag: "Workspace", root, worktree };
+  };
   const dir = here(row.dir);
-  if (dir === null) return null;
-  if (row.worktreePath && row.repoRoot) {
-    const root = here(row.repoRoot);
-    if (root !== null)
-      return {
-        root,
-        worktree: remote ? null : { path: row.worktreePath, branch: row.worktreeBranch ?? null },
-      };
-  }
-  return { root: dir, worktree: null };
+  if (dir === null) return { _tag: "Unsafe", reason: "outside-home" };
+  const repoRoot = row.repoRoot === undefined ? null : here(row.repoRoot);
+  if (row.worktreePath && repoRoot !== null)
+    return checked(
+      repoRoot,
+      remote ? null : { path: row.worktreePath, branch: row.worktreeBranch ?? null },
+    );
+  const gitRoot =
+    context.gitRoot === null
+      ? null
+      : remote
+        ? homeRelative(context.gitRoot, home)
+        : context.gitRoot;
+  // A repository rooted at home, such as dotfiles, groups nothing: the agent keeps its directory.
+  const root = [repoRoot, gitRoot].find(
+    (candidate): candidate is string =>
+      candidate !== null && amUnsafeRoot(candidate, home) === null,
+  );
+  return checked(root ?? dir, null);
+};
+
+/**
+ * The toplevel of the repository `path` is in, from `git rev-parse --show-prefix`, spelled as
+ * `path` is so a symlinked home still matches. Null when the prefix does not end `path`.
+ */
+export const amGitToplevel = (path: string, prefix: string) => {
+  const dir = trimSlashes(path);
+  const rest = trimSlashes(prefix.trim());
+  if (rest === "") return dir;
+  return dir.endsWith(`/${rest}`) ? dir.slice(0, -rest.length - 1) || "/" : null;
+};
+
+/** A path under this machine's home as `~`-relative, as a fleet host's mapped paths are. */
+const homeRelative = (path: string, home: string) => {
+  const homeDir = trimSlashes(home);
+  return path === homeDir
+    ? "~"
+    : path.startsWith(`${homeDir}/`)
+      ? `~${path.slice(homeDir.length)}`
+      : null;
 };
 
 const clip = (text: string) =>
@@ -275,10 +354,18 @@ export const amHistory = (
   };
 };
 
+const UNSAFE_ROOT_TEXT: Record<AmUnsafeRootReason, string> = {
+  "filesystem-root": "at the filesystem root",
+  home: "at your home directory",
+  "outside-home": "outside your home directory",
+};
+
 export const amMirrorStatus = (input: {
   readonly mirrored: number;
   readonly importing?: number;
   readonly missingWorkspaces: number;
+  /** Agents left out because their project root is unsafe, by reason. */
+  readonly skipped?: ReadonlyMap<AmUnsafeRootReason, number>;
   readonly host: string;
 }) => {
   const agents = (count: number) => `${count} ${count === 1 ? "agent" : "agents"}`;
@@ -287,5 +374,16 @@ export const amMirrorStatus = (input: {
     input.missingWorkspaces > 0
       ? ` ${input.missingWorkspaces === 1 ? "1 agent works in a project" : `${input.missingWorkspaces} agents work in projects`} with no copy on this machine.`
       : "";
-  return `Mirroring ${agents(input.mirrored)}${input.host ? ` on ${input.host}` : ""}.${importing}${missing}`;
+  const reasons = [...(input.skipped ?? [])].filter(([, count]) => count > 0);
+  const skippedCount = reasons.reduce((sum, [, count]) => sum + count, 0);
+  const skipped =
+    skippedCount > 0
+      ? ` Skipped ${agents(skippedCount)} with a project ${reasons
+          .map(
+            ([reason, count]) =>
+              `${UNSAFE_ROOT_TEXT[reason]}${reasons.length > 1 ? ` (${count})` : ""}`,
+          )
+          .join(" or ")}.`
+      : "";
+  return `Mirroring ${agents(input.mirrored)}${input.host ? ` on ${input.host}` : ""}.${importing}${missing}${skipped}`;
 };
