@@ -73,6 +73,7 @@ import {
   amProviderMismatch,
   amSelectionChosen,
   amSelectionEffort,
+  amSelectionLabel,
   amSelectionTransition,
   parseAmModelSlug,
 } from "./models.ts";
@@ -1440,27 +1441,23 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
             ),
           );
         let result = yield* restart;
-        if (
-          !result.restarted &&
-          result.reason === "in_turn" &&
-          amTurnPhase(detail.status) === "gone"
-        ) {
+        const settling = (refused: typeof result) =>
+          !refused.restarted && (refused.reason === "in_turn" || refused.reason === "queued");
+        // A stopped agent's queue never drains, so retrying cannot help until it is resumed.
+        if (settling(result) && amTurnPhase(detail.status) === "gone") {
           yield* fromApi(api.resume(ref));
           const deadline = (yield* Clock.currentTimeMillis) + RESUME_IDLE_MS;
+          let started = false;
           while ((yield* Clock.currentTimeMillis) < deadline) {
             const current = Option.getOrUndefined(yield* fromApi(api.getAgent(ref)));
-            if (!current || amTurnPhase(current.status) === "idle") break;
+            const phase = current && amTurnPhase(current.status);
+            if (!phase || phase === "idle" || (started && phase === "gone")) break;
+            started ||= phase !== "gone";
             yield* Effect.sleep(host ? REMOTE_SETTLE_POLL_MS : SETTLE_POLL_MS);
           }
           result = yield* restart;
         } else
-          for (
-            let attempt = 1;
-            !result.restarted &&
-            (result.reason === "in_turn" || result.reason === "queued") &&
-            attempt < RESTART_ATTEMPTS;
-            attempt++
-          ) {
+          for (let attempt = 1; settling(result) && attempt < RESTART_ATTEMPTS; attempt++) {
             yield* Effect.sleep(RESTART_RETRY_MS);
             result = yield* restart;
           }
@@ -1532,19 +1529,20 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           );
         const selection = turnInput.modelSelection;
         let running: Pick<AmAgentDetail, "provider" | "model" | "effort"> | undefined = detail;
+        /** A pick the agent did not take, as no earlier turn shows whether the user made it. */
+        let kept: ModelSelection | undefined;
         if (detail) {
           const mismatch = amProviderMismatch(ref, detail, selection);
           if (mismatch) return yield* protocolError(mismatch);
           // Only a model picked in T3 moves the agent; otherwise the thread takes on what it runs.
-          const change = amSelectionChosen(
-            selection,
-            turnInput.providerThread.nativeMetadata?.modelSelection,
-            detail,
-          )
-            ? amModelChange(detail, selection)
-            : undefined;
-          if (change) running = { ...detail, ...(yield* restartOnModel(ref, detail, change)) };
-          else if (amTurnPhase(detail.status) === "gone") yield* fromApi(api.resume(ref));
+          const lastSent = turnInput.providerThread.nativeMetadata?.lastSentSelection;
+          const change = amModelChange(detail, selection);
+          if (change && amSelectionChosen(selection, lastSent))
+            running = { ...detail, ...(yield* restartOnModel(ref, detail, change)) };
+          else {
+            if (change && lastSent === undefined) kept = selection;
+            if (amTurnPhase(detail.status) === "gone") yield* fromApi(api.resume(ref));
+          }
         }
         let created: AmAgentDetail | undefined;
         if (!detail) {
@@ -1575,12 +1573,14 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           receiptsConfirmed = true;
         }
         const id = yield* fromApi(api.sendMessage(ref, text, "queue"));
+        const runs = running && amAgentSelection(options.instanceId, running);
         yield* begin(turnInput, {
           observe: false,
           nativeTurnId: `${ref}:${id}`,
           from: head,
           floor: 0,
-          ...(running ? { selection: amAgentSelection(options.instanceId, running) } : {}),
+          ...(runs ? { selection: runs } : {}),
+          sent: selection,
           // A new agent's detail was read before its first prompt; the run reads it again.
           ...(detail
             ? {
@@ -1591,6 +1591,15 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           messages: [
             { id, mode: "queue", state: "queued", transcriptIndex: null, shownAt: undefined },
           ],
+          ...(kept && runs
+            ? {
+                notice: {
+                  key: `model-kept:${turnInput.runId}`,
+                  title: "Model kept",
+                  message: `This thread's agent runs ${amSelectionLabel(runs)}, so it kept that model rather than switch to ${amSelectionLabel(kept)}. To switch, pick another model, then ${amSelectionLabel(kept)} again.`,
+                },
+              }
+            : {}),
         });
       });
       const begin = Effect.fnUntraced(function* (
@@ -1602,6 +1611,13 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           readonly promptsCounted?: boolean;
           /** What the agent runs, which the thread reports as its native selection. */
           readonly selection?: ModelSelection | undefined;
+          /** The selection T3 sent with the turn's prompt. */
+          readonly sent?: ModelSelection;
+          readonly notice?: {
+            readonly key: string;
+            readonly title: string;
+            readonly message: string;
+          };
         },
       ) {
         const startedAt = yield* DateTime.now;
@@ -1654,11 +1670,19 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           status: "active",
           firstRunOrdinal: thread.firstRunOrdinal ?? turnInput.runOrdinal,
           lastRunOrdinal: turnInput.runOrdinal,
-          ...(init.selection
-            ? { nativeMetadata: { ...thread.nativeMetadata, modelSelection: init.selection } }
+          ...(init.selection || init.sent
+            ? {
+                nativeMetadata: {
+                  ...thread.nativeMetadata,
+                  ...(init.selection ? { modelSelection: init.selection } : {}),
+                  ...(init.sent ? { lastSentSelection: init.sent } : {}),
+                },
+              }
             : {}),
         });
         yield* updateSession("running");
+        if (init.notice)
+          yield* emitNotice(turn, init.notice.key, init.notice.title, init.notice.message);
         Queue.offerUnsafe(wake, undefined);
       });
 

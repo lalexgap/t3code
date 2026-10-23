@@ -1636,14 +1636,38 @@ describe("AmAdapterV2", () => {
       ...(effort ? { options: [{ id: "effort", value: effort }] } : {}),
     });
     const withModels = () => makeFakeAm({ models: () => FAKE_MODEL_CATALOG });
-    /** The agent's thread, with what T3 last recorded it running. */
-    const recordedThread = Effect.fnUntraced(function* (recorded: ModelSelection | undefined) {
+    /** The agent's thread, with what T3 last recorded it running and last sent it. */
+    const recordedThread = Effect.fnUntraced(function* (
+      recorded: ModelSelection | undefined,
+      lastSent?: ModelSelection,
+    ) {
       return {
         ...(yield* importedThread(0)),
         nativeConversationHeadRef: null,
         status: "idle",
-        ...(recorded ? { nativeMetadata: { modelSelection: recorded } } : {}),
+        ...(recorded || lastSent
+          ? {
+              nativeMetadata: {
+                ...(recorded ? { modelSelection: recorded } : {}),
+                ...(lastSent ? { lastSentSelection: lastSent } : {}),
+              },
+            }
+          : {}),
       } satisfies OrchestrationV2ProviderThread;
+    });
+    /** A thread whose last turn T3 sent with the model the agent ran. */
+    const sentThread = (selection: ModelSelection) => recordedThread(selection, selection);
+    /** Runs a turn to its end and returns the thread as T3 then holds it. */
+    const finishTurn = Effect.fnUntraced(function* (
+      fake: Fake,
+      harness: Effect.Success<ReturnType<typeof makeHarness>>,
+    ) {
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      yield* deliver(fake, sent.messageId!, user("Go on"));
+      yield* complete(fake, sent.messageId!, assistant("Done."));
+      yield* harness.takeEvent("turn.terminal");
+      return harness.allEvents.findLast((event) => event.type === "provider_thread.updated")!
+        .providerThread;
     });
     const reported = (harness: Effect.Success<ReturnType<typeof makeHarness>>) =>
       harness
@@ -1701,10 +1725,7 @@ describe("AmAdapterV2", () => {
       Effect.gen(function* () {
         const fake = yield* withModels();
         fake.agents.set(AGENT, { ...idleAgent(), model: "opus", effort: "high" });
-        const harness = yield* makeHarness(
-          fake,
-          yield* recordedThread(select("claude/opus", "high")),
-        );
+        const harness = yield* makeHarness(fake, yield* sentThread(select("claude/opus", "high")));
         yield* harness.runtime.startTurn(
           yield* turnInput(harness.providerThread, "Go on", 1, select("claude/sonnet")),
         );
@@ -1720,7 +1741,7 @@ describe("AmAdapterV2", () => {
       Effect.gen(function* () {
         const fake = yield* withModels();
         fake.agents.set(AGENT, { ...idleAgent(), model: "opus", effort: null });
-        const harness = yield* makeHarness(fake, yield* recordedThread(select("claude/opus")));
+        const harness = yield* makeHarness(fake, yield* sentThread(select("claude/opus")));
         yield* harness.runtime.startTurn(
           yield* turnInput(harness.providerThread, "Go on", 1, select("claude")),
         );
@@ -1740,6 +1761,7 @@ describe("AmAdapterV2", () => {
         );
         yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
         assert.deepStrictEqual(calls(fake), ["/messages"]);
+        assert.deepStrictEqual(harness.notices(), []);
       }).pipe(Effect.scoped, Effect.provide(testLayer)),
     );
 
@@ -1754,7 +1776,7 @@ describe("AmAdapterV2", () => {
           model: "opus",
           restartRefusal: { error: `refused: ${reason}`, reason },
         });
-        const harness = yield* makeHarness(fake, yield* recordedThread(select("claude/opus")));
+        const harness = yield* makeHarness(fake, yield* sentThread(select("claude/opus")));
         const started = yield* harness.runtime
           .startTurn(yield* turnInput(harness.providerThread, "Go on", 1, select("claude/sonnet")))
           .pipe(Effect.flip);
@@ -1787,7 +1809,7 @@ describe("AmAdapterV2", () => {
       Effect.gen(function* () {
         const fake = yield* withModels();
         fake.agents.set(AGENT, { ...idleAgent(), model: "sonnet", effort: null });
-        const harness = yield* makeHarness(fake, yield* recordedThread(select("claude/opus")));
+        const harness = yield* makeHarness(fake, yield* sentThread(select("claude/opus")));
         yield* harness.runtime.startTurn(
           yield* turnInput(harness.providerThread, "Go on", 1, select("claude/opus")),
         );
@@ -1798,7 +1820,34 @@ describe("AmAdapterV2", () => {
       }).pipe(Effect.scoped, Effect.provide(testLayer)),
     );
 
-    it.live("resumes a stopped agent am refuses to restart mid-turn, then restarts it", () =>
+    it.live.each(["in_turn", "queued"] as const)(
+      "resumes a stopped agent am refuses to restart as %s, then restarts it",
+      (reason) =>
+        Effect.gen(function* () {
+          const fake = yield* withModels();
+          fake.agents.set(AGENT, {
+            ...idleAgent(),
+            status: "exited",
+            model: "opus",
+            restartRefusal: { error: `refused: ${reason}`, reason },
+          });
+          const harness = yield* makeHarness(fake, yield* sentThread(select("claude/opus")));
+          const started = yield* harness.runtime
+            .startTurn(
+              yield* turnInput(harness.providerThread, "Go on", 1, select("claude/sonnet")),
+            )
+            .pipe(Effect.forkScoped);
+          yield* fake.takeCall("POST", `/api/agents/${AGENT}/resume`);
+          yield* fake.update(AGENT, (agent) => {
+            agent.status = "idle";
+          });
+          yield* Fiber.join(started);
+          assert.deepStrictEqual(calls(fake), ["/restart", "/resume", "/restart", "/messages"]);
+          assert.strictEqual(fake.agents.get(AGENT)!.model, "sonnet");
+        }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("stops waiting on a resumed agent that stops again", () =>
       Effect.gen(function* () {
         const fake = yield* withModels();
         fake.agents.set(AGENT, {
@@ -1807,17 +1856,92 @@ describe("AmAdapterV2", () => {
           model: "opus",
           restartRefusal: { error: "refused: in_turn", reason: "in_turn" },
         });
-        const harness = yield* makeHarness(fake, yield* recordedThread(select("claude/opus")));
+        const harness = yield* makeHarness(fake, yield* sentThread(select("claude/opus")));
         const started = yield* harness.runtime
           .startTurn(yield* turnInput(harness.providerThread, "Go on", 1, select("claude/sonnet")))
-          .pipe(Effect.forkScoped);
+          .pipe(Effect.flip, Effect.forkScoped);
         yield* fake.takeCall("POST", `/api/agents/${AGENT}/resume`);
+        // The first read has answered by the time the second is made, so it saw the agent start.
+        yield* fake.takeCall("GET", `/api/agents/${AGENT}`);
+        yield* fake.takeCall("GET", `/api/agents/${AGENT}`);
         yield* fake.update(AGENT, (agent) => {
-          agent.status = "idle";
+          agent.status = "dead";
+          agent.restartRefusal = { error: "refused: in_turn", reason: "in_turn" };
         });
-        yield* Fiber.join(started);
-        assert.deepStrictEqual(calls(fake), ["/restart", "/resume", "/restart", "/messages"]);
-        assert.strictEqual(fake.agents.get(AGENT)!.model, "sonnet");
+        const failed = yield* Fiber.join(started).pipe(Effect.timeout("5 seconds"));
+        assert.include(String(failed.cause), "is busy");
+        assert.deepStrictEqual(calls(fake), ["/restart", "/resume", "/restart"]);
+        assert.strictEqual(fake.agents.get(AGENT)!.model, "opus");
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("keeps the adopted model on the next turn when the picker is unchanged", () =>
+      Effect.gen(function* () {
+        const fake = yield* withModels();
+        fake.agents.set(AGENT, { ...idleAgent(), model: "opus", effort: "high" });
+        const harness = yield* makeHarness(fake, yield* recordedThread(select("claude")));
+        yield* harness.runtime.startTurn(
+          yield* turnInput(harness.providerThread, "Go on", 1, select("claude")),
+        );
+        const adopted = yield* finishTurn(fake, harness);
+        assert.deepStrictEqual(adopted.nativeMetadata, {
+          modelSelection: select("claude/opus", "high"),
+          lastSentSelection: select("claude"),
+        });
+        const [notice] = harness.notices();
+        assert.include(notice ?? "", "runs Claude · Opus (High)");
+        assert.include(notice ?? "", "switch to Claude Code");
+
+        yield* harness.runtime.startTurn(yield* turnInput(adopted, "Go on", 2, select("claude")));
+        yield* finishTurn(fake, harness);
+        assert.deepStrictEqual(calls(fake), ["/messages", "/messages"]);
+        assert.strictEqual(fake.agents.get(AGENT)!.model, "opus");
+        assert.lengthOf(harness.notices(), 1);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("restarts an adopted agent once the picker changes", () =>
+      Effect.gen(function* () {
+        const fake = yield* withModels();
+        fake.agents.set(AGENT, { ...idleAgent(), model: "opus", effort: "high" });
+        const harness = yield* makeHarness(fake, yield* recordedThread(select("claude")));
+        yield* harness.runtime.startTurn(
+          yield* turnInput(harness.providerThread, "Go on", 1, select("claude")),
+        );
+        const adopted = yield* finishTurn(fake, harness);
+
+        yield* harness.runtime.startTurn(
+          yield* turnInput(adopted, "Go on", 2, select("claude/sonnet")),
+        );
+        const restart = yield* fake.takeCall("POST", `/api/agents/${AGENT}/restart`);
+        assert.deepStrictEqual(restart.body, { model: "sonnet", effort: null, ifIdle: true });
+        const moved = yield* finishTurn(fake, harness);
+        assert.deepStrictEqual(calls(fake), ["/messages", "/restart", "/messages"]);
+        assert.deepStrictEqual(moved.nativeMetadata, {
+          modelSelection: select("claude/sonnet"),
+          lastSentSelection: select("claude/sonnet"),
+        });
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("keeps an effort the catalog does not list though the composer rewrites it", () =>
+      Effect.gen(function* () {
+        const fake = yield* withModels();
+        fake.agents.set(AGENT, { ...idleAgent(), model: "opus", effort: "ultra" });
+        const harness = yield* makeHarness(
+          fake,
+          yield* recordedThread(select("claude/opus", "ultra")),
+        );
+        // Claude's efforts stop at max, so the composer sends its Default instead.
+        const rewritten = select("claude/opus", "default");
+        yield* harness.runtime.startTurn(
+          yield* turnInput(harness.providerThread, "Go on", 1, rewritten),
+        );
+        const adopted = yield* finishTurn(fake, harness);
+        yield* harness.runtime.startTurn(yield* turnInput(adopted, "Go on", 2, rewritten));
+        yield* finishTurn(fake, harness);
+        assert.deepStrictEqual(calls(fake), ["/messages", "/messages"]);
+        assert.strictEqual(fake.agents.get(AGENT)!.effort, "ultra");
       }).pipe(Effect.scoped, Effect.provide(testLayer)),
     );
 
@@ -1831,7 +1955,7 @@ describe("AmAdapterV2", () => {
             model: "opus",
             restartRefusal: { error: `refused: ${reason}`, reason },
           });
-          const harness = yield* makeHarness(fake, yield* recordedThread(select("claude/opus")));
+          const harness = yield* makeHarness(fake, yield* sentThread(select("claude/opus")));
           yield* harness.runtime.startTurn(
             yield* turnInput(harness.providerThread, "Go on", 1, select("claude/sonnet")),
           );
@@ -1845,7 +1969,7 @@ describe("AmAdapterV2", () => {
       Effect.gen(function* () {
         const fake = yield* withModels();
         fake.agents.set(AGENT, { ...idleAgent(), model: "opus" });
-        const harness = yield* makeHarness(fake, yield* recordedThread(select("claude/opus")));
+        const harness = yield* makeHarness(fake, yield* sentThread(select("claude/opus")));
         const started = yield* harness.runtime
           .startTurn(yield* turnInput(harness.providerThread, "Go on", 1, select("claude/nope")))
           .pipe(Effect.flip);

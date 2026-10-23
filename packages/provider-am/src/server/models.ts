@@ -222,22 +222,33 @@ export const amModelChange = (
 };
 
 /**
- * Whether a turn's selection is a model the user picked in T3. One equal to what T3 last recorded
- * the agent running, or with no record to compare, is the agent's own, even if am moved it since.
+ * Whether two selections ask for the same model and effort. The composer sends either no effort or
+ * Default for the provider's own, so both are the same ask.
+ */
+const amSameSelection = (left: ModelSelection, right: ModelSelection): boolean =>
+  left.model === right.model &&
+  (amSelectionEffort(left) ?? null) === (amSelectionEffort(right) ?? null);
+
+/**
+ * Whether a turn's selection is a model the user picked in T3: one that differs from what T3 sent
+ * the thread's last turn. The composer resends the thread's selection, so a resend is no pick, even
+ * when the agent runs another model. With nothing sent before, the agent's model stands.
  */
 export const amSelectionChosen = (
   selection: ModelSelection,
-  recorded: ModelSelection | null | undefined,
-  detail: Pick<AmAgentDetail, "model">,
-): boolean => {
-  if (!recorded) return false;
-  const { provider, model } = parseAmModelSlug(recorded.model);
-  // Threads mirrored before T3 recorded models name only the provider, whatever the agent runs.
-  if (provider === undefined || (model === null && detail.model)) return false;
-  return (
-    selection.model !== recorded.model ||
-    (amSelectionEffort(selection) ?? null) !== (amSelectionEffort(recorded) ?? null)
-  );
+  lastSent: ModelSelection | undefined,
+): boolean => lastSent !== undefined && !amSameSelection(selection, lastSent);
+
+/** A selection as the picker names it: `Claude · Opus (High)`. */
+export const amSelectionLabel = (selection: ModelSelection): string => {
+  const { provider, model } = parseAmModelSlug(selection.model);
+  const name = !provider
+    ? selection.model
+    : model
+      ? `${PROVIDER_LABELS[provider]} · ${modelName(model, undefined)}`
+      : DEFAULT_MODEL_NAMES[provider];
+  const effort = amSelectionEffort(selection);
+  return effort ? `${name} (${EFFORT_LABELS[effort] ?? capitalize(effort)})` : name;
 };
 
 export const amProviderMismatch = (

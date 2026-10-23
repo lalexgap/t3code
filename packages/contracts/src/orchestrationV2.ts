@@ -848,6 +848,8 @@ export type OrchestrationV2PendingBackgroundTask = typeof OrchestrationV2Pending
 
 export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
   modelSelection: Schema.optional(ModelSelection),
+  /** The selection T3 last sent the native thread, for adapters that tell a pick from a resend. */
+  lastSentSelection: Schema.optional(ModelSelection),
   title: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   updatedAt: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   itemIdentityVersion: Schema.optional(Schema.Literal(2)),
