@@ -1596,7 +1596,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
                 notice: {
                   key: `model-kept:${turnInput.runId}`,
                   title: "Model kept",
-                  message: `This thread's agent runs ${amSelectionLabel(runs)}, so it kept that model rather than switch to ${amSelectionLabel(kept)}. To switch, pick another model, then ${amSelectionLabel(kept)} again.`,
+                  message: `This thread's agent runs ${amSelectionLabel(runs)}, so it kept that model rather than switch to ${amSelectionLabel(kept)}. To switch it, run \`am restart <agent> --model …\` or send one message with a different model selected here.`,
                 },
               }
             : {}),
