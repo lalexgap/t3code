@@ -257,6 +257,8 @@ interface ActiveTurn {
   settleWakePending: boolean;
   /** Whether the agent's am lists its permission prompts; unknown until read once in the run. */
   permissions: "unknown" | "supported" | "unsupported";
+  /** The run's agent detail counted prompts not listed since. */
+  promptsCounted: boolean;
   /** When the agent was first seen waiting with no prompt listed, while am relays prompts. */
   attentionSince: number | undefined;
   readonly done: Deferred.Deferred<void>;
@@ -870,16 +872,28 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
        * Shows the prompts am lists for the agent and settles the ones it no longer does: answered
        * in the pane or by another client, expired, or dropped with the provider's wait.
        */
-      const syncPermissions = Effect.fnUntraced(function* (turn: ActiveTurn, ref: string) {
+      const syncPermissions = Effect.fnUntraced(function* (
+        turn: ActiveTurn,
+        ref: string,
+        status: string,
+      ) {
         if (turn.permissions === "unknown") {
           const detail = yield* api.getAgent(ref).pipe(Effect.option);
           if (detail._tag === "None") return;
-          turn.permissions =
-            Option.getOrUndefined(detail.value)?.permissionRequests === true
-              ? "supported"
-              : "unsupported";
+          const value = Option.getOrUndefined(detail.value);
+          turn.permissions = value?.permissionRequests === true ? "supported" : "unsupported";
+          turn.promptsCounted = (value?.pendingPermissions ?? 0) > 0;
         }
         if (turn.permissions !== "supported") return;
+        // A fleet host's listing is an ssh round trip, so it is read only while a prompt may be open.
+        if (
+          parseAmAgentRef(ref).host !== undefined &&
+          !turn.promptsCounted &&
+          status !== "waiting" &&
+          amTurnPhase(status) !== "attention" &&
+          pendingRequestsOf(turn).length === 0
+        )
+          return;
         const listed = yield* api.permissions(ref).pipe(
           Effect.asSome,
           Effect.catch((error) => {
@@ -892,6 +906,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           }),
         );
         if (listed._tag === "None" || active !== turn) return;
+        turn.promptsCounted = false;
         const shown = new Set(
           [...requests.values()].filter((request) => request.turn === turn).map((r) => r.amId),
         );
@@ -1153,7 +1168,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
               : finish(turn, "failed", `Agent Motel no longer has the agent ${ref}.`);
         const transcript = read.value;
         yield* applyEntries(turn, transcript.entries, transcript.total, false);
-        yield* syncPermissions(turn, ref);
+        yield* syncPermissions(turn, ref, transcript.status);
         if (active !== turn) return;
         const phase = amTurnPhase(transcript.status);
         const prompting = pendingRequestsOf(turn).length > 0;
@@ -1442,7 +1457,10 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           floor: 0,
           // A new agent's detail was not read; the run reads it once.
           ...(detail
-            ? { permissions: detail.permissionRequests ? "supported" : "unsupported" }
+            ? {
+                permissions: detail.permissionRequests ? "supported" : "unsupported",
+                promptsCounted: (detail.pendingPermissions ?? 0) > 0,
+              }
             : {}),
           messages: [
             { id, mode: "queue", state: "queued", transcriptIndex: null, shownAt: undefined },
@@ -1455,6 +1473,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           readonly nativeTurnId: string;
           readonly restartCheck?: boolean;
           readonly permissions?: ActiveTurn["permissions"];
+          readonly promptsCounted?: boolean;
         },
       ) {
         const startedAt = yield* DateTime.now;
@@ -1489,6 +1508,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           settledAt: undefined,
           settleWakePending: false,
           permissions: init.permissions ?? "unknown",
+          promptsCounted: init.promptsCounted ?? false,
           attentionSince: undefined,
           done: yield* Deferred.make<void>(),
         };

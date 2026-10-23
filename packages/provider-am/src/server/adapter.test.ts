@@ -1814,6 +1814,7 @@ describe("AmAdapterV2", () => {
         yield* deliver(fake, sent.messageId!, user("Remote job"));
         // A fleet host's prompt raises no event here; only the poll finds it.
         const amId = yield* fake.prompt(ref, CLAUDE_PROMPT, false);
+        fake.agents.get(ref)!.status = "needs-attention";
         const card = yield* harness.takeApproval();
         yield* harness.runtime.respondToRuntimeRequest({
           requestId: card.requestId,
@@ -1825,6 +1826,51 @@ describe("AmAdapterV2", () => {
             call.path === `/api/agents/${encodeURIComponent(ref)}/permissions/${amId}`,
         );
         assert.deepStrictEqual(answer?.body, { optionId: "allow" });
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("lists a fleet host's prompts only once the agent may be waiting on one", () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeAm({ permissionRequests: true });
+        const ref = `gapserver:${AGENT}`;
+        const listPath = `/api/agents/${encodeURIComponent(ref)}/permissions`;
+        const listings = () =>
+          fake.log.filter((call) => call.method === "GET" && call.path === listPath).length;
+        fake.agents.set(ref, idleAgent());
+        const remote = decodeSettings({ enabled: true, apiToken: FAKE_TOKEN, host: "gapserver" });
+        const harness = yield* makeHarness(fake, undefined, remote, 100);
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Remote job"));
+        const sent = yield* fake.takeCall(
+          "POST",
+          `/api/agents/${encodeURIComponent(ref)}/messages`,
+        );
+        yield* deliver(fake, sent.messageId!, user("Remote job"));
+        for (let read = 0; read < 3; read++) yield* fake.takeCall("GET", "/transcript");
+        // Each listing is an ssh round trip, and a working agent with none pending has no prompt.
+        assert.strictEqual(listings(), 0);
+        const amId = yield* fake.prompt(ref, CLAUDE_PROMPT, false);
+        fake.agents.get(ref)!.status = "waiting";
+        const card = yield* harness.takeApproval();
+        assert.isAbove(listings(), 0);
+        // The open card is still read, so an answer given elsewhere settles it.
+        fake.agents.get(ref)!.status = "working";
+        yield* fake.resolvePermission(amId, "stale", false);
+        yield* harness.takeApproval("completed");
+        assert.deepStrictEqual(harness.requestStates(card.requestId), ["pending", "resolved"]);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("lists a fleet host's prompt the run's agent detail already counts", () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeAm({ permissionRequests: true });
+        const ref = `gapserver:${AGENT}`;
+        fake.agents.set(ref, { ...idleAgent(), status: "working" });
+        yield* fake.prompt(ref, CLAUDE_PROMPT, false);
+        const remote = decodeSettings({ enabled: true, apiToken: FAKE_TOKEN, host: "gapserver" });
+        const harness = yield* makeHarness(fake, undefined, remote, 100);
+        yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Remote job"));
+        const card = yield* harness.takeApproval();
+        assert.strictEqual(card.title, "Bash");
       }).pipe(Effect.scoped, Effect.provide(testLayer)),
     );
 
