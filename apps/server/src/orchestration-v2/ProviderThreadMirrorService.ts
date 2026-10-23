@@ -25,6 +25,7 @@ import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ThreadLifecycleService from "./ThreadLifecycleService.ts";
+import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 
 const EVENT_PREFIX = "provider-thread-mirror";
 const HEAD_WRITE_ATTEMPTS = 3;
@@ -266,7 +267,7 @@ export const layer = Layer.effectDiscard(
           createdAt: now,
           updatedAt: now,
         };
-        const committed = yield* eventSink
+        const write = eventSink
           .write({
             unlessNativeThreadOwned: providerThread,
             events: [
@@ -306,6 +307,10 @@ export const layer = Layer.effectDiscard(
                 }),
             }),
           );
+        // Worktree removal checks ownership under this lease, so it cannot race this write.
+        const committed = yield* Option.isSome(worktreePath)
+          ? withWorkspaceLease(worktreePath.value, write)
+          : write;
         return committed.length === 0
           ? ({ _tag: "AlreadyOwned" } as const)
           : ({ _tag: "Adopted", threadId } as const);

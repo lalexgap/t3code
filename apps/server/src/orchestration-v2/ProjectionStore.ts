@@ -465,6 +465,11 @@ export interface ProjectionStoreV2Shape {
     readonly driver: string;
     readonly providerInstanceId: ProviderInstanceId;
   }) => Effect.Effect<ReadonlyArray<ProjectionProviderThreadBinding>, ProjectionStoreV2Error>;
+  /** Worktrees any thread, archived or deleted ones included, marks as another tool's. */
+  readonly getExternalWorktreePaths: () => Effect.Effect<
+    ReadonlyArray<string>,
+    ProjectionStoreV2Error
+  >;
   /** Whether any thread, archived or deleted ones included, marks this worktree as another tool's. */
   readonly isExternalWorktree: (
     worktreePath: string,
@@ -6170,20 +6175,23 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         ),
       );
 
-    const isExternalWorktree: ProjectionStoreV2Shape["isExternalWorktree"] = (worktreePath) =>
+    const getExternalWorktreePaths: ProjectionStoreV2Shape["getExternalWorktreePaths"] = () =>
       sql<{ readonly worktree_path: string }>`
         SELECT DISTINCT json_extract(payload_json, '$.worktreePath') AS worktree_path
         FROM orchestration_v2_projection_threads
         WHERE json_extract(payload_json, '$.externalWorktree') = 1
           AND json_extract(payload_json, '$.worktreePath') IS NOT NULL
       `.pipe(
-        Effect.map((rows) => {
-          const target = normalizeWorktreePathForComparison(worktreePath);
-          return rows.some(
-            (row) => normalizeWorktreePathForComparison(row.worktree_path) === target,
-          );
-        }),
+        Effect.map((rows) => rows.map((row) => row.worktree_path)),
         Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+      );
+
+    const isExternalWorktree: ProjectionStoreV2Shape["isExternalWorktree"] = (worktreePath) =>
+      getExternalWorktreePaths().pipe(
+        Effect.map((paths) => {
+          const target = normalizeWorktreePathForComparison(worktreePath);
+          return paths.some((path) => normalizeWorktreePathForComparison(path) === target);
+        }),
       );
 
     const getThreadWorktreePaths: ProjectionStoreV2Shape["getThreadWorktreePaths"] = (options) =>
@@ -6569,6 +6577,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getSettlementCandidates,
       getThreadsWithPullRequests,
       getProviderThreadBindings,
+      getExternalWorktreePaths,
       isExternalWorktree,
       getThreadWorktreePaths,
       getThreadProjection,
@@ -6739,6 +6748,16 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
                   deletedAt: thread.deletedAt,
                   active: thread.activeProviderThreadId === providerThread.id,
                 })),
+            ),
+          ),
+        ),
+      getExternalWorktreePaths: () =>
+        Ref.get(replayState).pipe(
+          Effect.map((state) =>
+            [...state.projections.values()].flatMap(({ thread }) =>
+              thread.externalWorktree === true && thread.worktreePath !== null
+                ? [thread.worktreePath]
+                : [],
             ),
           ),
         ),

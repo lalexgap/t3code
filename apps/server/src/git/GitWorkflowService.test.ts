@@ -13,7 +13,7 @@ import * as GitWorkflowService from "./GitWorkflowService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 
-const testLayer = (externalWorktrees: ReadonlyArray<string> = []) =>
+const testLayer = (externalWorktrees: Array<string> = []) =>
   GitWorkflowService.layer.pipe(
     Layer.provide(
       Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
@@ -23,7 +23,7 @@ const testLayer = (externalWorktrees: ReadonlyArray<string> = []) =>
     Layer.provide(Layer.mock(GitManager.GitManager)({})),
     Layer.provide(
       Layer.mock(ProjectionStore.ProjectionStoreV2)({
-        isExternalWorktree: (path) => Effect.succeed(externalWorktrees.includes(path)),
+        getExternalWorktreePaths: () => Effect.succeed(externalWorktrees),
       }),
     ),
     Layer.provideMerge(GitVcsDriver.layer),
@@ -71,5 +71,24 @@ it.layer(NodeServices.layer)("GitWorkflowService", (it) => {
       const attempted = yield* Effect.flip(workflow.removeWorktree({ cwd, path: "/repo/own-wt" }));
       assert.notStrictEqual(attempted.reason, "worktree_owned_elsewhere");
     }).pipe(Effect.scoped, Effect.provide(testLayer(["/repo/agent-wt"]))),
+  );
+
+  const flagged: Array<string> = [];
+  it.effect("refuses another tool's worktree reached through a symlinked parent", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const root = yield* fileSystem.realPath(
+        yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-external-alias-" }),
+      );
+      yield* fileSystem.makeDirectory(`${root}/real/repo/wt`, { recursive: true });
+      yield* fileSystem.makeDirectory(`${root}/linked`);
+      yield* fileSystem.symlink(`${root}/real/repo`, `${root}/linked/repo`);
+      flagged.push(`${root}/real/repo/wt`);
+      const workflow = yield* GitWorkflowService.GitWorkflowService;
+      const refused = yield* Effect.flip(
+        workflow.removeWorktree({ cwd: root, path: `${root}/linked/repo/wt` }),
+      );
+      assert.strictEqual(refused.reason, "worktree_owned_elsewhere");
+    }).pipe(Effect.scoped, Effect.provide(testLayer(flagged))),
   );
 });

@@ -47,6 +47,7 @@ import * as TerminalManager from "./terminal/Manager.ts";
 import { isFilesystemRoot, managedWorktreesDirectories } from "./worktreesDirectory.ts";
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
 import { removeLinkedWorktree } from "./vcs/worktreeRemoval.ts";
+import { isExternalWorktreePath } from "./workspace/externalWorktree.ts";
 import { withWorkspaceLease } from "./workspace/workspaceLease.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -738,22 +739,12 @@ const make = Effect.gen(function* () {
           JOIN projection_projects p ON p.project_id = t.project_id
           WHERE t.deleted_at IS NOT NULL
         `;
-    const decodedDeletedThreads = yield* Effect.forEach(deletedRows, (row) =>
+    const deletedThreads = (yield* Effect.forEach(deletedRows, (row) =>
       decodeCleanupThread(row.payload_json).pipe(
         Effect.map((thread) => ({ ...thread, workspaceRoot: row.workspaceRoot })),
       ),
-    );
-    const deletedThreads = decodedDeletedThreads.filter(
-      (thread) => thread.worktreePath !== null && thread.branch !== null,
-    );
+    )).filter((thread) => thread.worktreePath !== null && thread.branch !== null);
     const snapshot = yield* readThreads();
-    const externalWorktrees = new Set(
-      [...snapshot.threads, ...decodedDeletedThreads].flatMap((thread) =>
-        thread.externalWorktree && thread.worktreePath !== null
-          ? [path.resolve(thread.worktreePath)]
-          : [],
-      ),
-    );
     const refreshedDefaultRefs = new Map<string, Set<string>>();
     const defaultBranches = new Map<string, string | null>();
     const groups = Map.groupBy(
@@ -788,7 +779,9 @@ const make = Effect.gen(function* () {
       const keep = (reason: string) => entries.push({ ...entry, reason: sentence(reason) });
       yield* Effect.gen(function* () {
         if (!(yield* fs.exists(worktreePath))) return;
-        if (externalWorktrees.has(worktreePath)) return keep("worktree belongs to another tool");
+        // Read under the lease adoption also takes, so no external thread lands before removal.
+        if (yield* isExternalWorktreePath({ projections, fs, path }, worktreePath))
+          return keep("worktree belongs to another tool");
         if (deleted && !settings.worktreeOnDelete) return keep("no rules apply");
         if (group.length > 1 && worktreeOwner(group) === undefined)
           return keep(`shared by ${group.length} threads`);
