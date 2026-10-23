@@ -216,8 +216,6 @@ interface ActiveTurn {
   readonly observe: boolean;
   /** The thread's mirrored head when the turn started: later entries belong to this run. */
   from: number | undefined;
-  /** The transcript length at the last read. */
-  total: number | undefined;
   /** An observing run skips a backlog this far back rather than replaying all of it. */
   readonly floor: number;
   /** The prompt first, then any steering; the run ends when every one of them has. */
@@ -509,7 +507,6 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         total: number,
         settled: boolean,
       ) {
-        turn.total = total;
         const start = turnStart(turn);
         if (start === undefined) return;
         if (turn.from !== undefined && start > turn.from) {
@@ -992,7 +989,8 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           return yield* begin(turnInput, {
             observe: true,
             nativeTurnId: `${ref}:observe:${turnInput.runId}`,
-            from: head ?? total,
+            // A transcript shorter than the head is a new session's, so it is all new.
+            from: head === undefined ? total : head > total ? 0 : head,
             floor: total - AM_MIRROR_ENTRY_LIMIT,
             messages: [],
           });
@@ -1073,7 +1071,6 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           providerTurn,
           observe: init.observe,
           from: init.from,
-          total: undefined,
           floor: init.floor,
           messages: init.messages,
           cursor: undefined,

@@ -81,7 +81,8 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
   let previous: ReadonlyMap<string, AmLiveness> | undefined;
   /** am's `updatedAt` for each agent when T3 last compared its transcript with the thread. */
   const checkedAt = new Map<string, string>();
-  const observeRequestedAt = new Map<string, number>();
+  /** When T3 last asked to follow each agent, and the thread's head then. */
+  const observeRequested = new Map<string, { readonly at: number; readonly head?: number }>();
   /** Agents whose project has no copy here, until am reports a change to them. */
   const missingWorkspaces = new Map<string, string>();
 
@@ -126,19 +127,25 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
 
   /** Asks for a run that follows the agent when its transcript moved past the thread's head. */
   const follow = Effect.fnUntraced(function* (thread: MirrorThreadView, row: AmFleetRow) {
-    if (options.busyAgents.has(thread.ref)) return;
+    const head = amMirroredThrough(thread.head, thread.ref);
+    if (options.busyAgents.has(thread.ref)) {
+      observeRequested.delete(thread.ref);
+      return;
+    }
     const now = yield* Clock.currentTimeMillis;
-    const requested = observeRequestedAt.get(thread.ref);
-    if (requested !== undefined && now - requested < OBSERVE_RETRY_MS) return;
+    const requested = observeRequested.get(thread.ref);
+    // A moved head means the requested run already happened.
+    if (requested && requested.head === head && now - requested.at < OBSERVE_RETRY_MS) return;
     const phase = amTurnPhase(row.status);
     let moved = phase === "running" || phase === "attention";
     if (!moved && checkedAt.get(thread.ref) !== row.updatedAt) {
       const total = (yield* api.transcript(thread.ref, TRANSCRIPT_END)).total;
-      moved = total > (amMirroredThrough(thread.head, thread.ref) ?? total);
+      // Shorter than the head means a new session's transcript, which is all new.
+      moved = total !== (head ?? total);
       checkedAt.set(thread.ref, row.updatedAt);
     }
     if (!moved) return;
-    observeRequestedAt.set(thread.ref, now);
+    observeRequested.set(thread.ref, { at: now, ...(head === undefined ? {} : { head }) });
     yield* options.continuationRequests.offer({
       threadId: ThreadId.make(thread.threadId),
       providerThreadId: ProviderThreadId.make(thread.providerThreadId),
