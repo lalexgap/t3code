@@ -62,6 +62,13 @@ message starts a run in which the adapter only reads. The provider thread's
 `nativeConversationHeadRef` records how far the thread has mirrored the native transcript, so
 observing runs and T3 turns never show an entry twice.
 
+An Agent Motel agent keeps its provider, so one instance can need a new native thread for a
+selection. Its adapter plans that change as `create_with_handoff`, and the orchestrator then moves
+the run to another root provider thread of the same instance with a context handoff, as for a
+provider switch. A later selection that the earlier thread can run returns to it with a delta.
+Compare against what the native thread reports in `nativeMetadata.modelSelection`: a thread
+started on a default sentinel does not say which provider runs it.
+
 ## Setup must not happen as a health-check side effect
 
 Opening a provider session can start MCP servers, run hooks, or launch a login browser.

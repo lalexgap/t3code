@@ -23,7 +23,13 @@ import type * as Context from "effect/Context";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import { AmSettings } from "../settings.ts";
 import { makeAmApi } from "./api.ts";
-import { FAKE_TOKEN, makeFakeAm, type FakeAgent, type FakeEntry } from "./fakeAm.testkit.ts";
+import {
+  FAKE_MODEL_CATALOG,
+  FAKE_TOKEN,
+  makeFakeAm,
+  type FakeAgent,
+  type FakeEntry,
+} from "./fakeAm.testkit.ts";
 import { AmGitRootError, makeAmFleetMirror, type AmFleetMirrorOptions } from "./fleetMirror.ts";
 import { AM_MIRROR_ENTRY_LIMIT, AM_REMOVED_MARK, amConversationHead } from "./mirrorPlan.ts";
 
@@ -170,6 +176,21 @@ const turnHistory = (count: number): Array<FakeEntry> =>
   );
 
 describe("makeAmFleetMirror", () => {
+  it.effect("imports an agent on the model and effort its detail reports", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm({ models: () => FAKE_MODEL_CATALOG });
+      fake.agents.set(
+        "worker",
+        agent([], { dir: "/work/worker", provider: "codex", model: "gpt-6-luna", effort: "high" }),
+      );
+      const mirror = yield* makeFakeMirror([]);
+      yield* startMirror(fake, mirror);
+      const adoption = yield* Queue.take(mirror.adoptions);
+      assert.strictEqual(adoption.model, "codex/gpt-6-luna");
+      assert.deepStrictEqual(adoption.modelOptions, [{ id: "effort", value: "high" }]);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.effect("imports new agents with bounded history and leaves owned or aged-out ones", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();

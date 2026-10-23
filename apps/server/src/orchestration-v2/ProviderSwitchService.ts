@@ -186,7 +186,11 @@ export const layer: Layer.Layer<
                 return session.id === currentSession?.id;
               }
               if (transition.type === "create_with_handoff") {
-                return session.providerInstanceId !== targetModelSelection.instanceId;
+                // Within an instance the selection leaves the current session's provider thread.
+                return (
+                  session.providerInstanceId !== targetModelSelection.instanceId ||
+                  (!instanceChanged && session.id === currentSession?.id)
+                );
               }
               return false;
             })

@@ -225,7 +225,11 @@ export const layer = Layer.effectDiscard(
               );
         const projectId = yield* resolveProject(workspaceRoot.value);
         const now = yield* DateTime.now;
-        const modelSelection = { instanceId: input.providerInstanceId, model: input.model };
+        const modelSelection = {
+          instanceId: input.providerInstanceId,
+          model: input.model,
+          ...(input.modelOptions?.length ? { options: input.modelOptions } : {}),
+        };
         const providerThreadId = idAllocator.derive.providerThread({
           driver: input.driver,
           providerInstanceId: input.providerInstanceId,
@@ -276,6 +280,8 @@ export const layer = Layer.effectDiscard(
             strength: "strong",
           },
           nativeConversationHeadRef: input.conversationHeadRef,
+          // The thread starts on what the native thread runs, so it is also what it reports.
+          nativeMetadata: { modelSelection },
           status: "idle",
           firstRunOrdinal: null,
           lastRunOrdinal: null,

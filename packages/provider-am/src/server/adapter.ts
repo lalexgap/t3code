@@ -1,5 +1,6 @@
 import {
   ProviderDriverKind,
+  type ModelSelection,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderCapabilities,
@@ -33,11 +34,13 @@ import {
   type AmSettings,
 } from "../settings.ts";
 import type {
+  AmAgentDetail,
   AmApi,
   AmApiError,
   AmConflict,
   AmMessageReceipt,
   AmMessageState,
+  AmModelChange,
   AmPermissionRequest,
   AmTranscriptEntry,
 } from "./api.ts";
@@ -57,7 +60,6 @@ import {
   amOptionForDecision,
   amPermissionPrompt,
   amPermissionRequestKind,
-  amProviderForModel,
   amToolPresentation,
   amTurnPhase,
   fleetEventConcerns,
@@ -65,6 +67,16 @@ import {
   parseAmAgentRef,
   sameEntry,
 } from "./mapping.ts";
+import {
+  amAgentSelection,
+  amModelChange,
+  amProviderMismatch,
+  amSelectionChosen,
+  amSelectionEffort,
+  amSelectionLabel,
+  amSelectionTransition,
+  parseAmModelSlug,
+} from "./models.ts";
 
 const AM_PROVIDER = ProviderDriverKind.make("am");
 
@@ -75,6 +87,11 @@ const EVENT_RECONNECT_MS = 2_000;
 // mailbox is busy or the message's turn has not started yet; both are worth retrying.
 const CANCEL_RETRY_MS = 250;
 const CANCEL_ATTEMPTS = 40;
+// am refuses a restart until a turn T3 just saw finish has left its queue and mailbox.
+const RESTART_RETRY_MS = 250;
+const RESTART_ATTEMPTS = 20;
+// am can refuse to restart a stopped agent whose last turn never finished; resumed, it is idle.
+const RESUME_IDLE_MS = 30_000;
 // Claude flushes its session file in batches, so a turn's closing reply can reach the transcript
 // after the Stop hook has marked the receipt done. A finished turn waits this long for it.
 // Each read of a fleet host's agent is an ssh round trip, so a remote turn re-reads less often.
@@ -322,14 +339,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
     driver: AM_PROVIDER,
     getCapabilities: () => Effect.succeed(capabilities),
     planSelectionTransition: (input) =>
-      Effect.succeed(
-        input.current.model === input.target.model
-          ? { type: "apply_on_next_turn" as const }
-          : {
-              type: "reject" as const,
-              reason: "An Agent Motel agent keeps its provider. Start a new thread to change it.",
-            },
-      ),
+      Effect.succeed(amSelectionTransition(input.current, input.target)),
     openSession: Effect.fn("AmAdapterV2.openSession")(function* (
       input: ProviderAdapter.ProviderAdapterV2OpenSessionInput,
     ) {
@@ -1335,10 +1345,18 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           (existing.driver !== AM_PROVIDER || existing.providerInstanceId !== options.instanceId)
         )
           return yield* protocolError("This thread belongs to another provider instance");
+        // A provider thread T3 opened later in the thread, as for a switch to another provider,
+        // needs an agent of its own.
+        const later =
+          existing !== undefined &&
+          (existing.handoffIds.length > 0 || (existing.firstRunOrdinal ?? 1) > 1);
         const name =
           existing?.nativeThreadRef?.nativeId ??
           input.initialNativeThreadId ??
-          amAgentRef(options.settings.host, amAgentName(args.threadId, args.title));
+          amAgentRef(
+            options.settings.host,
+            amAgentName(later ? `${args.threadId}:${existing.id}` : args.threadId, args.title),
+          );
         // Capabilities follow the instance's Fleet host, so a thread whose agent lives elsewhere
         // would checkpoint the wrong copy.
         if (parseAmAgentRef(name).host !== (options.settings.host || undefined))
@@ -1398,6 +1416,60 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           resolveAttachmentPath: providerHost.resolveAttachmentPath,
         }).trim();
 
+      // am restarts only an idle agent. Sending anyway would run on a model the thread does not
+      // show, so the turn fails and says why.
+      const restartOnModel = Effect.fnUntraced(function* (
+        ref: string,
+        detail: AmAgentDetail,
+        change: AmModelChange,
+      ) {
+        const { host } = parseAmAgentRef(ref);
+        if (detail.restartModel !== true)
+          return yield* protocolError(
+            `Agent Motel${host ? ` on ${host}` : ""} cannot move an agent to another model. Update am${host ? " there" : ""}, or pick the model the agent runs.`,
+          );
+        const restart = api
+          .restart(ref, change)
+          .pipe(
+            Effect.mapError((error) =>
+              protocolError(
+                error.status === 400
+                  ? `Agent Motel refused the model change for ${ref}: ${error.detail}`
+                  : error.message,
+                error,
+              ),
+            ),
+          );
+        let result = yield* restart;
+        const settling = (refused: typeof result) =>
+          !refused.restarted && (refused.reason === "in_turn" || refused.reason === "queued");
+        // A stopped agent's queue never drains, so retrying cannot help until it is resumed.
+        if (settling(result) && amTurnPhase(detail.status) === "gone") {
+          yield* fromApi(api.resume(ref));
+          const deadline = (yield* Clock.currentTimeMillis) + RESUME_IDLE_MS;
+          let started = false;
+          while ((yield* Clock.currentTimeMillis) < deadline) {
+            const current = Option.getOrUndefined(yield* fromApi(api.getAgent(ref)));
+            const phase = current && amTurnPhase(current.status);
+            if (!phase || phase === "idle" || (started && phase === "gone")) break;
+            started ||= phase !== "gone";
+            yield* Effect.sleep(host ? REMOTE_SETTLE_POLL_MS : SETTLE_POLL_MS);
+          }
+          result = yield* restart;
+        } else
+          for (let attempt = 1; settling(result) && attempt < RESTART_ATTEMPTS; attempt++) {
+            yield* Effect.sleep(RESTART_RETRY_MS);
+            result = yield* restart;
+          }
+        if (!result.restarted)
+          return yield* protocolError(
+            result.reason === "remote_too_old"
+              ? `Agent Motel on ${host} cannot restart an agent only while it is idle. Update am there.`
+              : `The Agent Motel agent ${ref} is busy (${result.error}), so it stays on its current model. It changes models only between turns: send again once it is idle, or pick the model it runs to send now.`,
+          );
+        return { model: result.model, effort: result.effort };
+      });
+
       const start = Effect.fnUntraced(function* (
         turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
       ) {
@@ -1455,22 +1527,45 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           return yield* protocolError(
             `The Agent Motel agent ${ref} works in ${detail.dir}, not this thread's ${dir}. Start a new thread, or remove the agent with \`am rm ${ref}\`.`,
           );
-        if (detail && amTurnPhase(detail.status) === "gone") yield* fromApi(api.resume(ref));
+        const selection = turnInput.modelSelection;
+        let running: Pick<AmAgentDetail, "provider" | "model" | "effort"> | undefined = detail;
+        /** A pick the agent did not take, as no earlier turn shows whether the user made it. */
+        let kept: ModelSelection | undefined;
+        if (detail) {
+          const mismatch = amProviderMismatch(ref, detail, selection);
+          if (mismatch) return yield* protocolError(mismatch);
+          // Only a model picked in T3 moves the agent; otherwise the thread takes on what it runs.
+          const lastSent = turnInput.providerThread.nativeMetadata?.lastSentSelection;
+          const change = amModelChange(detail, selection);
+          if (change && amSelectionChosen(selection, lastSent))
+            running = { ...detail, ...(yield* restartOnModel(ref, detail, change)) };
+          else {
+            if (change && lastSent === undefined) kept = selection;
+            if (amTurnPhase(detail.status) === "gone") yield* fromApi(api.resume(ref));
+          }
+        }
+        let created: AmAgentDetail | undefined;
         if (!detail) {
-          const provider = amProviderForModel(turnInput.modelSelection.model);
+          const wanted = parseAmModelSlug(selection.model);
+          const effort = wanted.provider ? amSelectionEffort(selection) : undefined;
           // No task: am would wrap it in launch instructions and give it no receipt.
           yield* fromApi(
             api.createAgent({
               name,
               ...(host ? { host } : {}),
               dir,
-              ...(provider ? { provider } : {}),
+              ...(wanted.provider ? { provider: wanted.provider } : {}),
+              ...(wanted.model ? { model: wanted.model } : {}),
+              ...(effort ? { effort } : {}),
             }),
           );
+          // am default leaves the provider to am, so only the new agent's detail says what runs.
+          created = Option.getOrUndefined(yield* fromApi(api.getAgent(ref)));
+          running = created;
         }
         if (!receiptsConfirmed) {
           // The fleet host's own am answers the detail, so its flag covers the am that delivers.
-          const remoteDetail = detail ?? Option.getOrUndefined(yield* fromApi(api.getAgent(ref)));
+          const remoteDetail = detail ?? created;
           if (remoteDetail?.messageReceipts !== true)
             return yield* protocolError(
               `Agent Motel on ${host} does not report message receipts, which T3 Code needs to follow a turn. Update am there.`,
@@ -1478,12 +1573,15 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           receiptsConfirmed = true;
         }
         const id = yield* fromApi(api.sendMessage(ref, text, "queue"));
+        const runs = running && amAgentSelection(options.instanceId, running);
         yield* begin(turnInput, {
           observe: false,
           nativeTurnId: `${ref}:${id}`,
           from: head,
           floor: 0,
-          // A new agent's detail was not read; the run reads it once.
+          ...(runs ? { selection: runs } : {}),
+          sent: selection,
+          // A new agent's detail was read before its first prompt; the run reads it again.
           ...(detail
             ? {
                 permissions: detail.permissionRequests ? "supported" : "unsupported",
@@ -1493,6 +1591,15 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           messages: [
             { id, mode: "queue", state: "queued", transcriptIndex: null, shownAt: undefined },
           ],
+          ...(kept && runs
+            ? {
+                notice: {
+                  key: `model-kept:${turnInput.runId}`,
+                  title: "Model kept",
+                  message: `This thread's agent runs ${amSelectionLabel(runs)}, so it kept that model rather than switch to ${amSelectionLabel(kept)}. To switch it, run \`am restart <agent> --model …\` or send one message with a different model selected here.`,
+                },
+              }
+            : {}),
         });
       });
       const begin = Effect.fnUntraced(function* (
@@ -1502,6 +1609,15 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           readonly restartCheck?: boolean;
           readonly permissions?: ActiveTurn["permissions"];
           readonly promptsCounted?: boolean;
+          /** What the agent runs, which the thread reports as its native selection. */
+          readonly selection?: ModelSelection | undefined;
+          /** The selection T3 sent with the turn's prompt. */
+          readonly sent?: ModelSelection;
+          readonly notice?: {
+            readonly key: string;
+            readonly title: string;
+            readonly message: string;
+          };
         },
       ) {
         const startedAt = yield* DateTime.now;
@@ -1554,8 +1670,19 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           status: "active",
           firstRunOrdinal: thread.firstRunOrdinal ?? turnInput.runOrdinal,
           lastRunOrdinal: turnInput.runOrdinal,
+          ...(init.selection || init.sent
+            ? {
+                nativeMetadata: {
+                  ...thread.nativeMetadata,
+                  ...(init.selection ? { modelSelection: init.selection } : {}),
+                  ...(init.sent ? { lastSentSelection: init.sent } : {}),
+                },
+              }
+            : {}),
         });
         yield* updateSession("running");
+        if (init.notice)
+          yield* emitNotice(turn, init.notice.key, init.notice.title, init.notice.message);
         Queue.offerUnsafe(wake, undefined);
       });
 

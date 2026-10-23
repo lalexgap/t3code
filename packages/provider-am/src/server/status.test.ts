@@ -6,8 +6,8 @@ import * as HttpClient from "effect/http/HttpClient";
 
 import { AmSettings, isAmApiUrlAllowed } from "../settings.ts";
 import { makeAmApi } from "./api.ts";
-import { FAKE_TOKEN, makeFakeAm } from "./fakeAm.testkit.ts";
-import { checkAmProviderStatus } from "./status.ts";
+import { FAKE_MODEL_CATALOG, FAKE_TOKEN, makeFakeAm } from "./fakeAm.testkit.ts";
+import { checkAmProviderStatus, makeAmModelCatalogCache } from "./status.ts";
 
 const decodeSettings = Schema.decodeSync(AmSettings);
 
@@ -124,4 +124,66 @@ describe("checkAmProviderStatus", () => {
       assert.deepStrictEqual(fake.log, []);
     }).pipe(Effect.scoped, Effect.provide(FetchHttpClient.layer)),
   );
+
+  describe("model list", () => {
+    const withCatalog = Effect.fnUntraced(function* (
+      fake: { readonly url: string },
+      host?: string,
+    ) {
+      const settings = decodeSettings({ enabled: true, apiToken: FAKE_TOKEN, host: host ?? "" });
+      const api = makeAmApi(yield* HttpClient.HttpClient, { baseUrl: fake.url, token: FAKE_TOKEN });
+      const catalog = yield* makeAmModelCatalogCache(settings, api);
+      return { catalog, check: checkAmProviderStatus(settings, api, catalog) };
+    });
+    const slugs = (status: { readonly models: ReadonlyArray<{ readonly slug: string }> }) =>
+      status.models.map((model) => model.slug);
+
+    it.live("reads am's list once, and again only on a model refresh", () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeAm({ models: () => FAKE_MODEL_CATALOG });
+        const { catalog, check } = yield* withCatalog(fake);
+        const first = yield* check;
+        assert.include(slugs(first), "claude/opus");
+        assert.include(slugs(first), "codex/gpt-6.1-sol");
+        yield* check;
+        const reads = () => fake.log.filter((call) => call.path === "/api/models");
+        assert.lengthOf(reads(), 1);
+        yield* catalog.refresh;
+        assert.deepStrictEqual(
+          reads().map((call) => call.search),
+          [undefined, "?refresh=1"],
+        );
+      }).pipe(Effect.scoped, Effect.provide(FetchHttpClient.layer)),
+    );
+
+    it.live("keeps the provider defaults for an am without a model list", () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeAm();
+        const { catalog, check } = yield* withCatalog(fake);
+        assert.deepStrictEqual(slugs(yield* check), ["default", "claude", "codex"]);
+        assert.isFalse(fake.log.some((call) => call.path === "/api/models"));
+        // A refresh asks anyway, and its 404 keeps the defaults.
+        yield* catalog.refresh;
+        assert.deepStrictEqual(slugs(yield* check), ["default", "claude", "codex"]);
+      }).pipe(Effect.scoped, Effect.provide(FetchHttpClient.layer)),
+    );
+
+    it.live("reads a fleet host's own list", () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeAm({
+          hosts: [{ name: "gapserver", reachable: true }],
+          models: (host) =>
+            host === "gapserver"
+              ? [{ provider: "codex", models: [{ id: "gpt-6-luna", efforts: [] }], efforts: [] }]
+              : FAKE_MODEL_CATALOG,
+        });
+        const { check } = yield* withCatalog(fake, "gapserver");
+        assert.deepStrictEqual(slugs(yield* check), ["default", "codex", "codex/gpt-6-luna"]);
+        assert.deepStrictEqual(
+          fake.log.filter((call) => call.path === "/api/models").map((call) => call.search),
+          ["?host=gapserver"],
+        );
+      }).pipe(Effect.scoped, Effect.provide(FetchHttpClient.layer)),
+    );
+  });
 });
