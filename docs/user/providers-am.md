@@ -55,6 +55,25 @@ delivers it. Sending while the turn runs steers it. **Stop** withdraws a message
 delivered yet, and otherwise sends Esc to the agent only while that message's turn is running. If
 the agent's session ends mid-turn, the turn fails.
 
+## Settling and archiving
+
+Settling a thread stops its agent, so a finished agent stops holding a session. Stopping ends the
+agent's tmux session but keeps it in am, with its conversation and worktree. Unsettling starts
+nothing; your next message resumes the agent and then delivers. Archiving leaves the agent running
+unless you turn on **Stop agents when their thread is archived**. Both are in
+**Settings → Providers → Agent Motel**, per instance; turn off **Stop agents when their thread is
+settled** to keep agents running. The mobile app has no editor for these settings, so change them
+from web or desktop.
+
+An agent that is working, waiting on a prompt in its terminal, or holding scheduled work,
+background shells or queued messages is never stopped: the thread shows a note saying so, and you
+can stop it with `am stop <name>`. An agent another active thread still uses keeps running too.
+am checks again as it stops the agent, so work that reaches it in the meantime keeps it running.
+This needs a recent am, on the agent's host too; with an older one, the thread notes that the agent
+was not stopped and asks you to update am.
+The thread also notes when its agent was stopped, or had stopped already. A stopped agent keeps its
+mirrored thread; T3 Code never removes an agent.
+
 ## Mirrored agents
 
 T3 Code keeps a thread for each agent in am's fleet, including agents you start with `am new`.
@@ -105,6 +124,6 @@ taken for T3 Code's own message.
 Plan mode, forks, conversation rewind, and T3 Code's tools are not available. Switching an
 existing thread to Agent Motel passes its conversation as a handoff.
 
-Deleting or archiving a thread never stops or removes its agent. Remove an agent with
-`am rm <name>`. To stop using Agent Motel in an environment, disable it in
+Deleting a thread never stops or removes its agent, and settling or archiving one only stops it
+(see above). Remove an agent with `am rm <name>`. To stop using Agent Motel in an environment, disable it in
 **Settings → Providers**.

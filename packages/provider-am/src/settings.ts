@@ -62,8 +62,26 @@ export const AmSettings = makeProviderSettingsSchema(
         },
       }),
     ),
+    stopOnSettle: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(true)),
+      Schema.annotateKey({
+        title: "Stop agents when their thread is settled",
+        description:
+          "Ends the agent's session but keeps its conversation and worktree; your next message resumes it. An agent that is busy keeps running.",
+        providerSettingsForm: { control: "switch", clearWhenEmpty: "omit" },
+      }),
+    ),
+    stopOnArchive: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Stop agents when their thread is archived",
+        description:
+          "Ends the agent's session but keeps it in am. An agent that is busy keeps running.",
+        providerSettingsForm: { control: "switch", clearWhenEmpty: "omit" },
+      }),
+    ),
   },
-  { order: ["apiUrl", "apiToken", "host", "autoImportDays"] },
+  { order: ["apiUrl", "apiToken", "host", "autoImportDays", "stopOnSettle", "stopOnArchive"] },
 );
 export type AmSettings = typeof AmSettings.Type;
 
