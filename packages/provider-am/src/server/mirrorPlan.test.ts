@@ -392,6 +392,14 @@ describe("amWorkspace", () => {
       root: "/home/me/app",
       worktree: { path: "/home/me/wt", branch: null },
     });
+    // So is a repoRoot am spelled under the real home.
+    assert.deepStrictEqual(
+      amWorkspace(row("review", { dir: "/home/me/wt", repoRoot: "/data/me/app" }), {
+        ...linked,
+        gitRoot: { root: "/data/me/app", worktree: "/home/me/wt" },
+      }),
+      review,
+    );
     // An agent spelled by the real home keeps the real spelling.
     assert.deepStrictEqual(
       amWorkspace(row("review", { dir: "/data/me/wt" }), {

@@ -328,8 +328,16 @@ export const amWorkspace = (row: AmFleetRow, context: AmWorkspaceContext): AmWor
           (context.realHome ? homeRelative(repo.root, context.realHome) : null) ??
           repo.root)
         : repo.root;
+  // am may spell a linked worktree's repoRoot under the other home; it is still git's main root.
+  const sameRepo =
+    !remote &&
+    repo?.worktree &&
+    repoRoot !== null &&
+    gitRoot !== null &&
+    normalizePath(amRepoSpelledLike({ ...repo, root: repoRoot }, dir, context).root) ===
+      normalizePath(gitRoot);
   // A repository rooted at home, such as dotfiles, groups nothing: the agent keeps its directory.
-  const root = [repoRoot, gitRoot].find(
+  const root = [sameRepo ? null : repoRoot, gitRoot].find(
     (candidate): candidate is string =>
       candidate !== null && "root" in amSafeRoot(candidate, true, context),
   );
