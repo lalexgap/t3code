@@ -125,7 +125,6 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
     return result._tag === "Adopted";
   });
 
-  /** Asks for a run that follows the agent when its transcript moved past the thread's head. */
   const follow = Effect.fnUntraced(function* (thread: MirrorThreadView, row: AmFleetRow) {
     const head = amMirroredThrough(thread.head, thread.ref);
     if (options.busyAgents.has(thread.ref)) {

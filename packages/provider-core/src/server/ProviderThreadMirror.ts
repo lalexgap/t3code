@@ -14,19 +14,15 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 /**
- * Lets a provider whose agents also run outside T3 Code keep a T3 thread per native thread,
- * without a session open: it lists the threads bound to its instance, adopts a native thread as a
- * new thread with bounded history, and archives or restores one.
+ * Lets a provider whose agents also run outside T3 Code keep a T3 thread per native thread
+ * without a session open.
  */
 
 export interface MirroredProviderThread {
   readonly threadId: ThreadId;
   readonly providerThread: OrchestrationV2ProviderThread;
   readonly archivedAt: DateTime.Utc | null;
-  /**
-   * Deleted, or moved to another provider. It keeps its native ref, so the native thread is never
-   * adopted again, and the provider leaves it alone.
-   */
+  /** Deleted, or moved to another provider; still bound, so never adopted again. */
   readonly released: boolean;
 }
 

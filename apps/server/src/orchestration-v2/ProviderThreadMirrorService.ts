@@ -129,9 +129,8 @@ function historyEvents(input: {
 }
 
 /**
- * Serves `ProviderThreadMirror` for providers whose native threads also start outside T3 Code.
- * Adoption writes the thread, its bounded history and its provider thread in one transaction,
- * which commits nothing when another thread already owns the native thread.
+ * Adoption writes the thread, its history and its provider thread in one transaction, which
+ * commits nothing when another thread already owns the native thread.
  */
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {

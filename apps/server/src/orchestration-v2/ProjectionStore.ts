@@ -180,7 +180,6 @@ export type ProjectionThreadPullRequests = Pick<
   "id" | "projectId" | "lineage" | "settledOverride" | "settledAt" | "pullRequests"
 >;
 
-/** A provider thread bound to an app thread, with the app thread's state. */
 export interface ProjectionProviderThreadBinding {
   readonly providerThread: OrchestrationV2ProviderThread;
   readonly threadId: ThreadId;

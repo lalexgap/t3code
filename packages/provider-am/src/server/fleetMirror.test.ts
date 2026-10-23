@@ -46,7 +46,7 @@ const agent = (entries: Array<FakeEntry> = [], patch: Partial<FakeAgent> = {}): 
   ...patch,
 });
 
-/** An in-memory stand-in for the server's thread mirror, applying updates as it would. */
+/** An in-memory stand-in for the server's thread mirror. */
 const makeFakeMirror = Effect.fnUntraced(function* (
   initial: ReadonlyArray<{
     readonly ref: string;
