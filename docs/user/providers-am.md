@@ -96,8 +96,19 @@ still importing.
 ## Permissions and limitations
 
 am starts agents with their provider's own permissions, which are unrestricted unless am's
-`skipPermissions` is off. T3 Code offers only **Full access** for these threads and cannot answer an
-agent's prompts. When an agent waits on one, the thread says so; answer it in the agent's session with `am j <name>`.
+`skipPermissions` is off. T3 Code offers only **Full access** for these threads: am, not T3 Code,
+decides what an agent may do.
+
+When an agent's provider asks for permission, an am that relays prompts passes it to T3 Code, and
+the thread shows it as an approval with the provider's own choices, on any device. A mirrored
+agent's prompt shows in its **Agent Motel activity** run. Answering it answers the agent, and the
+prompt in its terminal closes. A prompt answered in the terminal, or by another client, leaves the
+thread. Claude stops waiting for an answer from am after a while (2 minutes by default) and its own
+prompt carries on in the terminal; the thread then says so. A fleet host's prompts appear within a
+few seconds.
+
+With an older am, or for a prompt am cannot relay, such as one from a Codex subagent, the thread
+says the agent is waiting; answer it in the agent's session with `am j <name>`.
 
 Leave `t3-…` agents to T3 Code: identical text typed or sent into one from outside T3 Code can be
 taken for T3 Code's own message.

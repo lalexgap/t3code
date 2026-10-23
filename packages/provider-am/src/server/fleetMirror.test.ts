@@ -316,6 +316,38 @@ describe("makeAmFleetMirror", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.live("asks for a run when an agent raises a permission prompt, whatever its status", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm({ permissionRequests: true });
+      fake.agents.set(
+        "worker",
+        agent([
+          { kind: "user", text: "Hi" },
+          { kind: "assistant", text: "Hello" },
+        ]),
+      );
+      const mirror = yield* makeFakeMirror([
+        { ref: "worker", head: amConversationHead("worker", 2) },
+      ]);
+      const { requests, statuses } = yield* startMirror(fake, mirror);
+      assert.strictEqual(yield* Queue.take(statuses), "Mirroring 1 agent.");
+      yield* fake.connected;
+      assert.strictEqual(yield* Queue.size(requests), 0);
+
+      // am still lists the agent as idle with nothing new in its transcript.
+      yield* fake.prompt("worker", {
+        tool: "Bash",
+        summary: "Bash: rm -rf tmp",
+        options: [
+          { id: "allow", label: "Yes", kind: "allow" },
+          { id: "deny", label: "No", kind: "deny" },
+        ],
+      });
+      const request = yield* Queue.take(requests);
+      assert.strictEqual(request.threadId, "thread-worker");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.effect("tries an agent again when git could not say which repository it is in", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();

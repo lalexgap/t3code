@@ -19,7 +19,12 @@ import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import type * as ProviderThreadMirror from "@t3tools/provider-core/server/ProviderThreadMirror";
 import { amAutoImportDays, isAmApiUrlAllowed, type AmSettings } from "../settings.ts";
 import type { AmApi, AmFleetRow } from "./api.ts";
-import { AM_DEFAULT_MODEL, amProviderForModel, amTurnPhase } from "./mapping.ts";
+import {
+  AM_DEFAULT_MODEL,
+  amProviderForModel,
+  amTurnPhase,
+  fleetEventPromptedAgent,
+} from "./mapping.ts";
 import {
   AM_MIRROR_ENTRY_LIMIT,
   AM_REMOVED_MARK,
@@ -125,6 +130,8 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
   >();
   /** Tried since the imports last caught up, so a failing agent cannot hold up the rest. */
   const triedImports = new Set<string>();
+  /** Agents am says raised a permission prompt since T3 last looked, whatever their status. */
+  const promptedAgents = new Set<string>();
 
   /** A local root spelled as the project for its real path is, or will be, spelled. */
   const localProjectRoot = Effect.fnUntraced(function* (root: string) {
@@ -226,6 +233,7 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
     const head = amMirroredThrough(thread.head, thread.ref);
     if (options.busyAgents.has(thread.ref)) {
       observeRequested.delete(thread.ref);
+      promptedAgents.delete(thread.ref);
       return;
     }
     const now = yield* Clock.currentTimeMillis;
@@ -233,7 +241,9 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
     // A moved head means the requested run already happened.
     if (requested && requested.head === head && now - requested.at < OBSERVE_RETRY_MS) return;
     const phase = amTurnPhase(row.status);
-    let moved = phase === "running" || phase === "attention";
+    // A run that follows the agent is what shows its prompts as approvals.
+    let moved = phase === "running" || phase === "attention" || promptedAgents.has(thread.ref);
+    promptedAgents.delete(thread.ref);
     if (!moved && checkedAt.get(thread.ref) !== row.updatedAt) {
       const total = (yield* api.transcript(thread.ref, TRANSCRIPT_END)).total;
       // Shorter than the head means a new session's transcript, which is all new.
@@ -402,7 +412,13 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
         Effect.forkScoped,
       );
       yield* api.events.pipe(
-        Stream.runForEach(() => Queue.offer(events, undefined).pipe(Effect.asVoid)),
+        Stream.runForEach((event) =>
+          Effect.suspend(() => {
+            const prompted = fleetEventPromptedAgent(event.data);
+            if (prompted) promptedAgents.add(prompted);
+            return Queue.offer(events, undefined).pipe(Effect.asVoid);
+          }),
+        ),
         Effect.catch((error) => Effect.logDebug("Agent Motel event stream ended", error)),
         Effect.andThen(Effect.sleep(EVENT_RECONNECT_MS)),
         Effect.forever,

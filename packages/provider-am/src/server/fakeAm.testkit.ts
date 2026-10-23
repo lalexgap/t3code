@@ -1,11 +1,11 @@
-// @effect-diagnostics nodeBuiltinImport:off preferSchemaOverJson:off - a raw HTTP stand-in for `am serve`, speaking plain JSON and SSE.
+// @effect-diagnostics nodeBuiltinImport:off preferSchemaOverJson:off globalDate:off - a raw HTTP stand-in for `am serve`, speaking plain JSON and SSE and expiring prompts by the wall clock as am does.
 import * as NodeHttp from "node:http";
 import type * as NodeNet from "node:net";
 
 import * as Effect from "effect/Effect";
 import * as Queue from "effect/Queue";
 
-import type { AmMessageState, AmTranscriptEntry } from "./api.ts";
+import type { AmMessageState, AmPermissionRequest, AmTranscriptEntry } from "./api.ts";
 
 export type FakeEntry = Omit<AmTranscriptEntry, "index">;
 
@@ -47,6 +47,17 @@ export interface FakeMessage {
   conflict?: { readonly error: string; readonly reason?: string };
 }
 
+export interface FakePermission {
+  readonly agent: string;
+  readonly request: AmPermissionRequest;
+  /** am's record states: `applied` once an answer reached the provider. */
+  state: "pending" | "applied" | "stale" | "expired";
+  optionId?: string;
+  resolution?: string;
+  /** The next answer gets this 409 instead, as a remote or an older am might. */
+  conflict?: { readonly error: string; readonly reason?: string };
+}
+
 export interface FakeCall {
   readonly method: string;
   readonly path: string;
@@ -63,9 +74,22 @@ export const makeFakeAm = Effect.fnUntraced(function* (
     readonly hosts?: ReadonlyArray<{ name: string; reachable: boolean }>;
     /** False plays an am from before message receipts, on health and on agent detail. */
     readonly messageReceipts?: boolean;
+    /** True plays an am that relays its agents' permission prompts; older ones have no routes. */
+    readonly permissionRequests?: boolean;
   } = {},
 ) {
   const receiptsFlag = options.messageReceipts === false ? {} : { messageReceipts: true };
+  /** Keyed by am's request id. */
+  const permissions = new Map<string, FakePermission>();
+  let permissionSeq = 0;
+  // Like am, a read is what expires a request whose deadline passed.
+  const pendingOf = (name: string) =>
+    [...permissions.values()].filter((permission) => {
+      const { expiresAt } = permission.request;
+      if (permission.state === "pending" && expiresAt && Date.parse(expiresAt) <= Date.now())
+        permission.state = "expired";
+      return permission.agent === name && permission.state === "pending";
+    });
   const calls = yield* Queue.unbounded<FakeCall>();
   /** Keyed by am address: a bare name, or `host:name` for a fleet host's agent. */
   const agents = new Map<string, FakeAgent>();
@@ -162,7 +186,38 @@ export const makeFakeAm = Effect.fnUntraced(function* (
         queue: [],
         pane: null,
         ...receiptsFlag,
+        ...(options.permissionRequests
+          ? { permissionRequests: true, pendingPermissions: pendingOf(name).length }
+          : {}),
       });
+    if (parts[2] === "permissions" && options.permissionRequests) {
+      if (parts.length === 3 && method === "GET")
+        return json(res, 200, {
+          requests: pendingOf(name).map((permission) => permission.request),
+        });
+      if (parts.length === 4 && method === "POST") {
+        const permission = permissions.get(decodeURIComponent(parts[3]!));
+        if (!permission || permission.agent !== name)
+          return json(res, 404, { error: "no permission request" });
+        const optionId = typeof body?.optionId === "string" ? body.optionId : "";
+        if (!permission.request.options.some((option) => option.id === optionId))
+          return json(res, 400, { error: "optionId must be one of the request's option ids" });
+        if (permission.conflict) {
+          const { conflict } = permission;
+          delete permission.conflict;
+          return json(res, 409, conflict);
+        }
+        if (permission.state !== "pending")
+          return json(res, 409, {
+            error: `permission request ${permission.request.id} is no longer pending`,
+            reason: permission.state === "expired" ? "expired" : "not_pending",
+          });
+        permission.state = "applied";
+        permission.optionId = optionId;
+        json(res, 200, { ok: true, id: permission.request.id, optionId });
+        return publish("permission-resolved", name);
+      }
+    }
     if (parts[2] === "transcript" && method === "GET") {
       const after = Number(url.searchParams.get("after") ?? "0");
       return json(res, 200, {
@@ -306,13 +361,16 @@ export const makeFakeAm = Effect.fnUntraced(function* (
       ),
   );
   const { port } = server.address() as NodeNet.AddressInfo;
+  function publish(event: string, agent: string) {
+    const frame = `id: 1\nevent: fleet\ndata: ${JSON.stringify({ type: "fleet", event, agent })}\n\n`;
+    for (const stream of streams) stream.write(frame);
+  }
   const update = (name: string, change: (agent: FakeAgent) => void) =>
     Effect.sync(() => {
       const agent = agents.get(name);
       if (!agent) throw new Error(`no fake agent ${name}`);
       change(agent);
-      const frame = `id: 1\nevent: fleet\ndata: ${JSON.stringify({ type: "fleet", event: "changed", agent: name })}\n\n`;
-      for (const stream of streams) stream.write(frame);
+      publish("changed", name);
     });
   return {
     url: `http://127.0.0.1:${port}`,
@@ -332,6 +390,41 @@ export const makeFakeAm = Effect.fnUntraced(function* (
         const message = messages.get(id);
         if (!message) throw new Error(`no fake message ${id}`);
         return update(message.agent, (agent) => change(message, agent));
+      }),
+    permissions,
+    /**
+     * The agent's provider raises a permission prompt, as Claude's hook or Codex's app-server
+     * would; `wake: false` records it without the event, as a fleet host's am does.
+     */
+    prompt: (
+      name: string,
+      request: Omit<AmPermissionRequest, "id" | "provider" | "createdAt" | "expiresAt"> &
+        Partial<Pick<AmPermissionRequest, "provider" | "createdAt" | "expiresAt">>,
+      wake = true,
+    ) =>
+      Effect.sync(() => {
+        const id = `PERM${String(++permissionSeq).padStart(22, "0")}`;
+        permissions.set(id, {
+          agent: name,
+          state: "pending",
+          request: {
+            provider: "claude",
+            createdAt: "2026-01-01T00:00:03.000Z",
+            expiresAt: null,
+            ...request,
+            id,
+          },
+        });
+        if (wake) publish("permission-request", name);
+        return id;
+      }),
+    /** Ends a prompt outside T3: answered in the pane (`stale`) or out of time (`expired`). */
+    resolvePermission: (id: string, state: "stale" | "expired", wake = true) =>
+      Effect.sync(() => {
+        const permission = permissions.get(id);
+        if (!permission) throw new Error(`no fake permission ${id}`);
+        permission.state = state;
+        if (wake) publish("permission-resolved", permission.agent);
       }),
     takeCall: Effect.fnUntraced(function* (method: string, suffix: string) {
       while (true) {
