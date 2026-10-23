@@ -78,7 +78,9 @@ const CANCEL_ATTEMPTS = 40;
 // Claude flushes its session file in batches, so a turn's closing reply can reach the transcript
 // after the Stop hook has marked the receipt done. A finished turn waits this long for it.
 // Each read of a fleet host's agent is an ssh round trip, so a remote turn re-reads less often.
+// am says when the reply is on disk; one it waited for in vain gets a shorter grace.
 const SETTLE_GRACE_MS = 3_000;
+const LATE_REPLY_GRACE_MS = 1_000;
 const SETTLE_POLL_MS = 200;
 const REMOTE_SETTLE_POLL_MS = 1_000;
 const isSettled = (state: AmMessageState) =>
@@ -225,6 +227,8 @@ interface TrackedMessage {
   error?: string | undefined;
   /** am ended its turn after an Esc, from T3's Stop or from anywhere else, rather than a finish. */
   interrupted?: boolean;
+  /** On a done receipt: whether am found the final reply in the transcript. */
+  transcriptComplete?: boolean | undefined;
 }
 
 const isPending = (message: TrackedMessage) =>
@@ -637,6 +641,19 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         const from = Math.max(...turn.messages.map((message) => message.transcriptIndex ?? 0));
         return last?.kind === "assistant" && last.index >= from;
       };
+      /**
+       * How long a finished turn waits for its reply. None when am saw every reply on disk, since
+       * finish reads the transcript once more; less when am already waited for one in vain.
+       */
+      const settleGrace = (turn: ActiveTurn) => {
+        const grace = options.settleGraceMs ?? SETTLE_GRACE_MS;
+        const done = turn.messages.filter((message) => message.state === "done");
+        if (done.some((message) => message.transcriptComplete === false))
+          return Math.min(grace, LATE_REPLY_GRACE_MS);
+        if (done.length > 0 && done.every((message) => message.transcriptComplete === true))
+          return 0;
+        return grace;
+      };
       const finish = Effect.fnUntraced(function* (
         turn: ActiveTurn,
         status: "completed" | "interrupted" | "cancelled" | "failed",
@@ -1004,6 +1021,8 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         message.transcriptIndex = receipt.transcriptIndex ?? message.transcriptIndex;
         message.error = receipt.error ?? message.error;
         message.interrupted = receipt.state === "done" && receipt.interrupted === true;
+        message.transcriptComplete =
+          receipt.state === "done" ? receipt.transcriptComplete : undefined;
       };
       /** Only the receipt says why a message failed, or whether a done turn was aborted. */
       const settle = Effect.fnUntraced(function* (message: TrackedMessage, state: AmMessageState) {
@@ -1197,7 +1216,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           if (!interrupted && !showsReply(turn)) {
             const now = yield* Clock.currentTimeMillis;
             turn.settledAt ??= now;
-            if (now - turn.settledAt < (options.settleGraceMs ?? SETTLE_GRACE_MS)) {
+            if (now - turn.settledAt < settleGrace(turn)) {
               if (turn.settleWakePending) return;
               turn.settleWakePending = true;
               yield* Effect.sleep(remote ? REMOTE_SETTLE_POLL_MS : SETTLE_POLL_MS).pipe(

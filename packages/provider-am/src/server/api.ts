@@ -92,6 +92,11 @@ export const AmMessageReceipt = Schema.Struct({
   error: Schema.optional(Schema.NullOr(Schema.String)),
   /** Set on a `done` receipt whose turn was aborted with Esc rather than finished. */
   interrupted: Schema.optional(Schema.Boolean),
+  /**
+   * On a `done` receipt: whether the final reply was readable in the transcript (at or after
+   * `transcriptIndex`) when am answered. Absent with no reply to check, or from an older am.
+   */
+  transcriptComplete: Schema.optional(Schema.Boolean),
 });
 export type AmMessageReceipt = typeof AmMessageReceipt.Type;
 

@@ -47,6 +47,8 @@ export interface FakeMessage {
   staysBusyAfterEsc?: boolean;
   /** On a done receipt: am ended its turn after an Esc. */
   interrupted?: boolean;
+  /** On a done receipt: whether am found the final reply in the transcript. */
+  transcriptComplete?: boolean;
   /** The next cancel or interrupt answers this 409 instead, as an older or remote am might. */
   conflict?: { readonly error: string; readonly reason?: string };
 }
@@ -279,6 +281,9 @@ export const makeFakeAm = Effect.fnUntraced(function* (
           transcriptIndex: message.transcriptIndex,
           ...(message.error ? { error: message.error } : {}),
           ...(message.state === "done" && message.interrupted ? { interrupted: true } : {}),
+          ...(message.state === "done" && message.transcriptComplete !== undefined
+            ? { transcriptComplete: message.transcriptComplete }
+            : {}),
         });
       if (method === "DELETE") {
         if (message.conflict) {
