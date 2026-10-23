@@ -181,7 +181,10 @@ export const layer = Layer.effectDiscard(
     const processEvent = (event: OrchestrationV2DomainEvent) => {
       switch (event.type) {
         case "thread.settled":
-          return report("settled", event.threadId);
+          // A repeat settle keeps the thread's updatedAt, which a restart's empty map cannot tell.
+          return DateTime.isLessThan(event.payload.updatedAt, event.occurredAt)
+            ? Effect.void
+            : report("settled", event.threadId);
         case "thread.archived":
           return report("archived", event.threadId);
         case "thread.unsettled":

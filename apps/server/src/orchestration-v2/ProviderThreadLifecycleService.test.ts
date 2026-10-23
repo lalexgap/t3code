@@ -197,6 +197,33 @@ it.effect("reports a settle once, with the agent's ref, and leaves its notice on
   ),
 );
 
+it.effect("skips a repeat settle after a restart", () =>
+  withService(({ domainEvents, changes }) =>
+    Effect.gen(function* () {
+      const threadId = yield* seedThread(ThreadId.make("thread-a"), "t3-a");
+      yield* commit(threadId, "thread.settled");
+      const later = DateTime.add(now, { minutes: 5 });
+      const thread = yield* (yield* ProjectionStore.ProjectionStoreV2).getThread(threadId);
+      yield* Queue.offer(domainEvents, {
+        id: EventId.make(`${threadId}:thread.settled:repeat`),
+        type: "thread.settled",
+        threadId,
+        providerInstanceId: thread.providerInstanceId,
+        occurredAt: later,
+        payload: thread,
+      });
+
+      const next = yield* seedThread(ThreadId.make("thread-b"), "t3-b");
+      yield* Queue.offer(
+        domainEvents,
+        yield* commit(next, "thread.settled", DateTime.add(later, { seconds: 1 })),
+      );
+      assert.strictEqual((yield* Queue.take(changes)).threadId, next);
+      assert.strictEqual(yield* Queue.size(changes), 0);
+    }),
+  ),
+);
+
 it.effect("reports an archive", () =>
   withService(({ domainEvents, changes }) =>
     Effect.gen(function* () {
