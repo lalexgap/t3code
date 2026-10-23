@@ -1237,6 +1237,34 @@ describe("AmAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.live("fails a continued run whose agent exits after a read but before replying", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, {
+        ...idleAgent([user("Fix it"), assistant("On it.")]),
+        status: "working",
+      });
+      const harness = yield* makeHarness(fake, yield* importedThread(2));
+      const continued = yield* turnInput(harness.providerThread, "Continue where you left off.", 2);
+      yield* harness.runtime.startTurn({
+        ...continued,
+        restartContinuationOfRunId: RunId.make("run-1"),
+        message: { ...continued.message, createdBy: "agent", creationSource: "server" },
+      });
+      // A tool runs, so the run has read the working agent, which then exits with no reply.
+      yield* fake.update(AGENT, (agent) => {
+        agent.entries.push({ kind: "tool", name: "Bash", input: "make" });
+      });
+      yield* harness.takeItem((item) => item.turnItem.type === "command_execution");
+      yield* fake.update(AGENT, (agent) => {
+        agent.status = "exited";
+      });
+      const end = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(end.status, "failed");
+      assert.include(end.failure?.message ?? "", "stopped while T3 Code was restarting");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.live("shows only the newest entries when the transcript outgrows one read", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();

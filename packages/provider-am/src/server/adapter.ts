@@ -225,7 +225,7 @@ interface ActiveTurn {
   from: number | undefined;
   /** An observing run skips a backlog this far back rather than replaying all of it. */
   readonly floor: number;
-  /** Continues a run T3's restart cut off: an agent gone by the first read fails it. */
+  /** Continues a run T3's restart cut off: an agent gone before it shows a reply fails it. */
   restartCheck: boolean;
   /** The prompt first, then any steering; the run ends when every one of them has. */
   readonly messages: Array<TrackedMessage>;
@@ -826,22 +826,27 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           ),
         );
         if (active !== turn) return;
-        if (turn.restartCheck) {
-          turn.restartCheck = false;
-          if (read._tag === "None" || amTurnPhase(read.value.status) === "gone")
-            return yield* finish(
-              turn,
-              "failed",
-              `The Agent Motel agent ${ref} stopped while T3 Code was restarting. Send a message to resume it.`,
-            );
-        }
+        const stoppedOnRestart = () =>
+          finish(
+            turn,
+            "failed",
+            `The Agent Motel agent ${ref} stopped while T3 Code was restarting. Send a message to resume it.`,
+          );
         if (read._tag === "None")
-          return yield* turn.observe
-            ? finish(turn, "completed")
-            : finish(turn, "failed", `Agent Motel no longer has the agent ${ref}.`);
+          return yield* turn.restartCheck
+            ? stoppedOnRestart()
+            : turn.observe
+              ? finish(turn, "completed")
+              : finish(turn, "failed", `Agent Motel no longer has the agent ${ref}.`);
         const transcript = read.value;
         yield* applyEntries(turn, transcript.entries, transcript.total, false);
         const phase = amTurnPhase(transcript.status);
+        // Until the continued run shows a reply, an agent that stops left it unfinished.
+        if (turn.restartCheck) {
+          if ([...turn.published.values()].some(({ entry }) => entry.kind === "assistant"))
+            turn.restartCheck = false;
+          else if (phase === "gone") return yield* stoppedOnRestart();
+        }
         // An observing run lasts while the agent works; a T3 turn, while its messages do.
         const observedWork = turn.observe && (phase === "running" || phase === "attention");
         // am ends a turn aborted with Esc itself, whoever pressed it (`am interrupt` included).
