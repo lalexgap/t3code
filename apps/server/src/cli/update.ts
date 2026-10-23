@@ -5,6 +5,9 @@ import {
   cliReleaseIndexPageUrl,
   cliReleaseChannelOf,
   newestCliReleaseVersion,
+  SERVER_UPDATE_DISABLED_ENV,
+  SERVER_UPDATE_DISABLED_REASON,
+  serverUpdatesDisabled,
   type CliReleaseChannel,
 } from "@t3tools/shared/cliRelease";
 import * as Console from "effect/Console";
@@ -292,7 +295,7 @@ const belongsToBootService = Effect.fn("cli.update.belongs_to_boot_service")(fun
   return false;
 });
 
-const runUpdate = Effect.fn("cli.update.run")(function* (input: {
+export const runUpdate = Effect.fn("cli.update.run")(function* (input: {
   readonly baseDir: string;
   readonly logsDir: string;
   readonly serverRuntimeStatePath: string;
@@ -301,12 +304,15 @@ const runUpdate = Effect.fn("cli.update.run")(function* (input: {
   readonly allowDowngrade: boolean;
   readonly assumeYes: boolean;
 }) {
+  const environment = yield* HostProcess.Environment;
+  if (serverUpdatesDisabled(environment[SERVER_UPDATE_DISABLED_ENV])) {
+    return yield* new CliUpdateError({ reason: SERVER_UPDATE_DISABLED_REASON });
+  }
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const runner = yield* ProcessRunner.ProcessRunner;
   const platform = yield* HostProcess.Platform;
   const arch = yield* HostProcess.Architecture;
-  const environment = yield* HostProcess.Environment;
   const httpClient = yield* HttpClient.HttpClient;
   const service = yield* BootService.BootService;
 

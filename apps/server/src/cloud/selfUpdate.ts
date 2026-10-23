@@ -23,7 +23,12 @@ import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import { HttpClient } from "effect/http";
 
-import { CLI_RELEASE_BASE_URL_ENV } from "@t3tools/shared/cliRelease";
+import {
+  CLI_RELEASE_BASE_URL_ENV,
+  SERVER_UPDATE_DISABLED_ENV,
+  SERVER_UPDATE_DISABLED_REASON,
+  serverUpdatesDisabled,
+} from "@t3tools/shared/cliRelease";
 
 import packageJson from "../../package.json" with { type: "json" };
 import * as ServerConfig from "../config.ts";
@@ -43,10 +48,19 @@ import { isExactServiceVersion, SERVICE_LAUNCHER_PROTOCOL } from "./serviceProto
 
 const PREFLIGHT_TIMEOUT = Duration.seconds(30);
 
+/** Whether this server's operator turned self-updates off, from `T3CODE_DISABLE_SERVER_UPDATE`. */
+export const serverUpdatesDisabledConfig = Config.String(SERVER_UPDATE_DISABLED_ENV).pipe(
+  Config.option,
+  Config.map((value) => serverUpdatesDisabled(Option.getOrUndefined(value))),
+);
+
+/** Null when the server cannot update itself, which clients read as "update it by hand". */
 export function resolveServerSelfUpdateCapability(input: {
   readonly desktopManaged: boolean;
   readonly launcherManaged: boolean;
+  readonly updatesDisabled?: boolean;
 }): ServerSelfUpdateCapability | null {
+  if (input.updatesDisabled === true) return null;
   if (input.desktopManaged) return "desktop-managed" as const;
   return input.launcherManaged ? ("boot-service" as const) : null;
 }
@@ -215,6 +229,7 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
   const releaseBaseUrl = Option.getOrUndefined(
     yield* Config.String(CLI_RELEASE_BASE_URL_ENV).pipe(Config.option),
   );
+  const updatesDisabled = yield* serverUpdatesDisabledConfig;
   const inFlight = yield* Ref.make(false);
 
   yield* pruneRuntimesOnStart({ baseDir: serverConfig.baseDir, managed: launcher.managed }).pipe(
@@ -231,6 +246,7 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
   const update: ServerSelfUpdate["Service"]["update"] = Effect.fn(
     "cloud.server_self_update.update",
   )(function* (input, reportProgress = () => Effect.void, onHandoffAccepted = () => Effect.void) {
+    if (updatesDisabled) return yield* failWith(SERVER_UPDATE_DISABLED_REASON);
     if (capability === "desktop-managed") {
       if (desktopAppUpdate.available) {
         return yield* desktopAppUpdate.run(reportProgress);
@@ -369,7 +385,9 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
   return ServerSelfUpdate.of({
     update,
     commitDesktopUpdate: (requestId, onHandoffAccepted) =>
-      desktopAppUpdate.commit(requestId, onHandoffAccepted),
+      updatesDisabled
+        ? Effect.fail(failWith(SERVER_UPDATE_DISABLED_REASON))
+        : desktopAppUpdate.commit(requestId, onHandoffAccepted),
   });
 });
 

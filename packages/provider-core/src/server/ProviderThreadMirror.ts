@@ -71,7 +71,7 @@ export interface ProviderThreadMirrorUpdate {
 export class ProviderThreadMirrorError extends Schema.TaggedError<ProviderThreadMirrorError>()(
   "ProviderThreadMirrorError",
   {
-    operation: Schema.Literals(["list", "adopt", "update"]),
+    operation: Schema.Literals(["list", "project-roots", "adopt", "update"]),
     detail: Schema.String,
     cause: Schema.optional(Schema.Defect()),
   },
@@ -86,6 +86,8 @@ export interface ProviderThreadMirrorHandler {
     readonly driver: ProviderDriverKind;
     readonly providerInstanceId: ProviderInstanceId;
   }) => Effect.Effect<ReadonlyArray<MirroredProviderThread>, ProviderThreadMirrorError>;
+  /** The workspace roots of this server's projects that are not deleted, as stored. */
+  readonly projectRoots: Effect.Effect<ReadonlyArray<string>, ProviderThreadMirrorError>;
   readonly adopt: (
     input: ProviderThreadAdoption,
   ) => Effect.Effect<ProviderThreadAdoptionResult, ProviderThreadMirrorError>;
@@ -114,6 +116,7 @@ export class ProviderThreadMirror extends Context.Reference<
     available: false,
     install: () => Effect.void,
     list: () => unavailable("list"),
+    projectRoots: unavailable("project-roots"),
     adopt: () => unavailable("adopt"),
     update: () => unavailable("update"),
   }),
@@ -129,6 +132,7 @@ export const layer = Layer.effect(
       install: (next: ProviderThreadMirrorHandler) =>
         Deferred.succeed(handler, next).pipe(Effect.asVoid),
       list: (binding) => installed.pipe(Effect.flatMap((live) => live.list(binding))),
+      projectRoots: installed.pipe(Effect.flatMap((live) => live.projectRoots)),
       adopt: (input) => installed.pipe(Effect.flatMap((live) => live.adopt(input))),
       update: (input) => installed.pipe(Effect.flatMap((live) => live.update(input))),
     };

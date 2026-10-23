@@ -26,6 +26,7 @@ import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as ProjectStore from "./ProjectStore.ts";
 import * as ProviderThreadMirrorService from "./ProviderThreadMirrorService.ts";
 import * as ThreadLifecycleService from "./ThreadLifecycleService.ts";
 
@@ -42,7 +43,7 @@ let overlapProjectLookups: {
 } | null = null;
 let waitingProjectLookups = 0;
 
-const stores = Layer.mergeAll(EventStore.layer, ProjectionStore.layer).pipe(
+const stores = Layer.mergeAll(EventStore.layer, ProjectionStore.layer, ProjectStore.layer).pipe(
   Layer.provideMerge(SqlitePersistence.layerMemory),
 );
 /** Runs once just before the mirror's next conditional write, to stage a race. */
@@ -484,4 +485,48 @@ it.effect("binds a worktree adopted through a symlinked path by its physical pat
     assert.strictEqual(thread.worktreePath, `${root}/real/wt`);
     assert.isTrue(thread.externalWorktree);
   }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.effect("lists the workspace roots of the projects that are not deleted", () =>
+  Effect.gen(function* () {
+    const mirror = yield* ProviderThreadMirror.ProviderThreadMirror;
+    const store = yield* ProjectStore.ProjectStoreV2;
+    const at = "2026-10-22T12:00:00.000Z";
+    const envelope = (sequence: number, projectId: ProjectId) => ({
+      sequence,
+      eventId: EventId.make(`event-project-${sequence}`),
+      aggregateKind: "project" as const,
+      aggregateId: projectId,
+      occurredAt: at,
+      commandId: null,
+      causationEventId: null,
+      correlationId: null,
+      metadata: {},
+    });
+    for (const [sequence, name] of [
+      [1, "kept"],
+      [2, "gone"],
+    ] as const) {
+      const projectId = ProjectId.make(`project-${name}`);
+      yield* store.apply({
+        ...envelope(sequence, projectId),
+        type: "project.created",
+        payload: {
+          projectId,
+          title: name,
+          workspaceRoot: `/work/${name}`,
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: at,
+          updatedAt: at,
+        },
+      });
+    }
+    yield* store.apply({
+      ...envelope(3, ProjectId.make("project-gone")),
+      type: "project.deleted",
+      payload: { projectId: ProjectId.make("project-gone"), deletedAt: at },
+    });
+    assert.deepStrictEqual(yield* mirror.projectRoots, ["/work/kept"]);
+  }).pipe(Effect.provide(testLayer)),
 );

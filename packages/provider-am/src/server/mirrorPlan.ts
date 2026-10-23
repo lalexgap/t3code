@@ -349,6 +349,46 @@ export const amWorkspace = (row: AmFleetRow, context: AmWorkspaceContext): AmWor
 };
 
 /**
+ * Spellings under home that could lead to `real`, a real path outside it: home joined with each
+ * of its trailing parts, shortest first, as `~/code/app` for `/mnt/data/code/app`.
+ */
+export const amHomeSpellings = (real: string, home: string) => {
+  const parts = normalizePath(real)
+    .split("/")
+    .filter((part) => part !== "");
+  const homeDir = normalizePath(home);
+  return parts.map((_, index) => `${homeDir}/${parts.slice(parts.length - 1 - index).join("/")}`);
+};
+
+/**
+ * The root a local agent's project is created or found under, so one directory is one project
+ * whichever symlink am spells it through: a project already at the same real path, else the root
+ * as bound when it is under home, else `homeSpelling` (a path under home that leads there), else
+ * the real path. A root whose real path is unknown is kept as bound.
+ */
+export const amProjectRoot = (input: {
+  readonly root: string;
+  readonly real: string | null;
+  readonly projects: ReadonlyArray<{ readonly root: string; readonly real: string | null }>;
+  readonly homeSpelling: string | null;
+  readonly home: string;
+  readonly realHome?: string;
+}) => {
+  const { root, real } = input;
+  if (real === null) return root;
+  const homes = [input.home, input.realHome ?? input.home].map(normalizePath);
+  const underHome = (path: string) => homes.some((home) => isUnder(normalizePath(path), home));
+  const same = input.projects.filter((project) => project.real === real);
+  const existing =
+    same.find((project) => project.root === root) ??
+    same.find((project) => underHome(project.root)) ??
+    same[0];
+  if (existing) return existing.root;
+  if (underHome(root)) return root;
+  return input.homeSpelling ?? real;
+};
+
+/**
  * The toplevel of the repository `path` is in, from `git rev-parse --show-prefix`, spelled as
  * `path` is so a symlinked home still matches. Null when the prefix does not end `path`.
  */

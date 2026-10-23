@@ -10,7 +10,9 @@ import {
   amGitRepo,
   amGitToplevel,
   amHistory,
+  amHomeSpellings,
   amMirrorStatus,
+  amProjectRoot,
   amRepoSpelledLike,
   amWorkspace,
   fleetHostPathHere,
@@ -591,6 +593,76 @@ describe("amWorkspace", () => {
       // That worktree is on the fleet host; a checkout here may be unrelated.
       { _tag: "Workspace", root: "~/code/app", worktree: null },
     );
+  });
+});
+
+describe("amProjectRoot", () => {
+  const home = "/home/me";
+  const real = "/mnt/fastdata/code/app";
+
+  it("reuses a project whose root leads to the same real path", () => {
+    const projects = [
+      { root: "/srv/other", real: "/srv/other" },
+      { root: real, real },
+      { root: "/home/me/code/app", real },
+    ];
+    // The root as bound wins among projects at one real path, then a spelling under home.
+    assert.strictEqual(
+      amProjectRoot({ root: real, real, projects, homeSpelling: null, home }),
+      real,
+    );
+    assert.strictEqual(
+      amProjectRoot({ root: "/opt/app", real, projects, homeSpelling: null, home }),
+      "/home/me/code/app",
+    );
+  });
+
+  it("creates a new project under home, else by its real path", () => {
+    const fresh = { real, projects: [], home };
+    assert.strictEqual(
+      amProjectRoot({ ...fresh, root: "/home/me/code/app", homeSpelling: null }),
+      "/home/me/code/app",
+    );
+    assert.strictEqual(
+      amProjectRoot({ ...fresh, root: real, homeSpelling: "/home/me/code/app" }),
+      "/home/me/code/app",
+    );
+    assert.strictEqual(amProjectRoot({ ...fresh, root: "/opt/app", homeSpelling: null }), real);
+  });
+
+  it("keeps a root spelled under a symlinked home, and one that cannot be resolved", () => {
+    assert.strictEqual(
+      amProjectRoot({
+        root: "/data/me/code/app",
+        real: "/data/me/code/app",
+        projects: [],
+        homeSpelling: "/home/me/code/app",
+        home,
+        realHome: "/data/me",
+      }),
+      "/data/me/code/app",
+    );
+    assert.strictEqual(
+      amProjectRoot({
+        root: "/opt/app",
+        real: null,
+        projects: [{ root: real, real }],
+        homeSpelling: null,
+        home,
+      }),
+      "/opt/app",
+    );
+  });
+});
+
+describe("amHomeSpellings", () => {
+  it("joins home with each trailing part of the real path, shortest first", () => {
+    assert.deepStrictEqual(amHomeSpellings("/mnt/fastdata/code/app/", "/home/me/"), [
+      "/home/me/app",
+      "/home/me/code/app",
+      "/home/me/fastdata/code/app",
+      "/home/me/mnt/fastdata/code/app",
+    ]);
   });
 });
 
