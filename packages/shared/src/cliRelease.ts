@@ -2,6 +2,15 @@ const CLI_RELEASE_REPOSITORY = "pingdotgg/t3code";
 export const CLI_RELEASES_PAGE_URL = `https://github.com/${CLI_RELEASE_REPOSITORY}/releases`;
 export const CLI_RELEASE_CHECKSUMS_FILE = "SHA256SUMS";
 export const CLI_RELEASE_BASE_URL_ENV = "T3CODE_RELEASE_BASE_URL";
+/** Set on a server its operator updates by other means: no client and no `t3 update` moves it. */
+export const SERVER_UPDATE_DISABLED_ENV = "T3CODE_DISABLE_SERVER_UPDATE";
+export const SERVER_UPDATE_DISABLED_REASON = `Server updates are disabled on this server (${SERVER_UPDATE_DISABLED_ENV} is set).`;
+
+/** Any value but an empty one or an explicit no disables updates, so a typo cannot allow one. */
+export function serverUpdatesDisabled(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase() ?? "";
+  return normalized !== "" && !["0", "false", "no", "off"].includes(normalized);
+}
 
 /**
  * Kept in step with the build_linux_cli matrix, build_windows_arm64_cli, and

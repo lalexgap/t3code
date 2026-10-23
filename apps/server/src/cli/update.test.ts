@@ -5,10 +5,13 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Layer from "effect/Layer";
 import { HttpClient, HttpClientResponse } from "effect/http";
 import { afterEach, vi } from "vite-plus/test";
 
-import { repointLauncher, resolveLauncherPath, resolveNewestVersion } from "./update.ts";
+import * as BootService from "../cloud/bootService.ts";
+import * as ProcessRunner from "../processRunner.ts";
+import { repointLauncher, resolveLauncherPath, resolveNewestVersion, runUpdate } from "./update.ts";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -32,6 +35,39 @@ it.effect("authenticates each release page until the requested channel is found"
     );
     assert.equal(version, "1.2.3");
     assert.deepStrictEqual(pages, ["1", "2"]);
+  }),
+);
+
+it.effect("refuses to update while server updates are disabled", () =>
+  Effect.gen(function* () {
+    const error = yield* runUpdate({
+      baseDir: "/nonexistent/t3",
+      logsDir: "/nonexistent/t3/logs",
+      serverRuntimeStatePath: "/nonexistent/t3/server-runtime.json",
+      channel: undefined,
+      requestedVersion: "1.2.3",
+      allowDowngrade: false,
+      assumeYes: true,
+    }).pipe(
+      Effect.flip,
+      Effect.provideService(HostProcess.Environment, { T3CODE_DISABLE_SERVER_UPDATE: "1" }),
+      // Nothing past the check may run: every service it would reach dies.
+      Effect.provide(
+        Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ProcessRunner.ProcessRunner)({}),
+          Layer.mock(BootService.BootService)({}),
+          Layer.succeed(
+            HttpClient.HttpClient,
+            HttpClient.make(() => Effect.die("unexpected release request")),
+          ),
+        ),
+      ),
+    );
+    assert.equal(
+      error.message,
+      "Server updates are disabled on this server (T3CODE_DISABLE_SERVER_UPDATE is set).",
+    );
   }),
 );
 

@@ -3,10 +3,12 @@ import { expect, it } from "@effect/vitest";
 import { ServerSelfUpdateError, ThreadId } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Cause from "effect/Cause";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -28,6 +30,7 @@ interface HarnessOptions {
   readonly beforeDownload?: Effect.Effect<void>;
   readonly requestUpdate?: ServiceLauncherClient.ServiceLauncherClient["Service"]["requestUpdate"];
   readonly desktopAppUpdate?: DesktopAppUpdate.DesktopAppUpdate["Service"];
+  readonly env?: Record<string, string>;
 }
 
 const archiveBytes = new TextEncoder().encode("not really a tarball");
@@ -124,7 +127,12 @@ const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
     Effect.provideService(HttpClient.HttpClient, releaseHttpClient(order, options.beforeDownload)),
     Effect.provideService(HostProcess.Platform, "linux"),
     Effect.provideService(HostProcess.Architecture, "x64"),
-    Effect.provide(ServerConfig.layer({ ...config, mode: options.mode ?? "web" })),
+    Effect.provide(
+      Layer.mergeAll(
+        ServerConfig.layer({ ...config, mode: options.mode ?? "web" }),
+        ConfigProvider.layer(ConfigProvider.fromEnv({ env: options.env ?? {} })),
+      ),
+    ),
   );
   return { selfUpdate, order };
 });
@@ -299,6 +307,34 @@ it.layer(NodeServices.layer)("server self update", (it) => {
         (yield* desktop.selfUpdate.update({ targetVersion: "1.1.0" }).pipe(Effect.flip)).reason,
       ).toContain("desktop app");
       expect([...web.order, ...desktop.order]).toEqual([]);
+    }),
+  );
+
+  it.effect("refuses every update while server updates are disabled", () =>
+    Effect.gen(function* () {
+      const env = { T3CODE_DISABLE_SERVER_UPDATE: "1" };
+      const reason =
+        "Server updates are disabled on this server (T3CODE_DISABLE_SERVER_UPDATE is set).";
+      const service = yield* makeHarness({ env });
+      expect(
+        (yield* service.selfUpdate.update({ targetVersion: "1.1.0" }).pipe(Effect.flip)).reason,
+      ).toBe(reason);
+      const desktop = yield* makeHarness({
+        env,
+        mode: "desktop",
+        desktopAppUpdate: {
+          available: true,
+          run: () => Effect.die("unexpected desktop app update run"),
+          commit: () => Effect.die("unexpected desktop app update commit"),
+        },
+      });
+      expect(
+        (yield* desktop.selfUpdate.update({ targetVersion: "1.1.0" }).pipe(Effect.flip)).reason,
+      ).toBe(reason);
+      expect(
+        (yield* desktop.selfUpdate.commitDesktopUpdate("desktop-token").pipe(Effect.flip)).reason,
+      ).toBe(reason);
+      expect([...service.order, ...desktop.order]).toEqual([]);
     }),
   );
 

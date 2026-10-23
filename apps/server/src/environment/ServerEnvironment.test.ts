@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ORCHESTRATION_PROTOCOL_VERSION } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -122,6 +123,38 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
       }
     }),
   );
+  it.effect("advertises no self-update while server updates are disabled", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const baseDir = yield* fs.makeTempDirectoryScoped();
+      const config = yield* makeServerConfig(baseDir);
+      yield* fs.makeDirectory(config.stateDir, { recursive: true });
+      const descriptor = yield* Effect.gen(function* () {
+        const environment = yield* ServerEnvironment.ServerEnvironment;
+        return yield* environment.getDescriptor;
+      }).pipe(
+        Effect.provide(
+          ServerEnvironment.layer.pipe(
+            Layer.provide(layerEmptySecretStore),
+            Layer.provide(
+              ServerConfig.layer({ ...config, mode: "desktop", desktopTelemetryControlFd: 3 }),
+            ),
+            Layer.provide(
+              ConfigProvider.layer(
+                ConfigProvider.fromEnv({ env: { T3CODE_DISABLE_SERVER_UPDATE: "1" } }),
+              ),
+            ),
+          ),
+        ),
+        Effect.provideService(HostProcess.Platform, "linux"),
+        Effect.provideService(HostProcess.Environment, {}),
+      );
+      expect(descriptor.capabilities.serverSelfUpdate).toBeUndefined();
+      expect(descriptor.capabilities.serverSelfUpdateProgress).toBeUndefined();
+      expect(descriptor.capabilities.desktopAppUpdate).toBeUndefined();
+    }),
+  );
+
   it.effect.each([
     { name: "missing", content: undefined },
     { name: "empty", content: "" },
