@@ -1265,6 +1265,46 @@ describe("AmAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.live("withdraws a steer queued on a continued run when its agent stops", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, {
+        ...idleAgent([user("Fix it"), assistant("On it.")]),
+        status: "working",
+      });
+      const harness = yield* makeHarness(fake, yield* importedThread(2));
+      const continued = yield* turnInput(harness.providerThread, "Continue where you left off.", 2);
+      yield* harness.runtime.startTurn({
+        ...continued,
+        restartContinuationOfRunId: RunId.make("run-1"),
+        message: { ...continued.message, createdBy: "agent", creationSource: "server" },
+      });
+      const started = yield* harness.takeEvent("provider_turn.updated");
+      yield* harness.runtime.steerTurn({
+        threadId: THREAD_ID,
+        runId: continued.runId,
+        providerThread: harness.providerThread,
+        providerTurnId: started.providerTurn.id,
+        message: {
+          messageId: MessageId.make("steer-after-restart"),
+          text: "Also run the tests",
+          attachments: [],
+          createdBy: "user",
+          creationSource: "web",
+        },
+      });
+      const sent = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      yield* fake.update(AGENT, (agent) => {
+        agent.status = "exited";
+      });
+      yield* fake.takeCall("DELETE", `/api/agents/${AGENT}/messages/${sent.messageId}`);
+      const end = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(end.status, "failed");
+      assert.include(end.failure?.message ?? "", "stopped while T3 Code was restarting");
+      assert.strictEqual(fake.messages.get(sent.messageId!)?.state, "cancelled");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.live("shows only the newest entries when the transcript outgrows one read", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();

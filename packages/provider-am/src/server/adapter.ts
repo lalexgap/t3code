@@ -826,11 +826,18 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           ),
         );
         if (active !== turn) return;
+        // Withdraws a steer still queued, as the gone branch does, so a resume does not run it
+        // outside any run.
         const stoppedOnRestart = () =>
-          finish(
-            turn,
-            "failed",
-            `The Agent Motel agent ${ref} stopped while T3 Code was restarting. Send a message to resume it.`,
+          withdraw(turn).pipe(
+            Effect.ignore,
+            Effect.andThen(
+              finish(
+                turn,
+                "failed",
+                `The Agent Motel agent ${ref} stopped while T3 Code was restarting. Send a message to resume it.`,
+              ),
+            ),
           );
         if (read._tag === "None")
           return yield* turn.restartCheck
