@@ -35,7 +35,8 @@ export const makeAmThreadLifecycle = (
       const detail = yield* api.getAgent(ref);
       if (Option.isNone(detail)) return null;
       const phase = amTurnPhase(detail.value.status);
-      if (phase === "gone") return null;
+      // Noted so a repeat settle after a restart cannot stop an agent the user resumed since.
+      if (phase === "gone") return `The Agent Motel agent ${ref} had already stopped.`;
       if (phase === "running") return busy("is working");
       if (phase === "attention") return busy("is waiting on a prompt in its terminal");
       if (detail.value.status === "waiting") return busy("has scheduled or background work");

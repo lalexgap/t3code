@@ -175,11 +175,14 @@ describe("makeAmThreadLifecycle", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
-  it.live("says nothing for an agent that is already stopped or gone", () =>
+  it.live("notes an agent that already stopped, and says nothing for one am removed", () =>
     Effect.gen(function* () {
       const { fake, lifecycle, stops } = yield* setup();
       fake.agents.set(AGENT, agent("exited"));
-      assert.isNull(yield* lifecycle(change()));
+      assert.strictEqual(
+        yield* lifecycle(change()),
+        `The Agent Motel agent ${AGENT} had already stopped.`,
+      );
       assert.isNull(yield* lifecycle(change({ nativeThreadId: "t3-removed-abc123" })));
       assert.deepStrictEqual(stops(), []);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
