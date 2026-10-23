@@ -33,6 +33,8 @@ import * as ProjectStore from "./ProjectStore.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as ProviderContinuationService from "./ProviderContinuationService.ts";
+import * as ProviderThreadMirror from "@t3tools/provider-core/server/ProviderThreadMirror";
+import * as ProviderThreadMirrorService from "./ProviderThreadMirrorService.ts";
 import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationService.ts";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
@@ -301,6 +303,19 @@ const layerProviderContinuationWorkerProvided = ProviderContinuationService.laye
     ),
   ),
 );
+const layerProviderThreadMirrorProvided = ProviderThreadMirrorService.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      // Same layer reference as the adapter infrastructure, so drivers reach this handler.
+      ProviderThreadMirror.layer,
+      ProjectionStore.layer,
+      layerEventSinkProvided,
+      layerProjectService,
+      layerThreadLifecycleProvided,
+      IdAllocator.layer,
+    ),
+  ),
+);
 const layerThreadTitleRegenerationProvided = ThreadTitleRegenerationService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(layerThreadManagementProvided, ProjectStore.layer, TextGeneration.layer),
@@ -377,6 +392,7 @@ export const layerProduction = Layer.mergeAll(
     ),
   ),
   layerProviderContinuationWorkerProvided,
+  layerProviderThreadMirrorProvided,
   layerAgentSessionImporterProvided,
   EffectOutbox.layerPruneWorker.pipe(Layer.provide(EffectOutbox.layer)),
 ).pipe(

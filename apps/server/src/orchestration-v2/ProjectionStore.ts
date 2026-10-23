@@ -180,6 +180,16 @@ export type ProjectionThreadPullRequests = Pick<
   "id" | "projectId" | "lineage" | "settledOverride" | "settledAt" | "pullRequests"
 >;
 
+/** A provider thread bound to an app thread, with the app thread's state. */
+export interface ProjectionProviderThreadBinding {
+  readonly providerThread: OrchestrationV2ProviderThread;
+  readonly threadId: ThreadId;
+  readonly archivedAt: DateTime.Utc | null;
+  readonly deletedAt: DateTime.Utc | null;
+  /** Whether the app thread still runs on this provider thread rather than another one. */
+  readonly active: boolean;
+}
+
 export type ProjectionSettlementCandidate = Pick<
   OrchestrationV2ThreadShell,
   | "id"
@@ -451,6 +461,10 @@ export interface ProjectionStoreV2Shape {
   readonly getThreadsWithPullRequests: (
     threadId?: ThreadId,
   ) => Effect.Effect<ReadonlyArray<ProjectionThreadPullRequests>, ProjectionStoreV2Error>;
+  readonly getProviderThreadBindings: (input: {
+    readonly driver: string;
+    readonly providerInstanceId: ProviderInstanceId;
+  }) => Effect.Effect<ReadonlyArray<ProjectionProviderThreadBinding>, ProjectionStoreV2Error>;
   readonly getThreadWorktreePaths: (options?: {
     readonly includeArchived?: boolean;
   }) => Effect.Effect<
@@ -6108,6 +6122,48 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
       );
 
+    const getProviderThreadBindings: ProjectionStoreV2Shape["getProviderThreadBindings"] = (
+      input,
+    ) =>
+      sql<{
+        readonly payload_json: string;
+        readonly thread_id: string;
+        readonly archived_at: string | null;
+        readonly deleted_at: string | null;
+        readonly active_provider_thread_id: string | null;
+      }>`
+        SELECT
+          provider_threads.payload_json AS payload_json,
+          threads.thread_id AS thread_id,
+          json_extract(threads.payload_json, '$.archivedAt') AS archived_at,
+          threads.deleted_at AS deleted_at,
+          json_extract(threads.payload_json, '$.activeProviderThreadId') AS active_provider_thread_id
+        FROM orchestration_v2_projection_provider_threads AS provider_threads
+        JOIN orchestration_v2_projection_threads AS threads
+          ON threads.thread_id = provider_threads.thread_id
+        WHERE provider_threads.driver = ${input.driver}
+          AND provider_threads.provider_instance_id = ${input.providerInstanceId}
+      `.pipe(
+        Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+        Effect.flatMap((rows) =>
+          Effect.forEach(rows, (row) =>
+            decodeProviderThreadPayload(row.payload_json).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProjectionStoreReadError({ threadId: ThreadId.make(row.thread_id), cause }),
+              ),
+              Effect.map((providerThread): ProjectionProviderThreadBinding => ({
+                providerThread,
+                threadId: ThreadId.make(row.thread_id),
+                archivedAt: row.archived_at === null ? null : DateTime.makeUnsafe(row.archived_at),
+                deletedAt: row.deleted_at === null ? null : DateTime.makeUnsafe(row.deleted_at),
+                active: row.active_provider_thread_id === providerThread.id,
+              })),
+            ),
+          ),
+        ),
+      );
+
     const getThreadWorktreePaths: ProjectionStoreV2Shape["getThreadWorktreePaths"] = (options) =>
       sql<{ readonly thread_id: string; readonly worktree_path: string }>`
         SELECT thread_id, json_extract(payload_json, '$.worktreePath') AS worktree_path
@@ -6490,6 +6546,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getThread,
       getSettlementCandidates,
       getThreadsWithPullRequests,
+      getProviderThreadBindings,
       getThreadWorktreePaths,
       getThreadProjection,
       getTurnStartContext,
@@ -6641,6 +6698,27 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
             );
         },
       ),
+      getProviderThreadBindings: (input) =>
+        Ref.get(replayState).pipe(
+          Effect.map((state) =>
+            [...state.projections.values()].flatMap(({ thread, providerThreads }) =>
+              providerThreads
+                .filter(
+                  (providerThread) =>
+                    providerThread.appThreadId === thread.id &&
+                    providerThread.driver === input.driver &&
+                    providerThread.providerInstanceId === input.providerInstanceId,
+                )
+                .map((providerThread): ProjectionProviderThreadBinding => ({
+                  providerThread,
+                  threadId: thread.id,
+                  archivedAt: thread.archivedAt,
+                  deletedAt: thread.deletedAt,
+                  active: thread.activeProviderThreadId === providerThread.id,
+                })),
+            ),
+          ),
+        ),
       getThreadWorktreePaths: (options) =>
         Ref.get(replayState).pipe(
           Effect.map((state) =>

@@ -7,6 +7,7 @@ import * as CursorSdk from "@t3tools/provider-cursor/server/CursorSdk";
 import * as CursorKeychain from "@t3tools/provider-cursor/server/CursorKeychain";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import * as ProviderThreadMirror from "@t3tools/provider-core/server/ProviderThreadMirror";
 
 export type ProviderOrchestrationAdapterInfrastructure =
   | ClaudeAdapterV2.ClaudeAgentSdkQueryRunner
@@ -19,7 +20,8 @@ export type ProviderOrchestrationAdapterInfrastructure =
 /**
  * `providerContinuationRequestsLayer` must be the same layer reference the
  * orchestration runtime provides to its continuation worker so Effect layer
- * memoization yields one shared queue.
+ * memoization yields one shared queue. The thread mirror layer is shared the
+ * same way with the service that installs its handler.
  */
 export const layer = Layer.mergeAll(
   ClaudeAdapterV2.layerQueryRunner,
@@ -28,4 +30,5 @@ export const layer = Layer.mergeAll(
   CursorKeychain.layer,
   IdAllocator.layer,
   ProviderContinuationRequests.layer,
+  ProviderThreadMirror.layer,
 );
