@@ -36,9 +36,8 @@ const doneAt = (event: LifecycleEvent, thread: OrchestrationV2AppThread) => {
 };
 
 /**
- * Reports each committed settle and archive to the provider instance whose native thread the
- * thread runs on. The thread.settled event covers every way in: the sidebar, MCP tools, and
- * automatic settlement all dispatch thread.settle.
+ * Reports each committed settle and archive to the provider instance owning the thread's native
+ * thread. thread.settled covers the sidebar, MCP tools and automatic settlement alike.
  */
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {

@@ -14,9 +14,8 @@ export interface AmThreadLifecycleOptions {
 }
 
 /**
- * Stops a thread's agent once the user settles it, or archives it when that is on. Stopping only
- * ends the agent's tmux session: am keeps it, so the next message resumes it. An agent at work,
- * including on something T3 did not send, keeps running.
+ * Stops a settled (or, when enabled, archived) thread's agent. Stopping only ends its tmux session;
+ * the next message resumes it. A busy agent keeps running, even on work T3 did not send.
  */
 export const makeAmThreadLifecycle = (
   options: AmThreadLifecycleOptions,
