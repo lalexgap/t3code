@@ -7,9 +7,11 @@ import {
   AM_REMOVED_MARK,
   amConversationHead,
   amClipEntry,
+  amGitRepo,
   amGitToplevel,
   amHistory,
   amMirrorStatus,
+  amRepoSpelledLike,
   amWorkspace,
   fleetHostPathHere,
   planMirror,
@@ -237,7 +239,7 @@ describe("amWorkspace", () => {
         worktreePath: "/home/me/repo-wt",
         repoRoot: "/home/me/repo",
       }),
-      { ...local, gitRoot: "/home/me/repo-wt" },
+      { ...local, gitRoot: { root: "/home/me/repo-wt", worktree: null } },
     );
     assert.deepStrictEqual(nested, {
       _tag: "Workspace",
@@ -255,7 +257,7 @@ describe("amWorkspace", () => {
     assert.deepStrictEqual(
       amWorkspace(row("ui", { dir: "/home/me/code/app/packages/ui" }), {
         ...local,
-        gitRoot: "/home/me/code/app",
+        gitRoot: { root: "/home/me/code/app", worktree: null },
       }),
       { _tag: "Workspace", root: "/home/me/code/app", worktree: null },
     );
@@ -271,20 +273,24 @@ describe("amWorkspace", () => {
     assert.deepStrictEqual(
       amWorkspace(row("ui", { host: "laptop", dir: "/Users/alex/code/app/packages/ui" }), {
         ...remote,
-        gitRoot: "/home/me/code/app",
+        gitRoot: { root: "/home/me/code/app", worktree: null },
       }),
       { _tag: "Workspace", root: "~/code/app", worktree: null },
     );
     // A repository at home, such as dotfiles, leaves the agent in its own directory.
     assert.deepStrictEqual(
-      amWorkspace(row("notes", { dir: "/home/me/notes" }), { ...local, gitRoot: HOME }),
+      amWorkspace(row("notes", { dir: "/home/me/notes" }), {
+        ...local,
+        gitRoot: { root: HOME, worktree: null },
+      }),
       { _tag: "Workspace", root: "/home/me/notes", worktree: null },
     );
   });
 
-  it("never makes a project of the filesystem root, the home directory, or outside it", () => {
+  it("never makes a project of the filesystem root, the home directory, or a non-git folder outside it", () => {
     const unsafe = (patch: Partial<AmFleetRow>, context: Parameters<typeof amWorkspace>[1]) =>
       amWorkspace(row("agent", patch), context);
+    const repo = (root: string) => ({ root, worktree: null });
     assert.deepStrictEqual(unsafe({ dir: "/" }, local), {
       _tag: "Unsafe",
       reason: "filesystem-root",
@@ -297,34 +303,272 @@ describe("amWorkspace", () => {
     });
     assert.deepStrictEqual(unsafe({ dir: "/srv/app" }, local), {
       _tag: "Unsafe",
-      reason: "outside-home",
+      reason: "non-git-outside-home",
     });
     assert.deepStrictEqual(unsafe({ dir: "/home/meme/app" }, local), {
       _tag: "Unsafe",
-      reason: "outside-home",
+      reason: "non-git-outside-home",
     });
-    assert.deepStrictEqual(unsafe({ dir: "/srv/app/sub" }, { ...local, gitRoot: "/srv/app" }), {
+    // A git repository's root is allowed anywhere, from git or from am.
+    assert.deepStrictEqual(
+      unsafe(
+        { dir: "/mnt/fastdata/code/producthunt/app" },
+        { ...local, gitRoot: repo("/mnt/fastdata/code/producthunt") },
+      ),
+      { _tag: "Workspace", root: "/mnt/fastdata/code/producthunt", worktree: null },
+    );
+    assert.deepStrictEqual(unsafe({ dir: "/srv/app/sub", repoRoot: "/srv/app" }, local), {
+      _tag: "Workspace",
+      root: "/srv/app",
+      worktree: null,
+    });
+    // But never one at the filesystem root or home, in either spelling.
+    const linked = { ...local, realHome: "/data/me" };
+    assert.deepStrictEqual(unsafe({ dir: "/etc" }, { ...local, gitRoot: repo("/") }), {
       _tag: "Unsafe",
-      reason: "outside-home",
+      reason: "non-git-outside-home",
     });
-    // An am worktree of a repository at home or outside it is skipped, not moved to its directory.
+    assert.deepStrictEqual(unsafe({ dir: "/data/me" }, { ...linked, gitRoot: repo("/data/me") }), {
+      _tag: "Unsafe",
+      reason: "home",
+    });
+    assert.deepStrictEqual(unsafe({ dir: "/home/me" }, { ...linked, gitRoot: repo(HOME) }), {
+      _tag: "Unsafe",
+      reason: "home",
+    });
+    // An am worktree of a repository at home is skipped, not moved to its directory.
     assert.deepStrictEqual(
       unsafe({ dir: "/home/me/wt", worktreePath: "/home/me/wt", repoRoot: "/home/me" }, local),
       { _tag: "Unsafe", reason: "home" },
+    );
+    assert.deepStrictEqual(
+      unsafe({ dir: "/home/me/wt", worktreePath: "/home/me/wt", repoRoot: "/" }, local),
+      { _tag: "Unsafe", reason: "filesystem-root" },
     );
     // The same rule holds for a fleet host's agents once mapped under this home.
     assert.deepStrictEqual(unsafe({ host: "laptop", dir: "/Users/alex" }, remote), {
       _tag: "Unsafe",
       reason: "home",
     });
-    assert.deepStrictEqual(unsafe({ host: "laptop", dir: "/srv/app" }, remote), {
-      _tag: "Unsafe",
-      reason: "outside-home",
-    });
     assert.deepStrictEqual(unsafe({ host: "laptop", dir: "/" }, remote), {
       _tag: "Unsafe",
-      reason: "outside-home",
+      reason: "filesystem-root",
     });
+    assert.deepStrictEqual(
+      unsafe({ host: "laptop", dir: "/Users/alex/code/app" }, { ...remote, gitRoot: repo(HOME) }),
+      { _tag: "Workspace", root: "~/code/app", worktree: null },
+    );
+    // This machine's copy may belong to a repository outside home.
+    assert.deepStrictEqual(
+      unsafe(
+        { host: "laptop", dir: "/Users/alex/code/producthunt" },
+        { ...remote, gitRoot: repo("/mnt/fastdata/code/producthunt") },
+      ),
+      { _tag: "Workspace", root: "/mnt/fastdata/code/producthunt", worktree: null },
+    );
+    assert.deepStrictEqual(
+      unsafe({ host: "laptop", dir: "/Users/alex/code/app" }, { ...remote, gitRoot: repo("/") }),
+      { _tag: "Workspace", root: "~/code/app", worktree: null },
+    );
+    // A fleet host path with no place under this home has no copy here.
+    assert.deepStrictEqual(unsafe({ host: "laptop", dir: "/srv/app" }, remote), {
+      _tag: "NoCopy",
+    });
+  });
+
+  it("spells a linked worktree's main root under the agent's own home", () => {
+    const linked = { ...local, realHome: "/data/me" };
+    const main = amWorkspace(row("main", { dir: "/home/me/app/ui" }), {
+      ...linked,
+      gitRoot: { root: "/home/me/app", worktree: null },
+    });
+    const review = amWorkspace(row("review", { dir: "/home/me/wt" }), {
+      ...linked,
+      gitRoot: { root: "/data/me/app", worktree: "/home/me/wt" },
+    });
+    assert.deepStrictEqual(main, { _tag: "Workspace", root: "/home/me/app", worktree: null });
+    assert.deepStrictEqual(review, {
+      _tag: "Workspace",
+      root: "/home/me/app",
+      worktree: { path: "/home/me/wt", branch: null },
+    });
+    // So is a repoRoot am spelled under the real home.
+    assert.deepStrictEqual(
+      amWorkspace(row("review", { dir: "/home/me/wt", repoRoot: "/data/me/app" }), {
+        ...linked,
+        gitRoot: { root: "/data/me/app", worktree: "/home/me/wt" },
+      }),
+      review,
+    );
+    // An agent spelled by the real home keeps the real spelling.
+    assert.deepStrictEqual(
+      amWorkspace(row("review", { dir: "/data/me/wt" }), {
+        ...linked,
+        gitRoot: { root: "/home/me/app", worktree: "/data/me/wt" },
+      }),
+      { _tag: "Workspace", root: "/data/me/app", worktree: { path: "/data/me/wt", branch: null } },
+    );
+    // A root outside both homes is left as git spelled it.
+    assert.deepStrictEqual(
+      amRepoSpelledLike({ root: "/srv/app", worktree: "/home/me/wt" }, "/home/me/wt", linked),
+      { root: "/srv/app", worktree: "/home/me/wt" },
+    );
+  });
+
+  it("groups an agent in a linked worktree into its main repository's project", () => {
+    const repo = {
+      root: "/home/me/code/app",
+      worktree: "/home/me/.agent-manager/worktrees/app/review",
+    };
+    assert.deepStrictEqual(
+      amWorkspace(row("review", { dir: "/home/me/.agent-manager/worktrees/app/review/ui" }), {
+        ...local,
+        gitRoot: repo,
+      }),
+      {
+        _tag: "Workspace",
+        root: "/home/me/code/app",
+        worktree: { path: "/home/me/.agent-manager/worktrees/app/review", branch: null },
+      },
+    );
+    // A main repository outside home still groups its worktrees.
+    assert.deepStrictEqual(
+      amWorkspace(row("review", { dir: "/home/me/wt" }), {
+        ...local,
+        gitRoot: { root: "/mnt/fastdata/code/producthunt", worktree: "/home/me/wt" },
+      }),
+      {
+        _tag: "Workspace",
+        root: "/mnt/fastdata/code/producthunt",
+        worktree: { path: "/home/me/wt", branch: null },
+      },
+    );
+    // A fleet host's worktree is on that host, so its thread gets only the project.
+    assert.deepStrictEqual(
+      amWorkspace(row("review", { host: "laptop", dir: "/Users/alex/wt" }), {
+        ...remote,
+        gitRoot: { root: "/home/me/code/app", worktree: "/home/me/wt" },
+      }),
+      { _tag: "Workspace", root: "~/code/app", worktree: null },
+    );
+    // A main repository at home groups nothing: the agent keeps its directory.
+    assert.deepStrictEqual(
+      amWorkspace(row("dots", { dir: "/home/me/wt" }), {
+        ...local,
+        gitRoot: { root: HOME, worktree: "/home/me/wt" },
+      }),
+      { _tag: "Workspace", root: "/home/me/wt", worktree: null },
+    );
+  });
+
+  it("accepts a path under either spelling of a symlinked home", () => {
+    const linked = { ...local, realHome: "/data/me" };
+    assert.deepStrictEqual(amWorkspace(row("app", { dir: "/data/me/code/app" }), linked), {
+      _tag: "Workspace",
+      root: "/data/me/code/app",
+      worktree: null,
+    });
+    assert.deepStrictEqual(amWorkspace(row("app", { dir: "/home/me/code/app" }), linked), {
+      _tag: "Workspace",
+      root: "/home/me/code/app",
+      worktree: null,
+    });
+    assert.deepStrictEqual(amWorkspace(row("home", { dir: "/data/me" }), linked), {
+      _tag: "Unsafe",
+      reason: "home",
+    });
+    assert.deepStrictEqual(amWorkspace(row("app", { dir: "/data/me/code/app" }), local), {
+      _tag: "Unsafe",
+      reason: "non-git-outside-home",
+    });
+  });
+
+  it("checks a local root where its symlinks lead", () => {
+    const resolved = (
+      dir: string,
+      real: string,
+      context: Parameters<typeof amWorkspace>[1] = local,
+    ) => amWorkspace(row("agent", { dir }), { ...context, realPaths: new Map([[dir, real]]) });
+    assert.deepStrictEqual(resolved("/home/me/root", "/"), {
+      _tag: "Unsafe",
+      reason: "filesystem-root",
+    });
+    assert.deepStrictEqual(resolved("/home/me/srv", "/srv/app"), {
+      _tag: "Unsafe",
+      reason: "non-git-outside-home",
+    });
+    assert.deepStrictEqual(resolved("/home/me/link/../..", "/home"), {
+      _tag: "Unsafe",
+      reason: "non-git-outside-home",
+    });
+    // A link outside home is bound by its spelling, so it is refused wherever it leads.
+    assert.deepStrictEqual(resolved("/tmp/link", "/home/me/code/app"), {
+      _tag: "Unsafe",
+      reason: "non-git-outside-home",
+    });
+    // A repository may be anywhere, but not where its link leads to the filesystem root or home.
+    const viaLink = (
+      root: string,
+      real: string,
+      context: Parameters<typeof amWorkspace>[1] = local,
+    ) =>
+      amWorkspace(row("agent", { dir: `${root}/ui` }), {
+        ...context,
+        gitRoot: { root, worktree: null },
+        realPaths: new Map([
+          [root, real],
+          [`${root}/ui`, `${real === "/" ? "" : real}/ui`],
+        ]),
+      });
+    assert.deepStrictEqual(viaLink("/mnt/link", "/mnt/fastdata/app"), {
+      _tag: "Workspace",
+      root: "/mnt/link",
+      worktree: null,
+    });
+    assert.deepStrictEqual(viaLink("/home/me/rootlink", "/"), {
+      _tag: "Unsafe",
+      reason: "non-git-outside-home",
+    });
+    assert.deepStrictEqual(viaLink("/home/me/homelink", HOME), {
+      _tag: "Workspace",
+      root: "/home/me/homelink/ui",
+      worktree: null,
+    });
+    assert.deepStrictEqual(
+      viaLink("/home/me/datalink", "/data/me", { ...local, realHome: "/data/me" }),
+      { _tag: "Workspace", root: "/home/me/datalink/ui", worktree: null },
+    );
+    // A `..` after a symlink is where the link leads, not where its spelling suggests.
+    assert.deepStrictEqual(resolved("/home/me/link/../app", "/home/me/code/app"), {
+      _tag: "Workspace",
+      root: "/home/me/code/app",
+      worktree: null,
+    });
+    // Other spellings are kept, normalized, so projects opened by that path still match.
+    assert.deepStrictEqual(
+      resolved("/home/me/code/app/", "/data/me/code/app", {
+        ...local,
+        realHome: "/data/me",
+      }),
+      { _tag: "Workspace", root: "/home/me/code/app", worktree: null },
+    );
+    // A repository may lead outside home, and keeps its spelling.
+    assert.deepStrictEqual(
+      amWorkspace(row("ui", { dir: "/home/me/code/app/ui" }), {
+        ...local,
+        gitRoot: { root: "/home/me/code/app", worktree: null },
+        realPaths: new Map([["/home/me/code/app", "/srv/app"]]),
+      }),
+      { _tag: "Workspace", root: "/home/me/code/app", worktree: null },
+    );
+    // A fleet host's paths are not on this machine, so nothing here resolves them.
+    assert.deepStrictEqual(
+      amWorkspace(row("app", { host: "laptop", dir: "/Users/alex/code/app" }), {
+        ...remote,
+        realPaths: new Map([["/home/me/code/app", "/srv/app"]]),
+      }),
+      { _tag: "Workspace", root: "~/code/app", worktree: null },
+    );
   });
 
   it("maps a fleet host's paths under this machine's home", () => {
@@ -358,16 +602,86 @@ describe("amGitToplevel", () => {
   });
 });
 
+describe("amGitRepo", () => {
+  it("finds the main repository of a linked worktree", () => {
+    assert.deepStrictEqual(
+      amGitRepo("/home/me/app/ui", "ui/\n/data/me/app/.git\n/data/me/app/.git\n"),
+      { root: "/home/me/app", worktree: null },
+    );
+    assert.deepStrictEqual(
+      amGitRepo(
+        "/home/me/wt/ui",
+        "ui/\n/mnt/fastdata/app/.git/worktrees/wt\n/mnt/fastdata/app/.git\n",
+      ),
+      { root: "/mnt/fastdata/app", worktree: "/home/me/wt" },
+    );
+    // A bare repository's worktree, or an odd common dir, keeps the toplevel.
+    assert.deepStrictEqual(
+      amGitRepo("/home/me/wt", "\n/home/me/app.git/worktrees/wt\n/home/me/app.git\n"),
+      { root: "/home/me/wt", worktree: null },
+    );
+    assert.deepStrictEqual(amGitRepo("/home/me/wt", "\n"), { root: "/home/me/wt", worktree: null });
+    assert.deepStrictEqual(amGitRepo("/home/me/wt", "\n/x/.git/worktrees/wt\nrelative/.git\n"), {
+      root: "/home/me/wt",
+      worktree: null,
+    });
+    assert.isNull(amGitRepo("/home/me/elsewhere", "ui/\n/x/.git\n/x/.git\n"));
+  });
+
+  it("resolves git's relative answers against the directory", () => {
+    assert.deepStrictEqual(amGitRepo("/home/me/app", "\n.git\n.git\n"), {
+      root: "/home/me/app",
+      worktree: null,
+    });
+    // In a subdirectory git names the git dir by its real path but the common dir relatively.
+    assert.deepStrictEqual(amGitRepo("/home/me/app/ui", "ui/\n/data/me/app/.git\n../.git\n"), {
+      root: "/home/me/app",
+      worktree: null,
+    });
+    assert.deepStrictEqual(
+      amGitRepo("/home/me/wt", "\n/abs/main/.git/worktrees/x\n/abs/main/.git\n"),
+      { root: "/abs/main", worktree: "/home/me/wt" },
+    );
+    assert.deepStrictEqual(
+      amGitRepo("/home/me/wt/ui", "ui/\n/home/me/app/.git/worktrees/wt\n../../app/.git\n"),
+      { root: "/home/me/app", worktree: "/home/me/wt" },
+    );
+  });
+
+  it("keeps the toplevel for an answer of the wrong shape", () => {
+    const toplevel = { root: "/home/me/wt", worktree: null };
+    // A stray extra line, such as an old git echoing a flag it does not know.
+    assert.deepStrictEqual(
+      amGitRepo("/home/me/wt", "\n/abs/main/.git/worktrees/x\n/abs/main/.git\nextra\n"),
+      toplevel,
+    );
+    assert.deepStrictEqual(
+      amGitRepo(
+        "/home/me/wt",
+        "\n--path-format=absolute\n/abs/main/.git/worktrees/x\n/abs/main/.git\n",
+      ),
+      toplevel,
+    );
+    assert.deepStrictEqual(amGitRepo("/home/me/wt", "\n\n/abs/main/.git\n"), toplevel);
+    // A git dir nested deeper than one worktree name is not a linked worktree's.
+    assert.deepStrictEqual(
+      amGitRepo("/home/me/wt", "\n/abs/main/.git/worktrees/x/y\n/abs/main/.git\n"),
+      toplevel,
+    );
+    assert.isNull(amGitRepo("/home/me/elsewhere", "ui/\n.git\n.git\nextra\n"));
+  });
+});
+
 describe("amMirrorStatus", () => {
   it("counts the agents it skipped, with why", () => {
     assert.strictEqual(
       amMirrorStatus({
         mirrored: 2,
         missingWorkspaces: 0,
-        skipped: new Map([["outside-home", 1]]),
+        skipped: new Map([["non-git-outside-home", 1]]),
         host: "",
       }),
-      "Mirroring 2 agents. Skipped 1 agent with a project outside your home directory.",
+      "Mirroring 2 agents. Skipped 1 agent with a project outside your home directory that is not a git repository.",
     );
     assert.strictEqual(
       amMirrorStatus({
