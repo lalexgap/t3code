@@ -60,6 +60,8 @@ export interface FakePermission {
   resolution?: string;
   /** The next answer gets this 409 instead, as a remote or an older am might. */
   conflict?: { readonly error: string; readonly reason?: string };
+  /** The next answer is applied but its reply never arrives, and nothing wakes listeners. */
+  loseResponse?: boolean;
 }
 
 export interface FakeCall {
@@ -218,10 +220,19 @@ export const makeFakeAm = Effect.fnUntraced(function* (
         if (permission.state !== "pending")
           return json(res, 409, {
             error: `permission request ${permission.request.id} is no longer pending`,
-            reason: permission.state === "expired" ? "expired" : "not_pending",
+            reason:
+              permission.state === "expired"
+                ? "expired"
+                : permission.state === "applied"
+                  ? "already_resolved"
+                  : "not_pending",
           });
         permission.state = "applied";
         permission.optionId = optionId;
+        if (permission.loseResponse) {
+          delete permission.loseResponse;
+          return res.destroy();
+        }
         json(res, 200, { ok: true, id: permission.request.id, optionId });
         return publish("permission-resolved", name);
       }

@@ -273,6 +273,8 @@ interface AmPendingRequest {
   readonly expiresAt: number | null;
   /** `answering` while T3's answer is on its way to am; `settled` once T3 showed its end. */
   state: "pending" | "answering" | "answered" | "settled";
+  /** An answer whose reply was lost may have been applied, so am ending the request is no news. */
+  maybeAnswered?: boolean;
 }
 
 const trimSlashes = (path: string) => path.replace(/\/+$/, "");
@@ -368,6 +370,13 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
       let receiptsConfirmed = false;
       /** The agent's permission prompts T3 has shown, by runtime request id. */
       const requests = new Map<string, AmPendingRequest>();
+      const forgetFinished = (request: AmPendingRequest) => {
+        if (
+          active !== request.turn &&
+          (request.state === "answered" || request.state === "settled")
+        )
+          requests.delete(request.runtimeRequest.id);
+      };
       const pendingRequestsOf = (turn: ActiveTurn) =>
         [...requests.values()].filter(
           (request) =>
@@ -643,7 +652,8 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         // A prompt still open goes with the run; the next run that follows the agent shows it again.
         // An answer on its way to am settles it itself.
         for (const request of pendingRequestsOf(turn))
-          if (request.state === "pending") yield* settleRequest(request, "cancelled");
+          if (request.state === "pending")
+            yield* settleRequest(request, request.maybeAnswered ? "resolved" : "cancelled");
         // Everything before the head is in the thread; a failed last read resumes at the cursor.
         const head = last._tag === "Some" ? last.value.total : turn.cursor;
         busyAgents.delete(agentRef!);
@@ -665,6 +675,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         });
         yield* updateSession("ready", status === "failed" ? (detail ?? null) : null);
         active = undefined;
+        for (const request of requests.values()) if (request.turn === turn) forgetFinished(request);
         if (status === "failed") {
           const failure = makeProviderFailure({
             class: "provider_error",
@@ -884,7 +895,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         const now = yield* Clock.currentTimeMillis;
         for (const request of pendingRequestsOf(turn))
           if (request.state === "pending" && !open.has(request.amId)) {
-            if (request.expiresAt !== null && now >= request.expiresAt)
+            if (!request.maybeAnswered && request.expiresAt !== null && now >= request.expiresAt)
               yield* settleRequest(request, "expired", expiredNote());
             else yield* settleRequest(request, "resolved");
           }
@@ -911,6 +922,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           // A transport failure is retried by T3, so the request is still T3's to answer.
           Effect.tapError(() =>
             Effect.sync(() => {
+              request.maybeAnswered = true;
               if (request.state === "answering") request.state = "pending";
             }),
           ),
@@ -919,6 +931,14 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           request.state = "answered";
           return;
         }
+        if (
+          request.maybeAnswered &&
+          (answer.reason === "already_resolved" || answer.reason === "not_pending")
+        )
+          return yield* settleRequest(request, "resolved", {
+            title: "Answer may have been applied",
+            message: `The reply to your earlier answer was lost, and Agent Motel no longer holds this request open, so that answer may already have been applied. Check the agent's session with \`am j ${ref}\`.`,
+          });
         // Retrying cannot help: the prompt ended without this answer, so T3 shows what happened.
         switch (answer.reason) {
           case "expired":
@@ -1677,7 +1697,9 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
               return yield* protocolError("An Agent Motel approval needs a decision");
             // A request T3 already settled goes to am anyway: am says why it ended, and T3 shows it.
             if (request.state === "settled") request.state = "pending";
-            yield* answerRequest(request, args.decision);
+            yield* answerRequest(request, args.decision).pipe(
+              Effect.ensuring(Effect.sync(() => forgetFinished(request))),
+            );
           },
           (effect, args) =>
             effect.pipe(

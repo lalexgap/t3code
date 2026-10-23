@@ -1665,6 +1665,68 @@ describe("AmAdapterV2", () => {
         }).pipe(Effect.scoped, Effect.provide(testLayer)),
     );
 
+    it.live("settles a retried answer whose first reply was lost, without blaming anyone", () =>
+      Effect.gen(function* () {
+        const { fake, harness, amId, card, respond, answers } = yield* promptedTurn();
+        fake.permissions.get(amId)!.loseResponse = true;
+        yield* respond("accept").pipe(Effect.flip);
+        assert.strictEqual(fake.permissions.get(amId)?.state, "applied");
+        // T3 retries a failed response.
+        yield* respond("accept");
+        yield* harness.takeApproval("completed");
+        assert.strictEqual(answers().length, 2);
+        assert.deepStrictEqual(harness.requestStates(card.requestId), ["pending", "resolved"]);
+        const notes = harness
+          .items()
+          .flatMap((item) => (item.type === "system_notice" ? [item] : []));
+        assert.deepStrictEqual(
+          notes.map((note) => note.title),
+          ["Answer may have been applied"],
+        );
+        assert.include(notes[0]!.message, "may already have been applied");
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("settles a lost answer am stops listing as resolved, not expired", () =>
+      Effect.gen(function* () {
+        const deadline = DateTime.formatIso(
+          DateTime.add(yield* DateTime.now, { milliseconds: 500 }),
+        );
+        const { fake, harness, amId, card, respond } = yield* promptedTurn({ expiresAt: deadline });
+        fake.permissions.get(amId)!.loseResponse = true;
+        yield* respond("accept").pipe(Effect.flip);
+        // Whichever read finds it gone, before or after its deadline, the lost answer may be why.
+        yield* harness.takeApproval("completed");
+        assert.deepStrictEqual(harness.requestStates(card.requestId), ["pending", "resolved"]);
+        assert.deepStrictEqual(harness.notices(), []);
+        // A retry after that hears am already holds an answer.
+        yield* respond("accept");
+        const retried = yield* harness.takeEvent(
+          "runtime_request.updated",
+          (event) => event.runtimeRequest.id === card.requestId,
+        );
+        assert.strictEqual(retried.runtimeRequest.status, "resolved");
+        assert.isFalse(
+          harness
+            .items()
+            .some((item) => item.type === "system_notice" && item.title === "Answered elsewhere"),
+        );
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
+    it.live("forgets a run's prompts once the run ends", () =>
+      Effect.gen(function* () {
+        const { fake, harness, sent, amId, respond, answers } = yield* promptedTurn();
+        yield* fake.resolvePermission(amId, "stale");
+        yield* harness.takeApproval("completed");
+        yield* complete(fake, sent.messageId!, assistant("Done."));
+        yield* harness.takeEvent("turn.terminal", (event) => event.status === "completed");
+        const error = yield* respond("accept").pipe(Effect.flip);
+        assert.include(String(error.cause), "No open Agent Motel request");
+        assert.strictEqual(answers().length, 0);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
     it.live("settles a prompt answered in the agent's pane", () =>
       Effect.gen(function* () {
         const { fake, harness, sent, amId, card } = yield* promptedTurn();
