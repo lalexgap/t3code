@@ -52,7 +52,6 @@ const OBSERVE_RETRY_MS = 120_000;
 const IMPORTS_PER_STEP = 1;
 const IMPORT_PACE_MS = 1_000;
 
-/** git could not say whether a directory is in a repository. */
 export class AmGitRootError extends Schema.TaggedError<AmGitRootError>()("AmGitRootError", {
   path: Schema.String,
   cause: Schema.Defect(),

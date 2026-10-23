@@ -68,10 +68,7 @@ export type AmDriverEnv =
   | ProviderHost.ProviderHost
   | HttpClient.HttpClient;
 
-/**
- * The git toplevel of `path`. Null only when git cleanly reports no repository; a timeout or a
- * failed spawn fails, since the directory may well be in one.
- */
+/** Null only when git cleanly reports no repository; a timeout or failed spawn fails. */
 export const amGitRoot = (path: string) =>
   spawnAndCollect(
     "git",
@@ -104,7 +101,6 @@ export const AmDriver: ProviderDriver<AmSettings, AmDriverEnv> = {
     const httpClient = yield* HttpClient.HttpClient;
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const fileSystem = yield* FileSystem.FileSystem;
-    // Null when the path does not exist or cannot be read.
     const realPath = (path: string) =>
       fileSystem.realPath(path).pipe(Effect.orElseSucceed(() => null));
     const gitRoot = (path: string) =>
