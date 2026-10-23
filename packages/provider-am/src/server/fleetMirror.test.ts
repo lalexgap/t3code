@@ -367,13 +367,14 @@ describe("makeAmFleetMirror", () => {
         "elsewhere",
         agent([], { dir: "/work/missing/app", status: "exited", updatedAt: daysAgo(now, 1) }),
       );
-      const mirror = yield* makeFakeMirror([]);
+      fake.agents.set("t3-owned-abc123", agent());
+      const mirror = yield* makeFakeMirror([{ ref: "t3-owned-abc123", head: null }]);
       const { fleetMirror, statuses } = yield* startMirror(fake, mirror);
       yield* Queue.take(statuses);
       yield* TestClock.adjust("1 second");
       assert.strictEqual(
         yield* Queue.take(statuses),
-        "Mirroring 0 agents. 1 agent works in a project with no copy on this machine. Skipped 1 agent with a project outside your home directory.",
+        "Mirroring 1 agent. 1 agent works in a project with no copy on this machine. Skipped 1 agent with a project outside your home directory.",
       );
 
       // One listing that leaves an agent out proves nothing, so it still counts.
@@ -382,13 +383,23 @@ describe("makeAmFleetMirror", () => {
       yield* fleetMirror.wake;
       assert.strictEqual(
         yield* Queue.take(statuses),
-        "Mirroring 0 agents. 1 agent works in a project with no copy on this machine. Skipped 1 agent with a project outside your home directory.",
+        "Mirroring 1 agent. 1 agent works in a project with no copy on this machine. Skipped 1 agent with a project outside your home directory.",
       );
       fake.agents.set("outside", outside);
 
+      // An empty listing while a thread is bound confirms nothing, so the counts stay.
+      const listed = new Map(fake.agents);
+      fake.agents.clear();
+      yield* fleetMirror.wake;
+      assert.strictEqual(
+        yield* Queue.take(statuses),
+        "Mirroring 1 agent. 1 agent works in a project with no copy on this machine. Skipped 1 agent with a project outside your home directory.",
+      );
+      for (const [name, value] of listed) fake.agents.set(name, value);
+
       yield* TestClock.adjust("30 days");
       yield* fleetMirror.wake;
-      assert.strictEqual(yield* Queue.take(statuses), "Mirroring 0 agents.");
+      assert.strictEqual(yield* Queue.take(statuses), "Mirroring 1 agent.");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

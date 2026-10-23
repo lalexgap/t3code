@@ -294,13 +294,17 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
     if (importing === 0) triedImports.clear();
     for (const { thread, row } of plan.watch)
       yield* follow(thread, row).pipe(ignoreFailure("follow", thread.ref, undefined));
+    // A listing that confirmed nothing keeps its liveness, and the counts with it.
+    const confirmed = plan.liveness !== previous;
     previous = plan.liveness;
     previousOmitted = plan.omitted;
-    // An agent aged out of the imports no longer counts as missing or skipped; one left out of a
-    // single listing still might come back.
-    const refs = new Set([...plan.imports.map((row) => row.ref), ...plan.omitted]);
-    for (const ref of missingWorkspaces.keys()) if (!refs.has(ref)) missingWorkspaces.delete(ref);
-    for (const ref of skipped.keys()) if (!refs.has(ref)) skipped.delete(ref);
+    if (confirmed) {
+      // An agent aged out of the imports no longer counts as missing or skipped; one left out of
+      // a single listing still might come back.
+      const refs = new Set([...plan.imports.map((row) => row.ref), ...plan.omitted]);
+      for (const ref of missingWorkspaces.keys()) if (!refs.has(ref)) missingWorkspaces.delete(ref);
+      for (const ref of skipped.keys()) if (!refs.has(ref)) skipped.delete(ref);
+    }
     const skippedByReason = new Map<AmUnsafeRootReason, number>();
     for (const { reason } of skipped.values())
       skippedByReason.set(reason, (skippedByReason.get(reason) ?? 0) + 1);
