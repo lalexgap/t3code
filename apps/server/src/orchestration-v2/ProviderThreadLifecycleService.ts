@@ -48,12 +48,6 @@ export const layer = Layer.effectDiscard(
     // Settling a settled thread re-emits thread.settled with the same settledAt.
     const reported = new Map<ThreadId, string>();
 
-    const stillApplies = (event: LifecycleEvent, threadId: ThreadId) =>
-      projections.getThread(threadId).pipe(
-        Effect.map((thread) => applies(event, thread)),
-        Effect.orElseSucceed(() => false),
-      );
-
     /** Another thread still at work on the same native thread keeps it running. */
     const sharedWithActiveThread = Effect.fnUntraced(function* (
       threadId: ThreadId,
@@ -78,6 +72,24 @@ export const layer = Layer.effectDiscard(
       }
       return false;
     });
+
+    const stillApplies = (
+      event: LifecycleEvent,
+      threadId: ThreadId,
+      binding: Pick<OrchestrationV2ProviderThread, "driver" | "providerInstanceId">,
+      nativeThreadId: string,
+    ) =>
+      projections.getThread(threadId).pipe(
+        Effect.flatMap((thread) =>
+          applies(event, thread)
+            ? Effect.map(
+                sharedWithActiveThread(threadId, binding, nativeThreadId),
+                (shared) => !shared,
+              )
+            : Effect.succeed(false),
+        ),
+        Effect.orElseSucceed(() => false),
+      );
 
     // In the latest run's band, so it follows the thread's work rather than leading it.
     const writeNotice = Effect.fnUntraced(function* (
@@ -148,7 +160,7 @@ export const layer = Layer.effectDiscard(
             providerThread,
             nativeThreadId,
           ),
-          stillApplies: stillApplies(event, threadId),
+          stillApplies: stillApplies(event, threadId, providerThread, nativeThreadId),
         });
         if (notice !== null) yield* writeNotice(threadId, providerThread.id, notice);
       },

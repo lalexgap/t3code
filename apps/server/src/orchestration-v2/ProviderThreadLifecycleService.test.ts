@@ -237,9 +237,13 @@ it.effect("tells the provider while another unsettled thread shares the agent", 
       const first = yield* seedThread(ThreadId.make("thread-first"), "t3-shared");
       const second = yield* seedThread(ThreadId.make("thread-second"), "t3-shared");
       yield* Queue.offer(domainEvents, yield* commit(first, "thread.settled"));
-      assert.isTrue((yield* Queue.take(changes)).sharedWithActiveThread);
+      const shared = yield* Queue.take(changes);
+      assert.isTrue(shared.sharedWithActiveThread);
+      assert.isFalse(shared.stillAppliesNow);
       yield* Queue.offer(domainEvents, yield* commit(second, "thread.settled"));
-      assert.isFalse((yield* Queue.take(changes)).sharedWithActiveThread);
+      const last = yield* Queue.take(changes);
+      assert.isFalse(last.sharedWithActiveThread);
+      assert.isTrue(last.stillAppliesNow);
     }),
   ),
 );
