@@ -38,8 +38,12 @@ export const AmAgentDetail = Schema.Struct({
   statusReason: Schema.optional(Schema.NullOr(Schema.String)),
   provider: Schema.String,
   dir: Schema.String,
+  /** Messages waiting for delivery; a fleet host's detail may omit it. */
+  queue: Schema.optional(Schema.Array(Schema.Unknown)),
   /** Set by an am whose `send --json` returns receipt ids; a fleet host's reflects that host's am. */
   messageReceipts: Schema.optional(Schema.Boolean),
+  /** Set by an am that can stop an agent only while it is idle; a fleet host's reflects that host's am. */
+  stopIfIdle: Schema.optional(Schema.Boolean),
   /** Set by an am that relays its agents' permission prompts; a fleet host's reflects that host's am. */
   permissionRequests: Schema.optional(Schema.Boolean),
   pendingPermissions: Schema.optional(Schema.Number),
@@ -107,6 +111,11 @@ export const AmConflictReason = Schema.Literals([
 export type AmConflictReason = typeof AmConflictReason.Type;
 const isConflictReason = Schema.is(AmConflictReason);
 
+/** Why am refused to stop an agent only while idle (HTTP 409). */
+export const AmStopRefusalReason = Schema.Literals(["busy", "queued", "in_turn", "remote_too_old"]);
+export type AmStopRefusalReason = typeof AmStopRefusalReason.Type;
+const isStopRefusalReason = Schema.is(AmStopRefusalReason);
+
 /** A choice the agent's own provider offers; its id goes back to am unchanged. */
 export const AmPermissionOption = Schema.Struct({
   id: Schema.String,
@@ -157,7 +166,10 @@ export const AmHosts = Schema.Struct({
 });
 export type AmHosts = typeof AmHosts.Type;
 
-export const AmHealth = Schema.Struct({ messageReceipts: Schema.optional(Schema.Boolean) });
+export const AmHealth = Schema.Struct({
+  messageReceipts: Schema.optional(Schema.Boolean),
+  stopIfIdle: Schema.optional(Schema.Boolean),
+});
 export type AmHealth = typeof AmHealth.Type;
 
 const SentMessage = Schema.Struct({ id: Schema.String });
@@ -202,6 +214,10 @@ export type AmCancelResult =
   | { readonly cancelled: true }
   | ({ readonly cancelled: false } & AmConflict);
 
+export type AmStopResult =
+  | { readonly stopped: true }
+  | { readonly stopped: false; readonly reason: AmStopRefusalReason; readonly error: string };
+
 export type AmInterruptResult =
   | { readonly interrupted: true }
   | ({ readonly interrupted: false } & AmConflict);
@@ -233,6 +249,12 @@ export interface AmApi {
     id: string,
   ) => Effect.Effect<AmInterruptResult, AmApiError>;
   readonly resume: (name: string) => Effect.Effect<void, AmApiError>;
+  /**
+   * Ends the agent's tmux session only if am, under its delivery lock, finds it idle with nothing
+   * queued and no turn left to finish; am keeps its state, conversation and worktree to resume.
+   * An am without `stopIfIdle` ignores the condition and stops regardless, so check it first.
+   */
+  readonly stopIfIdle: (ref: string) => Effect.Effect<AmStopResult, AmApiError>;
   readonly transcript: (name: string, after: number) => Effect.Effect<AmTranscript, AmApiError>;
   /** The agent's pending permission prompts. */
   readonly permissions: (
@@ -401,6 +423,27 @@ export const makeAmApi = (
         ),
       ),
     resume: (ref) => post("resume", agentPath(ref, "/resume"), {}),
+    stopIfIdle: (ref) =>
+      send(
+        "stop",
+        HttpClientRequest.post(agentPath(ref, "/stop")).pipe(
+          HttpClientRequest.bodyJsonUnsafe({ ifIdle: true }),
+        ),
+      ).pipe(
+        Effect.flatMap((response): Effect.Effect<AmStopResult, AmApiError> =>
+          response.status === 409
+            ? decodeBody("stop", ConflictBody, response).pipe(
+                Effect.flatMap(({ error, reason }) =>
+                  isStopRefusalReason(reason)
+                    ? Effect.succeed({ stopped: false as const, reason, error })
+                    : Effect.fail(
+                        new AmApiError({ operation: "stop", status: 409, detail: error }),
+                      ),
+                ),
+              )
+            : expectOk("stop")(response).pipe(Effect.as({ stopped: true as const })),
+        ),
+      ),
     transcript: (ref, after) =>
       send(
         "transcript read",

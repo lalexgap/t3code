@@ -32,6 +32,7 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import { AmSettings } from "../settings.ts";
 import { makeAmAdapterV2 } from "./adapter.ts";
 import { makeAmApi } from "./api.ts";
+import { makeAmThreadLifecycle } from "./lifecycle.ts";
 import { FAKE_TOKEN, makeFakeAm, type FakeAgent, type FakeEntry } from "./fakeAm.testkit.ts";
 import { amAgentName } from "./mapping.ts";
 import { AM_MIRROR_ENTRY_LIMIT, AM_EMITTED_BYTE_LIMIT, amConversationHead } from "./mirrorPlan.ts";
@@ -1467,6 +1468,50 @@ describe("AmAdapterV2", () => {
           .notices()
           .some((notice) => notice.startsWith(`${skipped} transcript entries are not shown`)),
       );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("resumes an agent stopped on settle before delivering the next message", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      const harness = yield* makeHarness(fake);
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Fix login"));
+      yield* fake.takeCall("POST", "/api/agents");
+      const first = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      yield* deliver(fake, first.messageId!, user("Fix login"));
+      yield* complete(fake, first.messageId!, assistant("Fixed."));
+      yield* harness.takeEvent("turn.terminal");
+
+      const lifecycle = makeAmThreadLifecycle({
+        settings,
+        api: makeAmApi(yield* HttpClient.HttpClient, { baseUrl: fake.url, token: FAKE_TOKEN }),
+        busyAgents: new Set(),
+      });
+      const notice = yield* lifecycle({
+        event: "settled",
+        threadId: THREAD_ID,
+        providerThreadId: harness.providerThread.id,
+        nativeThreadId: AGENT,
+        sharedWithActiveThread: false,
+        stillApplies: Effect.succeed(true),
+      });
+      assert.include(notice ?? "", "Stopped");
+      assert.strictEqual(fake.agents.get(AGENT)?.status, "exited");
+
+      // Unsettling starts nothing; the next message resumes the agent, then goes to it.
+      const beforeSend = fake.log.length;
+      yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "One more", 2));
+      const second = yield* fake.takeCall("POST", `/api/agents/${AGENT}/messages`);
+      const resumedAt = fake.log.findIndex(
+        (call, index) => index >= beforeSend && call.path.endsWith(`/${AGENT}/resume`),
+      );
+      assert.isAbove(resumedAt, -1);
+      assert.isBelow(resumedAt, fake.log.indexOf(second));
+      yield* deliver(fake, second.messageId!, user("One more"));
+      yield* complete(fake, second.messageId!, assistant("Done."));
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(terminal.status, "completed");
+      assert.deepStrictEqual(harness.replies().slice(-1), ["Done."]);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
