@@ -366,6 +366,7 @@ export const GitCommandFailureReason = Schema.Literals([
   "ref_not_found",
   "remote_unreachable",
   "tag_would_be_clobbered",
+  "worktree_owned_elsewhere",
 ]);
 export type GitCommandFailureReason = typeof GitCommandFailureReason.Type;
 

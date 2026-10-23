@@ -7,10 +7,34 @@ import * as FileSystem from "effect/FileSystem";
 
 import * as ServerConfig from "../config.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as GitManager from "./GitManager.ts";
 import * as GitWorkflowService from "./GitWorkflowService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
+
+const testLayer = (externalWorktrees: ReadonlyArray<string> = []) =>
+  GitWorkflowService.layer.pipe(
+    Layer.provide(
+      Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
+        resolve: () => Effect.succeed({ kind: "git" } as VcsDriverRegistry.VcsDriverHandle),
+      }),
+    ),
+    Layer.provide(Layer.mock(GitManager.GitManager)({})),
+    Layer.provide(
+      Layer.mock(ProjectionStore.ProjectionStoreV2)({
+        isExternalWorktree: (path) => Effect.succeed(externalWorktrees.includes(path)),
+      }),
+    ),
+    Layer.provideMerge(GitVcsDriver.layer),
+    Layer.provideMerge(VcsProcess.layer),
+    Layer.provideMerge(
+      ServerConfig.layerTest(process.cwd(), { prefix: "t3-ref-named-" }).pipe(
+        Layer.provide(NodeServices.layer),
+      ),
+    ),
+    Layer.provideMerge(NodeServices.layer),
+  );
 
 it.layer(NodeServices.layer)("GitWorkflowService", (it) => {
   it.effect("finds a name among the refs of every namespace", () =>
@@ -33,26 +57,19 @@ it.layer(NodeServices.layer)("GitWorkflowService", (it) => {
         (refName) => workflow.hasRefNamed({ cwd, refName }),
       );
       assert.deepEqual(found, [true, true, true, true, false, false]);
-    }).pipe(
-      Effect.scoped,
-      Effect.provide(
-        GitWorkflowService.layer.pipe(
-          Layer.provide(
-            Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
-              resolve: () => Effect.succeed({ kind: "git" } as VcsDriverRegistry.VcsDriverHandle),
-            }),
-          ),
-          Layer.provide(Layer.mock(GitManager.GitManager)({})),
-          Layer.provideMerge(GitVcsDriver.layer),
-          Layer.provideMerge(VcsProcess.layer),
-          Layer.provideMerge(
-            ServerConfig.layerTest(process.cwd(), { prefix: "t3-ref-named-" }).pipe(
-              Layer.provide(NodeServices.layer),
-            ),
-          ),
-          Layer.provideMerge(NodeServices.layer),
-        ),
-      ),
-    ),
+    }).pipe(Effect.scoped, Effect.provide(testLayer())),
+  );
+
+  it.effect("refuses to remove a worktree another tool created", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const cwd = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-external-wt-" });
+      const workflow = yield* GitWorkflowService.GitWorkflowService;
+      const refused = yield* Effect.flip(workflow.removeWorktree({ cwd, path: "/repo/agent-wt" }));
+      assert.strictEqual(refused.reason, "worktree_owned_elsewhere");
+      // Any other path still reaches git, which fails here on its own terms.
+      const attempted = yield* Effect.flip(workflow.removeWorktree({ cwd, path: "/repo/own-wt" }));
+      assert.notStrictEqual(attempted.reason, "worktree_owned_elsewhere");
+    }).pipe(Effect.scoped, Effect.provide(testLayer(["/repo/agent-wt"]))),
   );
 });

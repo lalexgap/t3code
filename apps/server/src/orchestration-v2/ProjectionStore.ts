@@ -87,6 +87,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import type * as Statement from "effect/sql/Statement";
 
 import { MCP_APP_OUTPUT_KEY } from "@t3tools/shared/mcpApp";
+import { normalizeWorktreePathForComparison } from "@t3tools/shared/path";
 import { threadHtmlRenderAttachmentIds } from "../attachmentStore.ts";
 import {
   isThreadHistoryUserTurn,
@@ -464,7 +465,7 @@ export interface ProjectionStoreV2Shape {
     readonly driver: string;
     readonly providerInstanceId: ProviderInstanceId;
   }) => Effect.Effect<ReadonlyArray<ProjectionProviderThreadBinding>, ProjectionStoreV2Error>;
-  /** Whether any thread, deleted ones included, marks this worktree as another tool's. */
+  /** Whether any thread, archived or deleted ones included, marks this worktree as another tool's. */
   readonly isExternalWorktree: (
     worktreePath: string,
   ) => Effect.Effect<boolean, ProjectionStoreV2Error>;
@@ -6170,14 +6171,18 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       );
 
     const isExternalWorktree: ProjectionStoreV2Shape["isExternalWorktree"] = (worktreePath) =>
-      sql<{ readonly found: number }>`
-        SELECT 1 AS found
+      sql<{ readonly worktree_path: string }>`
+        SELECT DISTINCT json_extract(payload_json, '$.worktreePath') AS worktree_path
         FROM orchestration_v2_projection_threads
-        WHERE json_extract(payload_json, '$.worktreePath') = ${worktreePath}
-          AND json_extract(payload_json, '$.externalWorktree') = 1
-        LIMIT 1
+        WHERE json_extract(payload_json, '$.externalWorktree') = 1
+          AND json_extract(payload_json, '$.worktreePath') IS NOT NULL
       `.pipe(
-        Effect.map((rows) => rows.length > 0),
+        Effect.map((rows) => {
+          const target = normalizeWorktreePathForComparison(worktreePath);
+          return rows.some(
+            (row) => normalizeWorktreePathForComparison(row.worktree_path) === target,
+          );
+        }),
         Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
       );
 
@@ -6742,7 +6747,10 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
           Effect.map((state) =>
             [...state.projections.values()].some(
               ({ thread }) =>
-                thread.worktreePath === worktreePath && thread.externalWorktree === true,
+                thread.externalWorktree === true &&
+                thread.worktreePath !== null &&
+                normalizeWorktreePathForComparison(thread.worktreePath) ===
+                  normalizeWorktreePathForComparison(worktreePath),
             ),
           ),
         ),

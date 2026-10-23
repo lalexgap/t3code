@@ -1278,6 +1278,7 @@ it.effect("marks threads that move onto another tool's worktree", () =>
     });
 
     assert.isTrue((yield* create("thread:opened-on-agent-wt", worktreePath)).externalWorktree);
+    assert.isTrue((yield* create("thread:other-spelling", "/work/./agent-wt/")).externalWorktree);
     assert.isUndefined((yield* create("thread:elsewhere", "/work/other-wt")).externalWorktree);
     const moved = yield* create("thread:moved", null);
     yield* orchestrator.dispatch({

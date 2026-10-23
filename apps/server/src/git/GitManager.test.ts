@@ -4080,6 +4080,9 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
         const events: string[] = [];
         const workflows = yield* Effect.forEach([0, 1], () =>
           GitWorkflowService.make.pipe(
+            Effect.provideService(ProjectionStore.ProjectionStoreV2, {
+              isExternalWorktree: () => Effect.succeed(false),
+            } as unknown as ProjectionStore.ProjectionStoreV2["Service"]),
             // Cache the real filesystem result so startImmediately reaches lease acquisition.
             Effect.provideService(FileSystem.FileSystem, {
               ...fileSystem,

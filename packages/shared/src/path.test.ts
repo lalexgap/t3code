@@ -4,6 +4,7 @@ import {
   newProjectFolderName,
   normalizeProjectPathForComparison,
   normalizeProjectPathForDispatch,
+  normalizeWorktreePathForComparison,
   resolveWorkspaceFilePath,
 } from "./path.ts";
 
@@ -23,6 +24,12 @@ describe("path helpers", () => {
     expect(normalizeProjectPathForComparison("C:")).toBe(normalizeProjectPathForComparison("C:\\"));
     expect(normalizeProjectPathForComparison("C:")).toBe(normalizeProjectPathForComparison("C:/"));
     expect(normalizeProjectPathForDispatch("C:\\repo\\")).toBe("C:\\repo");
+  });
+
+  it("compares worktree paths by location, not spelling", () => {
+    for (const spelling of ["/repo/wt/", " /repo/wt", "/repo//wt", "/repo/./wt", "/repo/x/../wt"])
+      expect(normalizeWorktreePathForComparison(spelling)).toBe("/repo/wt");
+    expect(normalizeWorktreePathForComparison("C:\\Repo\\WT\\")).toBe("c:\\repo\\wt");
   });
 
   it("names a new project's folder from any typed name", () => {

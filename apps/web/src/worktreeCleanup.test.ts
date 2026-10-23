@@ -73,5 +73,13 @@ describe("getOrphanedWorktreePathForThread", () => {
       externalWorktree: true,
     });
     expect(getOrphanedWorktreePathForThread([external], external.id)).toBeNull();
+
+    const sameDirectory = makeThread({
+      id: ThreadId.make("thread-2"),
+      worktreePath: "/tmp/repo/worktrees/agent/",
+    });
+    expect(
+      getOrphanedWorktreePathForThread([external, sameDirectory], sameDirectory.id),
+    ).toBeNull();
   });
 });

@@ -1,3 +1,5 @@
+import { normalizeWorktreePathForComparison } from "@t3tools/shared/path";
+
 import type { ThreadShell } from "./types";
 
 function normalizeWorktreePath(path: string | null): string | null {
@@ -5,7 +7,7 @@ function normalizeWorktreePath(path: string | null): string | null {
   if (!trimmed) {
     return null;
   }
-  return trimmed;
+  return normalizeWorktreePathForComparison(trimmed);
 }
 
 export function getOrphanedWorktreePathForThread(
@@ -29,7 +31,7 @@ export function getOrphanedWorktreePathForThread(
     return null;
   }
 
-  return linkedThreads.length > 1 ? null : targetWorktreePath;
+  return linkedThreads.length > 1 ? null : targetThread.worktreePath!.trim();
 }
 
 export function formatWorktreePathForDisplay(worktreePath: string): string {

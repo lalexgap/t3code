@@ -63,6 +63,19 @@ export function normalizeProjectPathForComparison(value: string): string {
   return normalized;
 }
 
+/** Spellings of one worktree compare equal: repeated or trailing separators, and `.` or `..`. */
+export function normalizeWorktreePathForComparison(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("/")) return normalizeProjectPathForComparison(trimmed);
+  const segments: Array<string> = [];
+  for (const segment of trimmed.split("/")) {
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") segments.pop();
+    else segments.push(segment);
+  }
+  return `/${segments.join("/")}`;
+}
+
 // Windows refuses these as file names, with or without an extension.
 const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/;
 
