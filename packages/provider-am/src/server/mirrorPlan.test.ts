@@ -263,4 +263,38 @@ describe("amHistory", () => {
     );
     assert.isNull(amHistory("worker", [{ index: 0, kind: "user", text: "hi" }], 1).notice);
   });
+
+  it("keeps the newest entries when the transcript grew while its tail was read", () => {
+    const entries: Array<AmTranscriptEntry> = Array.from({ length: 230 }, (_, index) => ({
+      index: 20 + index,
+      kind: "user",
+      text: `entry ${20 + index}`,
+    }));
+    const { history, notice } = amHistory("worker", entries, 250);
+    assert.strictEqual(history.length, AM_MIRROR_ENTRY_LIMIT);
+    assert.deepStrictEqual(history[0], { role: "user", text: "entry 50" });
+    assert.include(notice ?? "", "50 earlier transcript entries");
+  });
+
+  it("drops the oldest messages beyond the history's text budget", () => {
+    // 100 clipped messages of 16k four-byte characters, far beyond the budget.
+    const entries: Array<AmTranscriptEntry> = Array.from({ length: 100 }, (_, index) => ({
+      index,
+      kind: "assistant",
+      text: `${index}`.padEnd(20_000, "😀"),
+    }));
+    const { history, notice } = amHistory("worker", entries, 100);
+    const bytes = history.reduce(
+      (sum, message) => sum + new TextEncoder().encode(message.text).length,
+      0,
+    );
+    assert.isAtMost(bytes, 1_000_000);
+    assert.isAbove(history.length, 0);
+    assert.strictEqual(history.at(-1)?.text.slice(0, 2), "99");
+    const shown = Number(history[0]!.text.match(/^\d+/)![0]);
+    assert.strictEqual(
+      notice,
+      `${shown} earlier transcript entries are not shown. Read them with \`am transcript worker\`.`,
+    );
+  });
 });

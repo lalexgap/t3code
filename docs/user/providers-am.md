@@ -74,8 +74,8 @@ still importing.
   worktree stays on that host, so its agent's thread uses the project, not a worktree. It never creates
   a directory: an agent whose project has no copy here is not mirrored, and provider status counts
   it. Diffs and checkpoints read this machine's copy, so they do not show such an agent's changes.
-- **History.** A new thread shows the agent's last 200 transcript entries as history, without tool
-  calls. Read older ones with `am transcript <name>`.
+- **History.** A new thread shows up to the agent's last 200 transcript entries as history, without
+  tool calls, and fewer when their messages are long. Read older ones with `am transcript <name>`.
 - **Activity.** Work that T3 Code did not send appears as it happens in an **Agent Motel activity**
   run, which lasts while the agent works. Sending a message during it waits for the agent instead
   of typing into its work. **Stop** on such a run stops showing it; it does not interrupt the agent.
