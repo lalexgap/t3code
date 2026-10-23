@@ -1291,3 +1291,35 @@ it.effect("marks threads that move onto another tool's worktree", () =>
     assert.isTrue((yield* projections.getThreadShell(moved.id))?.externalWorktree);
   }).pipe(Effect.provide(layerTest)),
 );
+
+it.effect("refuses an archive that expects another active provider thread", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = ThreadId.make("thread:archive-precondition");
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create:archive-precondition"),
+      threadId,
+      projectId: ProjectId.make("project:archive-precondition"),
+      title: "Switched provider",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    const refused = yield* Effect.result(
+      orchestrator.dispatch({
+        type: "thread.archive",
+        commandId: CommandId.make("archive:stale-provider"),
+        threadId,
+        expectedActiveProviderThreadId: ProviderThreadId.make("provider-thread:mirrored"),
+      }),
+    );
+    assert.isTrue(Result.isFailure(refused));
+    assert.isNull((yield* projections.getThread(threadId)).archivedAt);
+  }).pipe(Effect.provide(layerTest)),
+);

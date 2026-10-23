@@ -137,6 +137,11 @@ export interface EventSinkV2Shape {
    */
   readonly writeIfProviderThreadUnchanged: (input: {
     readonly expected: OrchestrationV2ProviderThread;
+    /**
+     * Also require that its app thread still runs on it: a provider-thread.updated makes its
+     * provider thread the app thread's active one.
+     */
+    readonly whileActive?: boolean;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
   }) => Effect.Effect<
     {
@@ -602,7 +607,16 @@ const layerBase: Layer.Layer<
             WHERE provider_thread_id = ${input.expected.id}
             LIMIT 1
           `;
-          if (rows[0]?.payload_json !== expectedJson) {
+          const active =
+            input.whileActive !== true
+              ? true
+              : (yield* sql<{ readonly active_provider_thread_id: string | null }>`
+                  SELECT active_provider_thread_id
+                  FROM orchestration_v2_projection_threads
+                  WHERE thread_id = ${input.expected.appThreadId}
+                  LIMIT 1
+                `)[0]?.active_provider_thread_id === input.expected.id;
+          if (rows[0]?.payload_json !== expectedJson || !active) {
             return {
               committed: false as const,
               storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,

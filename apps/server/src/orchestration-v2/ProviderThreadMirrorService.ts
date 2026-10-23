@@ -349,6 +349,7 @@ export const layer = Layer.effectDiscard(
         const id = yield* randomUuidV4;
         const { committed } = yield* eventSink.writeIfProviderThreadUnchanged({
           expected: current,
+          whileActive: true,
           events: [
             {
               id: EventId.make(`${EVENT_PREFIX}:provider-thread:${current.id}:${id}`),
@@ -366,14 +367,16 @@ export const layer = Layer.effectDiscard(
       return false;
     });
 
+    // The orchestrator refuses it once the thread runs on another provider thread, so a provider
+    // switch after the mirror read the binding never has its session detached by this archive.
     const setArchived = Effect.fn("ProviderThreadMirror.setArchived")(function* (
       threadId: ThreadId,
+      providerThreadId: OrchestrationV2ProviderThread["id"],
       archived: boolean,
     ) {
       const commandId = CommandId.make(`${EVENT_PREFIX}:archive:${yield* randomUuidV4}`);
-      yield* archived
-        ? lifecycle.archive({ commandId, threadId })
-        : lifecycle.unarchive({ commandId, threadId });
+      const input = { commandId, threadId, expectedActiveProviderThreadId: providerThreadId };
+      yield* archived ? lifecycle.archive(input) : lifecycle.unarchive(input);
     });
 
     const update: ProviderThreadMirror.ProviderThreadMirrorHandler["update"] = Effect.fn(
@@ -388,9 +391,9 @@ export const layer = Layer.effectDiscard(
         // archive and is cleared only after the thread is back.
         if (input.archived === true) {
           if (input.headFingerprint === undefined || (yield* mark(input.headFingerprint)))
-            yield* setArchived(input.threadId, true);
+            yield* setArchived(input.threadId, input.providerThreadId, true);
         } else if (input.archived === false) {
-          yield* setArchived(input.threadId, false);
+          yield* setArchived(input.threadId, input.providerThreadId, false);
           if (input.headFingerprint !== undefined) yield* mark(input.headFingerprint);
         } else if (input.headFingerprint !== undefined) yield* mark(input.headFingerprint);
       },

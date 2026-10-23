@@ -41,7 +41,23 @@ let waitingProjectLookups = 0;
 const stores = Layer.mergeAll(EventStore.layer, ProjectionStore.layer).pipe(
   Layer.provideMerge(SqlitePersistence.layerMemory),
 );
-const sink = EventSink.layer.pipe(Layer.provide(stores));
+/** Runs once just before the mirror's next conditional write, to stage a race. */
+let beforeConditionalWrite: Effect.Effect<void> | null = null;
+const sink = Layer.effect(
+  EventSink.EventSinkV2,
+  Effect.gen(function* () {
+    const delegate = yield* EventSink.EventSinkV2;
+    return EventSink.EventSinkV2.of({
+      ...delegate,
+      writeIfProviderThreadUnchanged: (input) =>
+        Effect.suspend(() => {
+          const staged = beforeConditionalWrite ?? Effect.void;
+          beforeConditionalWrite = null;
+          return staged;
+        }).pipe(Effect.andThen(delegate.writeIfProviderThreadUnchanged(input))),
+    });
+  }),
+).pipe(Layer.provideMerge(EventSink.layer.pipe(Layer.provide(stores))));
 const testLayer = Layer.mergeAll(ProviderThreadMirror.layer, stores, sink, IdAllocator.layer).pipe(
   Layer.provideMerge(
     ProviderThreadMirrorService.layer.pipe(
@@ -355,4 +371,54 @@ it.effect("lets one of two concurrent adoptions of a native thread win", () =>
     Effect.ensuring(Effect.sync(() => (overlapProjectLookups = null))),
     Effect.provide(testLayer),
   ),
+);
+
+it.effect("leaves a thread alone when its provider changes while the mirror marks it", () =>
+  Effect.gen(function* () {
+    const mirror = yield* ProviderThreadMirror.ProviderThreadMirror;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const adopted = yield* mirror.adopt(adoption("switching"));
+    const threadId = adopted._tag === "Adopted" ? adopted.threadId : ThreadId.make("none");
+    const { providerThreads } = yield* projections.getThreadRecords(threadId, ["providerThreads"]);
+    const am = providerThreads[0]!;
+    const other = ProviderThreadId.make("provider-thread:switched-to");
+    // The user switches provider after the mirror read the am binding.
+    beforeConditionalWrite = eventSink
+      .write({
+        events: [
+          {
+            id: EventId.make("switching:other-provider"),
+            type: "provider-thread.updated",
+            threadId,
+            driver: ProviderDriverKind.make("codex"),
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            occurredAt: now,
+            payload: {
+              ...am,
+              id: other,
+              driver: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              nativeThreadRef: null,
+              nativeConversationHeadRef: null,
+            },
+          },
+        ],
+      })
+      .pipe(Effect.orDie, Effect.asVoid);
+
+    yield* mirror.update({
+      threadId,
+      providerThreadId: am.id,
+      archived: true,
+      headFingerprint: "am-removed",
+    });
+    const after = yield* projections.getThreadRecords(threadId, ["providerThreads"]);
+    assert.strictEqual(after.thread.activeProviderThreadId, other);
+    assert.isUndefined(
+      after.providerThreads.find((thread) => thread.id === am.id)?.nativeConversationHeadRef
+        ?.fingerprint,
+    );
+    assert.isEmpty(archives.filter((entry) => entry.threadId === threadId));
+  }).pipe(Effect.provide(testLayer)),
 );

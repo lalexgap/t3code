@@ -2771,6 +2771,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: `Thread ${command.threadId} is already archived.`,
       });
     }
+    if (
+      (command.type === "thread.archive" || command.type === "thread.unarchive") &&
+      command.expectedActiveProviderThreadId !== undefined &&
+      command.expectedActiveProviderThreadId !== thread.activeProviderThreadId
+    ) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Thread ${command.threadId} moved to another provider thread.`,
+      });
+    }
     if (command.type === "thread.unarchive" && thread.archivedAt === null) {
       return yield* new OrchestratorDispatchError({
         commandId: command.commandId,

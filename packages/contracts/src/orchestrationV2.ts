@@ -2604,11 +2604,15 @@ export const OrchestrationV2Command = Schema.Union([
     type: Schema.Literal("thread.archive"),
     commandId: CommandId,
     threadId: ThreadId,
+    /** Refused unless the thread still runs on this provider thread. */
+    expectedActiveProviderThreadId: Schema.optional(ProviderThreadId),
   }),
   Schema.Struct({
     type: Schema.Literal("thread.unarchive"),
     commandId: CommandId,
     threadId: ThreadId,
+    /** Refused unless the thread still runs on this provider thread. */
+    expectedActiveProviderThreadId: Schema.optional(ProviderThreadId),
   }),
   Schema.Struct({
     type: Schema.Literal("thread.delete"),
