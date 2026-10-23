@@ -207,6 +207,7 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
       yield* mirror
         .update({
           threadId: ThreadId.make(thread.threadId),
+          providerThreadId: ProviderThreadId.make(thread.providerThreadId),
           archived: true,
           conversationHeadRef: { ...thread.head!, fingerprint: AM_REMOVED_MARK },
         })
@@ -216,6 +217,7 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
       yield* mirror
         .update({
           threadId: ThreadId.make(thread.threadId),
+          providerThreadId: ProviderThreadId.make(thread.providerThreadId),
           archived: false,
           ...(thread.head ? { conversationHeadRef: head } : {}),
         })

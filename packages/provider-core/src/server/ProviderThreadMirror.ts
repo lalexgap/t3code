@@ -3,6 +3,7 @@ import type {
   OrchestrationV2ProviderThread,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderThreadId,
   RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
@@ -57,6 +58,8 @@ export type ProviderThreadAdoptionResult =
 
 export interface ProviderThreadMirrorUpdate {
   readonly threadId: ThreadId;
+  /** Nothing changes unless the thread still runs on this provider thread. */
+  readonly providerThreadId: ProviderThreadId;
   readonly archived?: boolean;
   readonly conversationHeadRef?: OrchestrationV2ProviderRef | null;
 }

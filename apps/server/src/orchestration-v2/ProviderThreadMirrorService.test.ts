@@ -4,6 +4,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderThreadId,
   ThreadId,
   type OrchestrationV2AppThread,
   type OrchestrationV2ProviderThread,
@@ -11,6 +12,7 @@ import {
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderThreadMirror from "@t3tools/provider-core/server/ProviderThreadMirror";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
@@ -29,6 +31,12 @@ const PROJECT_ID = ProjectId.make("project-mirror");
 const now = DateTime.makeUnsafe("2026-10-22T12:00:00.000Z");
 const existingRoots = new Set(["/work/app", "/work/app-wt"]);
 const archives: Array<{ readonly threadId: ThreadId; readonly archived: boolean }> = [];
+/** Holds each project lookup until this many are waiting, so adoptions overlap. */
+let overlapProjectLookups: {
+  readonly count: number;
+  readonly arrived: Deferred.Deferred<void>;
+} | null = null;
+let waitingProjectLookups = 0;
 
 const stores = Layer.mergeAll(EventStore.layer, ProjectionStore.layer).pipe(
   Layer.provideMerge(SqlitePersistence.layerMemory),
@@ -45,19 +53,29 @@ const testLayer = Layer.mergeAll(ProviderThreadMirror.layer, stores, sink, IdAll
           IdAllocator.layer,
           Layer.mock(ProjectService.ProjectService)({
             bootstrap: (input) =>
-              Effect.succeed({
-                project: {
-                  id: PROJECT_ID,
-                  title: input.title,
-                  workspaceRoot: input.workspaceRoot,
-                  defaultModelSelection: null,
-                  scripts: [],
-                  createdAt: "2026-10-22T12:00:00.000Z",
-                  updatedAt: "2026-10-22T12:00:00.000Z",
-                  deletedAt: null,
-                },
-                created: true,
-              }),
+              Effect.gen(function* () {
+                const overlap = overlapProjectLookups;
+                if (overlap !== null) {
+                  waitingProjectLookups++;
+                  if (waitingProjectLookups === overlap.count)
+                    yield* Deferred.succeed(overlap.arrived, undefined);
+                  yield* Deferred.await(overlap.arrived);
+                }
+              }).pipe(
+                Effect.as({
+                  project: {
+                    id: PROJECT_ID,
+                    title: input.title,
+                    workspaceRoot: input.workspaceRoot,
+                    defaultModelSelection: null,
+                    scripts: [],
+                    createdAt: "2026-10-22T12:00:00.000Z",
+                    updatedAt: "2026-10-22T12:00:00.000Z",
+                    deletedAt: null,
+                  },
+                  created: true,
+                }),
+              ),
           }),
           Layer.mock(ThreadLifecycleService.ThreadLifecycleService)({
             archive: (input) =>
@@ -252,9 +270,23 @@ it.effect("records the provider's head before archiving and after restoring", ()
     const adopted = yield* mirror.adopt(adoption("removed"));
     const threadId = adopted._tag === "Adopted" ? adopted.threadId : ThreadId.make("none");
     const head = { driver: AM, nativeId: "removed", strength: "weak" as const, ordinal: 5 };
+    const providerThreadId = (yield* projections.getThread(threadId)).activeProviderThreadId!;
+
+    // A thread that moved to another provider thread is left alone.
+    yield* mirror.update({
+      threadId,
+      providerThreadId: ProviderThreadId.make("provider-thread:switched-away"),
+      archived: true,
+      conversationHeadRef: { ...head, fingerprint: "am-removed" },
+    });
+    const untouched = yield* projections.getThreadRecords(threadId, ["providerThreads"]);
+    assert.strictEqual(untouched.providerThreads[0]?.nativeConversationHeadRef?.ordinal, 5);
+    assert.isUndefined(untouched.providerThreads[0]?.nativeConversationHeadRef?.fingerprint);
+    assert.isEmpty(archives.filter((entry) => entry.threadId === threadId));
 
     yield* mirror.update({
       threadId,
+      providerThreadId,
       archived: true,
       conversationHeadRef: { ...head, fingerprint: "am-removed" },
     });
@@ -263,7 +295,12 @@ it.effect("records the provider's head before archiving and after restoring", ()
       marked.providerThreads[0]?.nativeConversationHeadRef?.fingerprint,
       "am-removed",
     );
-    yield* mirror.update({ threadId, archived: false, conversationHeadRef: head });
+    yield* mirror.update({
+      threadId,
+      providerThreadId,
+      archived: false,
+      conversationHeadRef: head,
+    });
     const cleared = yield* projections.getThreadRecords(threadId, ["providerThreads"]);
     assert.deepStrictEqual(cleared.providerThreads[0]?.nativeConversationHeadRef, head);
     assert.deepStrictEqual(
@@ -274,4 +311,25 @@ it.effect("records the provider's head before archiving and after restoring", ()
       ],
     );
   }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("lets one of two concurrent adoptions of a native thread win", () =>
+  Effect.gen(function* () {
+    const mirror = yield* ProviderThreadMirror.ProviderThreadMirror;
+    overlapProjectLookups = { count: 2, arrived: yield* Deferred.make<void>() };
+    waitingProjectLookups = 0;
+    const results = yield* Effect.all(
+      [mirror.adopt(adoption("race")), mirror.adopt(adoption("race"))],
+      {
+        concurrency: "unbounded",
+      },
+    );
+    assert.deepStrictEqual(results.map((result) => result._tag).toSorted(), [
+      "Adopted",
+      "AlreadyOwned",
+    ]);
+  }).pipe(
+    Effect.ensuring(Effect.sync(() => (overlapProjectLookups = null))),
+    Effect.provide(testLayer),
+  ),
 );

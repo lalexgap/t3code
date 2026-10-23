@@ -27,6 +27,7 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ThreadLifecycleService from "./ThreadLifecycleService.ts";
 
 const EVENT_PREFIX = "provider-thread-mirror";
+const HEAD_WRITE_ATTEMPTS = 3;
 
 const failure =
   (operation: ProviderThreadMirror.ProviderThreadMirrorError["operation"], detail: string) =>
@@ -265,29 +266,46 @@ export const layer = Layer.effectDiscard(
           createdAt: now,
           updatedAt: now,
         };
-        const committed = yield* eventSink.write({
-          unlessNativeThreadOwned: providerThread,
-          events: [
-            {
-              id: EventId.make(`${EVENT_PREFIX}:thread:${threadId}:created`),
-              type: "thread.created",
-              threadId,
-              providerInstanceId: input.providerInstanceId,
-              occurredAt: input.createdAt,
-              payload: appThread,
-            },
-            ...historyEvents({ threadId, at: input.updatedAt, adoption: input }),
-            {
-              id: EventId.make(`${EVENT_PREFIX}:provider-thread:${providerThreadId}:adopted`),
-              type: "provider-thread.updated",
-              threadId,
-              driver: input.driver,
-              providerInstanceId: input.providerInstanceId,
-              occurredAt: now,
-              payload: providerThread,
-            },
-          ],
-        });
+        const committed = yield* eventSink
+          .write({
+            unlessNativeThreadOwned: providerThread,
+            events: [
+              {
+                id: EventId.make(`${EVENT_PREFIX}:thread:${threadId}:created`),
+                type: "thread.created",
+                threadId,
+                providerInstanceId: input.providerInstanceId,
+                occurredAt: input.createdAt,
+                payload: appThread,
+              },
+              ...historyEvents({ threadId, at: input.updatedAt, adoption: input }),
+              {
+                id: EventId.make(`${EVENT_PREFIX}:provider-thread:${providerThreadId}:adopted`),
+                type: "provider-thread.updated",
+                threadId,
+                driver: input.driver,
+                providerInstanceId: input.providerInstanceId,
+                occurredAt: now,
+                payload: providerThread,
+              },
+            ],
+          })
+          .pipe(
+            // A concurrent adoption of the same native thread commits first: its thread id is ours.
+            Effect.catchTags({
+              EventSinkWriteError: (error) =>
+                Effect.gen(function* () {
+                  const winner = yield* projections.getThread(threadId).pipe(
+                    Effect.asSome,
+                    Effect.catchTags({
+                      ProjectionStoreThreadNotFoundError: () => Effect.succeedNone,
+                    }),
+                  );
+                  if (Option.isNone(winner)) return yield* error;
+                  return [];
+                }),
+            }),
+          );
         return committed.length === 0
           ? ({ _tag: "AlreadyOwned" } as const)
           : ({ _tag: "Adopted", threadId } as const);
@@ -295,30 +313,44 @@ export const layer = Layer.effectDiscard(
       Effect.mapError(failure("adopt", "Could not create the thread.")),
     );
 
-    const setConversationHead = Effect.fn("ProviderThreadMirror.setConversationHead")(function* (
+    /** The provider thread, while the thread still runs on it rather than on another provider. */
+    const boundProviderThread = Effect.fnUntraced(function* (
       threadId: ThreadId,
-      head: OrchestrationV2ProviderThread["nativeConversationHeadRef"],
+      providerThreadId: OrchestrationV2ProviderThread["id"],
     ) {
       const records = yield* projections.getThreadRecords(threadId, ["providerThreads"]);
-      const current = records.providerThreads.find(
-        (candidate) => candidate.id === records.thread.activeProviderThreadId,
-      );
-      if (!current) return;
-      const now = yield* DateTime.now;
-      const id = yield* randomUuidV4;
-      yield* eventSink.write({
-        events: [
-          {
-            id: EventId.make(`${EVENT_PREFIX}:provider-thread:${current.id}:${id}`),
-            type: "provider-thread.updated",
-            threadId,
-            driver: current.driver,
-            providerInstanceId: current.providerInstanceId,
-            occurredAt: now,
-            payload: { ...current, nativeConversationHeadRef: head, updatedAt: now },
-          },
-        ],
-      });
+      if (records.thread.activeProviderThreadId !== providerThreadId) return undefined;
+      return records.providerThreads.find((candidate) => candidate.id === providerThreadId);
+    });
+
+    /** Reports whether the head landed; a turn writing the same row in between wins a retry. */
+    const setConversationHead = Effect.fn("ProviderThreadMirror.setConversationHead")(function* (
+      threadId: ThreadId,
+      providerThreadId: OrchestrationV2ProviderThread["id"],
+      head: OrchestrationV2ProviderThread["nativeConversationHeadRef"],
+    ) {
+      for (let attempt = 0; attempt < HEAD_WRITE_ATTEMPTS; attempt++) {
+        const current = yield* boundProviderThread(threadId, providerThreadId);
+        if (!current) return false;
+        const now = yield* DateTime.now;
+        const id = yield* randomUuidV4;
+        const { committed } = yield* eventSink.writeIfProviderThreadUnchanged({
+          expected: current,
+          events: [
+            {
+              id: EventId.make(`${EVENT_PREFIX}:provider-thread:${current.id}:${id}`),
+              type: "provider-thread.updated",
+              threadId,
+              driver: current.driver,
+              providerInstanceId: current.providerInstanceId,
+              occurredAt: now,
+              payload: { ...current, nativeConversationHeadRef: head, updatedAt: now },
+            },
+          ],
+        });
+        if (committed) return true;
+      }
+      return false;
     });
 
     const setArchived = Effect.fn("ProviderThreadMirror.setArchived")(function* (
@@ -335,17 +367,19 @@ export const layer = Layer.effectDiscard(
       "ProviderThreadMirror.update",
     )(
       function* (input) {
-        const head =
-          input.conversationHeadRef === undefined
-            ? Effect.void
-            : setConversationHead(input.threadId, input.conversationHeadRef);
+        if ((yield* boundProviderThread(input.threadId, input.providerThreadId)) === undefined)
+          return;
+        const head = (headRef: OrchestrationV2ProviderThread["nativeConversationHeadRef"]) =>
+          setConversationHead(input.threadId, input.providerThreadId, headRef);
         // The head is the provider's note about why it archived, so it lands before the archive
         // and is cleared only after the thread is back.
-        if (input.archived === true)
-          yield* head.pipe(Effect.andThen(setArchived(input.threadId, true)));
-        else if (input.archived === false)
-          yield* setArchived(input.threadId, false).pipe(Effect.andThen(head));
-        else yield* head;
+        if (input.archived === true) {
+          if (input.conversationHeadRef === undefined || (yield* head(input.conversationHeadRef)))
+            yield* setArchived(input.threadId, true);
+        } else if (input.archived === false) {
+          yield* setArchived(input.threadId, false);
+          if (input.conversationHeadRef !== undefined) yield* head(input.conversationHeadRef);
+        } else if (input.conversationHeadRef !== undefined) yield* head(input.conversationHeadRef);
       },
       Effect.mapError(failure("update", "Could not update the thread.")),
     );
