@@ -61,7 +61,11 @@ export interface ProviderThreadMirrorUpdate {
   /** Nothing changes unless the thread still runs on this provider thread. */
   readonly providerThreadId: ProviderThreadId;
   readonly archived?: boolean;
-  readonly conversationHeadRef?: OrchestrationV2ProviderRef | null;
+  /**
+   * Sets, or with null clears, the fingerprint of the provider thread's current conversation head,
+   * leaving where that head points as it is.
+   */
+  readonly headFingerprint?: string | null;
 }
 
 export class ProviderThreadMirrorError extends Schema.TaggedError<ProviderThreadMirrorError>()(

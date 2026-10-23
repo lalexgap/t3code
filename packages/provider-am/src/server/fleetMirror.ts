@@ -209,20 +209,18 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
           threadId: ThreadId.make(thread.threadId),
           providerThreadId: ProviderThreadId.make(thread.providerThreadId),
           archived: true,
-          conversationHeadRef: { ...thread.head!, fingerprint: AM_REMOVED_MARK },
+          headFingerprint: AM_REMOVED_MARK,
         })
         .pipe(ignoreFailure("archive the thread of", thread.ref, undefined));
-    for (const thread of plan.unarchive) {
-      const { fingerprint: _mark, ...head } = thread.head ?? amConversationHead(thread.ref, 0);
+    for (const thread of plan.unarchive)
       yield* mirror
         .update({
           threadId: ThreadId.make(thread.threadId),
           providerThreadId: ProviderThreadId.make(thread.providerThreadId),
           archived: false,
-          ...(thread.head ? { conversationHeadRef: head } : {}),
+          headFingerprint: null,
         })
         .pipe(ignoreFailure("restore the thread of", thread.ref, undefined));
-    }
     let adopted = 0;
     let tried = 0;
     let importing = 0;

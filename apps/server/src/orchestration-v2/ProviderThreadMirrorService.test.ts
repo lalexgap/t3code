@@ -263,46 +263,69 @@ it.effect("adopts a native thread once, with its history, project and worktree",
   }).pipe(Effect.provide(testLayer)),
 );
 
-it.effect("records the provider's head before archiving and after restoring", () =>
+it.effect("marks the provider's current head before archiving and clears it after restoring", () =>
   Effect.gen(function* () {
     const mirror = yield* ProviderThreadMirror.ProviderThreadMirror;
     const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const eventSink = yield* EventSink.EventSinkV2;
     const adopted = yield* mirror.adopt(adoption("removed"));
     const threadId = adopted._tag === "Adopted" ? adopted.threadId : ThreadId.make("none");
-    const head = { driver: AM, nativeId: "removed", strength: "weak" as const, ordinal: 5 };
     const providerThreadId = (yield* projections.getThread(threadId)).activeProviderThreadId!;
+    const currentHead = () =>
+      projections
+        .getThreadRecords(threadId, ["providerThreads"])
+        .pipe(Effect.map((records) => records.providerThreads[0]?.nativeConversationHeadRef));
 
     // A thread that moved to another provider thread is left alone.
     yield* mirror.update({
       threadId,
       providerThreadId: ProviderThreadId.make("provider-thread:switched-away"),
       archived: true,
-      conversationHeadRef: { ...head, fingerprint: "am-removed" },
+      headFingerprint: "am-removed",
     });
-    const untouched = yield* projections.getThreadRecords(threadId, ["providerThreads"]);
-    assert.strictEqual(untouched.providerThreads[0]?.nativeConversationHeadRef?.ordinal, 5);
-    assert.isUndefined(untouched.providerThreads[0]?.nativeConversationHeadRef?.fingerprint);
+    assert.isUndefined((yield* currentHead())?.fingerprint);
     assert.isEmpty(archives.filter((entry) => entry.threadId === threadId));
+
+    // A turn moves the head on after the mirror listed the thread at ordinal 5.
+    const { providerThreads } = yield* projections.getThreadRecords(threadId, ["providerThreads"]);
+    const listed = providerThreads[0]!;
+    yield* eventSink.write({
+      events: [
+        {
+          id: EventId.make("removed:head-moved"),
+          type: "provider-thread.updated",
+          threadId,
+          driver: listed.driver,
+          providerInstanceId: listed.providerInstanceId,
+          occurredAt: now,
+          payload: {
+            ...listed,
+            nativeConversationHeadRef: { ...listed.nativeConversationHeadRef!, ordinal: 7 },
+          },
+        },
+      ],
+    });
 
     yield* mirror.update({
       threadId,
       providerThreadId,
       archived: true,
-      conversationHeadRef: { ...head, fingerprint: "am-removed" },
+      headFingerprint: "am-removed",
     });
-    const marked = yield* projections.getThreadRecords(threadId, ["providerThreads"]);
-    assert.strictEqual(
-      marked.providerThreads[0]?.nativeConversationHeadRef?.fingerprint,
-      "am-removed",
-    );
-    yield* mirror.update({
-      threadId,
-      providerThreadId,
-      archived: false,
-      conversationHeadRef: head,
+    assert.deepStrictEqual(yield* currentHead(), {
+      driver: AM,
+      nativeId: "removed",
+      strength: "weak",
+      ordinal: 7,
+      fingerprint: "am-removed",
     });
-    const cleared = yield* projections.getThreadRecords(threadId, ["providerThreads"]);
-    assert.deepStrictEqual(cleared.providerThreads[0]?.nativeConversationHeadRef, head);
+    yield* mirror.update({ threadId, providerThreadId, archived: false, headFingerprint: null });
+    assert.deepStrictEqual(yield* currentHead(), {
+      driver: AM,
+      nativeId: "removed",
+      strength: "weak",
+      ordinal: 7,
+    });
     assert.deepStrictEqual(
       archives.filter((entry) => entry.threadId === threadId),
       [

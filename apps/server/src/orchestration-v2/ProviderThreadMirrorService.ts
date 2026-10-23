@@ -328,15 +328,23 @@ export const layer = Layer.effectDiscard(
       return records.providerThreads.find((candidate) => candidate.id === providerThreadId);
     });
 
-    /** Reports whether the head landed; a turn writing the same row in between wins a retry. */
-    const setConversationHead = Effect.fn("ProviderThreadMirror.setConversationHead")(function* (
+    /**
+     * Reports whether the current head carries the fingerprint. A turn writing the row in between
+     * wins, and the retry marks the head it moved to.
+     */
+    const setHeadFingerprint = Effect.fn("ProviderThreadMirror.setHeadFingerprint")(function* (
       threadId: ThreadId,
       providerThreadId: OrchestrationV2ProviderThread["id"],
-      head: OrchestrationV2ProviderThread["nativeConversationHeadRef"],
+      fingerprint: string | null,
     ) {
       for (let attempt = 0; attempt < HEAD_WRITE_ATTEMPTS; attempt++) {
         const current = yield* boundProviderThread(threadId, providerThreadId);
         if (!current) return false;
+        const currentHead = current.nativeConversationHeadRef;
+        if (currentHead === null) return fingerprint === null;
+        if ((currentHead.fingerprint ?? null) === fingerprint) return true;
+        const { fingerprint: _previous, ...position } = currentHead;
+        const head = fingerprint === null ? position : { ...position, fingerprint };
         const now = yield* DateTime.now;
         const id = yield* randomUuidV4;
         const { committed } = yield* eventSink.writeIfProviderThreadUnchanged({
@@ -374,17 +382,17 @@ export const layer = Layer.effectDiscard(
       function* (input) {
         if ((yield* boundProviderThread(input.threadId, input.providerThreadId)) === undefined)
           return;
-        const head = (headRef: OrchestrationV2ProviderThread["nativeConversationHeadRef"]) =>
-          setConversationHead(input.threadId, input.providerThreadId, headRef);
-        // The head is the provider's note about why it archived, so it lands before the archive
-        // and is cleared only after the thread is back.
+        const mark = (fingerprint: string | null) =>
+          setHeadFingerprint(input.threadId, input.providerThreadId, fingerprint);
+        // The fingerprint is the provider's note about why it archived, so it lands before the
+        // archive and is cleared only after the thread is back.
         if (input.archived === true) {
-          if (input.conversationHeadRef === undefined || (yield* head(input.conversationHeadRef)))
+          if (input.headFingerprint === undefined || (yield* mark(input.headFingerprint)))
             yield* setArchived(input.threadId, true);
         } else if (input.archived === false) {
           yield* setArchived(input.threadId, false);
-          if (input.conversationHeadRef !== undefined) yield* head(input.conversationHeadRef);
-        } else if (input.conversationHeadRef !== undefined) yield* head(input.conversationHeadRef);
+          if (input.headFingerprint !== undefined) yield* mark(input.headFingerprint);
+        } else if (input.headFingerprint !== undefined) yield* mark(input.headFingerprint);
       },
       Effect.mapError(failure("update", "Could not update the thread.")),
     );

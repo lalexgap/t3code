@@ -98,14 +98,21 @@ const makeFakeMirror = Effect.fnUntraced(function* (
     update: (input) =>
       Effect.sync(() => {
         const current = threads.get(input.threadId)!;
+        const head = current.providerThread.nativeConversationHeadRef;
+        const { fingerprint: _previous, ...position } = head ?? amConversationHead("", 0);
         threads.set(input.threadId, {
           ...current,
           ...(input.archived === undefined ? {} : { archivedAt: input.archived ? now : null }),
           providerThread: {
             ...current.providerThread,
-            ...(input.conversationHeadRef === undefined
+            ...(input.headFingerprint === undefined || head === null
               ? {}
-              : { nativeConversationHeadRef: input.conversationHeadRef }),
+              : {
+                  nativeConversationHeadRef:
+                    input.headFingerprint === null
+                      ? position
+                      : { ...position, fingerprint: input.headFingerprint },
+                }),
           },
         });
         Queue.offerUnsafe(updates, input);
@@ -250,7 +257,7 @@ describe("makeAmFleetMirror", () => {
       const archived = yield* Queue.take(mirror.updates);
       assert.strictEqual(archived.threadId, "thread-gone");
       assert.isTrue(archived.archived);
-      assert.strictEqual(archived.conversationHeadRef?.fingerprint, AM_REMOVED_MARK);
+      assert.strictEqual(archived.headFingerprint, AM_REMOVED_MARK);
 
       fake.agents.set("gone", agent([], { status: "exited" }));
       yield* fleetMirror.wake;
@@ -258,7 +265,7 @@ describe("makeAmFleetMirror", () => {
       const restored = yield* Queue.take(mirror.updates);
       assert.strictEqual(restored.threadId, "thread-gone");
       assert.isFalse(restored.archived);
-      assert.deepStrictEqual(restored.conversationHeadRef, amConversationHead("gone", 3));
+      assert.isNull(restored.headFingerprint);
       // A thread the user archived stays archived while its agent keeps running.
       yield* fleetMirror.wake;
       yield* Queue.take(statuses);
