@@ -1409,11 +1409,8 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           resolveAttachmentPath: providerHost.resolveAttachmentPath,
         }).trim();
 
-      /**
-       * am restarts the agent on the same conversation only while it is idle. T3 Code does not
-       * wait for other work to end: the message would then run on a model the thread does not
-       * show, so the turn fails and says why.
-       */
+      // am restarts only an idle agent. Sending anyway would run on a model the thread does not
+      // show, so the turn fails and says why.
       const restartOnModel = Effect.fnUntraced(function* (
         ref: string,
         detail: AmAgentDetail,

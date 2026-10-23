@@ -123,7 +123,6 @@ const AM_DEFAULT_ENTRY: ServerProviderModel = {
   capabilities: null,
 };
 
-/** What an am without a model list, or one T3 cannot reach, offers. */
 export const AM_FALLBACK_MODELS: ReadonlyArray<ServerProviderModel> = [
   AM_DEFAULT_ENTRY,
   ...PROVIDERS.map((provider) => ({
@@ -222,7 +221,6 @@ export const amModelChange = (
   };
 };
 
-/** Why the selection cannot run on this agent at all, if it cannot. */
 export const amProviderMismatch = (
   ref: string,
   detail: Pick<AmAgentDetail, "provider">,
