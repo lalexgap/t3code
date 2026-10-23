@@ -688,10 +688,12 @@ describe("DesktopBackendConfiguration", () => {
       const previousWslEnv = process.env.WSLENV;
       const previousDisabled = process.env.OTEL_SDK_DISABLED;
       const previousTelemetry = process.env.T3CODE_TELEMETRY_ENABLED;
+      const previousUpdatesDisabled = process.env.T3CODE_DISABLE_SERVER_UPDATE;
       try {
         delete process.env.WSLENV;
         process.env.OTEL_SDK_DISABLED = "true";
         process.env.T3CODE_TELEMETRY_ENABLED = "false";
+        process.env.T3CODE_DISABLE_SERVER_UPDATE = "1";
 
         yield* Effect.gen(function* () {
           const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
@@ -701,6 +703,8 @@ describe("DesktopBackendConfiguration", () => {
           assert.include((config.env.WSLENV ?? "").split(":"), "OTEL_SDK_DISABLED");
           assert.equal(config.env.T3CODE_TELEMETRY_ENABLED, "false");
           assert.include((config.env.WSLENV ?? "").split(":"), "T3CODE_TELEMETRY_ENABLED");
+          assert.equal(config.env.T3CODE_DISABLE_SERVER_UPDATE, "1");
+          assert.include((config.env.WSLENV ?? "").split(":"), "T3CODE_DISABLE_SERVER_UPDATE");
         }).pipe(
           Effect.provide(
             layerBackendConfiguration().pipe(
@@ -722,6 +726,7 @@ describe("DesktopBackendConfiguration", () => {
         restoreEnv("WSLENV", previousWslEnv);
         restoreEnv("OTEL_SDK_DISABLED", previousDisabled);
         restoreEnv("T3CODE_TELEMETRY_ENABLED", previousTelemetry);
+        restoreEnv("T3CODE_DISABLE_SERVER_UPDATE", previousUpdatesDisabled);
       }
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
