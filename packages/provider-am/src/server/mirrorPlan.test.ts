@@ -67,8 +67,8 @@ describe("planMirror", () => {
     assert.deepStrictEqual(refs(result.imports), [
       "working",
       "idle-long-ago",
-      "stopped-recently",
       "dead-recently",
+      "stopped-recently",
     ]);
   });
 

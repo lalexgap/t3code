@@ -61,6 +61,7 @@ export interface MirrorWatch {
 export interface MirrorPlan {
   /** False when am cannot read the fleet host, so its missing agents prove nothing. */
   readonly reachable: boolean;
+  /** Live agents first, then the most recently active. */
   readonly imports: ReadonlyArray<AmFleetRow & { readonly ref: string }>;
   readonly archive: ReadonlyArray<MirrorThreadView>;
   readonly unarchive: ReadonlyArray<MirrorThreadView>;
@@ -100,7 +101,12 @@ export const planMirror = (input: MirrorPlanInput): MirrorPlan => {
         !bound.has(ref) &&
         (liveness.get(ref) === "live" || input.nowMs - timeMs(row.updatedAt) <= windowMs),
     )
-    .map(([ref, row]) => ({ ...row, ref }));
+    .map(([ref, row]) => ({ ...row, ref }))
+    .toSorted(
+      (left, right) =>
+        Number(liveness.get(right.ref) === "live") - Number(liveness.get(left.ref) === "live") ||
+        timeMs(right.updatedAt) - timeMs(left.updatedAt),
+    );
   const archive: Array<MirrorThreadView> = [];
   const unarchive: Array<MirrorThreadView> = [];
   const watch: Array<MirrorWatch> = [];
@@ -182,13 +188,15 @@ export const amHistory = (
 
 export const amMirrorStatus = (input: {
   readonly mirrored: number;
+  readonly importing?: number;
   readonly missingWorkspaces: number;
   readonly host: string;
 }) => {
   const agents = (count: number) => `${count} ${count === 1 ? "agent" : "agents"}`;
+  const importing = input.importing ? ` Importing ${input.importing} more.` : "";
   const missing =
     input.missingWorkspaces > 0
       ? ` ${input.missingWorkspaces === 1 ? "1 agent works in a project" : `${input.missingWorkspaces} agents work in projects`} with no copy on this machine.`
       : "";
-  return `Mirroring ${agents(input.mirrored)}${input.host ? ` on ${input.host}` : ""}.${missing}`;
+  return `Mirroring ${agents(input.mirrored)}${input.host ? ` on ${input.host}` : ""}.${importing}${missing}`;
 };

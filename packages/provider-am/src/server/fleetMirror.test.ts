@@ -13,6 +13,7 @@ import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as HttpClient from "effect/http/HttpClient";
 
@@ -34,7 +35,7 @@ const testLayer = Layer.mergeAll(
 const AM = ProviderDriverKind.make("am");
 const INSTANCE_ID = ProviderInstanceId.make("am_fleet");
 const decodeSettings = Schema.decodeSync(AmSettings);
-/** Real time: the mirror reads the live clock to age agents out. */
+/** Relative to the clock the mirror ages agents out by. */
 const daysAgo = (now: DateTime.Utc, days: number) =>
   DateTime.formatIso(DateTime.subtract(now, { days }));
 
@@ -151,7 +152,7 @@ const turnHistory = (count: number): Array<FakeEntry> =>
   );
 
 describe("makeAmFleetMirror", () => {
-  it.live("imports new agents with bounded history and leaves owned or aged-out ones", () =>
+  it.effect("imports new agents with bounded history and leaves owned or aged-out ones", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();
       const now = yield* DateTime.now;
@@ -163,11 +164,13 @@ describe("makeAmFleetMirror", () => {
       const mirror = yield* makeFakeMirror([{ ref: "t3-owned-abc123", head: null }]);
       const { statuses } = yield* startMirror(fake, mirror);
 
-      const adopted = [
-        yield* Queue.take(mirror.adoptions),
-        yield* Queue.take(mirror.adoptions),
-        yield* Queue.take(mirror.adoptions),
-      ];
+      const adopted: Array<ProviderThreadMirror.ProviderThreadAdoption> = [];
+      let status = "";
+      for (let step = 0; step < 3; step++) {
+        if (step > 0) yield* TestClock.adjust("1 second");
+        status = yield* Queue.take(statuses);
+        adopted.push(yield* Queue.take(mirror.adoptions));
+      }
       assert.deepStrictEqual(adopted.map((adoption) => adoption.nativeThreadId).toSorted(), [
         "elsewhere",
         "recent",
@@ -183,9 +186,47 @@ describe("makeAmFleetMirror", () => {
       // The thread's head starts at the end, so mirroring picks up only new work.
       assert.strictEqual(worker.conversationHeadRef?.ordinal, 450);
       assert.strictEqual(
-        yield* Queue.take(statuses),
+        status,
         "Mirroring 3 agents. 1 agent works in a project with no copy on this machine.",
       );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("imports a large fleet one agent per step, live and recent agents first", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      const fleet = 12;
+      for (let index = 0; index < fleet; index++)
+        fake.agents.set(
+          `agent-${index}`,
+          agent([{ kind: "user", text: `task ${index}` }], {
+            status: index === 7 ? "working" : "exited",
+            updatedAt: `2026-01-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`,
+          }),
+        );
+      const mirror = yield* makeFakeMirror([]);
+      // The test clock starts in 1970, so no agent has aged out.
+      const { statuses } = yield* startMirror(fake, mirror);
+
+      const order: Array<string> = [];
+      for (let step = 1; step <= fleet; step++) {
+        if (step > 1) yield* TestClock.adjust("1 second");
+        const status = yield* Queue.take(statuses);
+        order.push((yield* Queue.take(mirror.adoptions)).nativeThreadId);
+        assert.strictEqual(yield* Queue.size(mirror.adoptions), 0);
+        assert.strictEqual(
+          status,
+          step < fleet
+            ? `Mirroring ${step} ${step === 1 ? "agent" : "agents"}. Importing ${fleet - step} more.`
+            : `Mirroring ${fleet} agents.`,
+        );
+      }
+      assert.deepStrictEqual(order, [
+        "agent-7",
+        ...Array.from({ length: fleet }, (_, index) => `agent-${fleet - 1 - index}`).filter(
+          (ref) => ref !== "agent-7",
+        ),
+      ]);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

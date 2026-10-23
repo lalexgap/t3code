@@ -43,6 +43,10 @@ const EVENT_DEBOUNCE_MS = 1_500;
 const EVENT_RECONNECT_MS = 5_000;
 // An observation request waits behind any T3 turn; ask again only if it never ran.
 const OBSERVE_RETRY_MS = 120_000;
+// One adoption commits up to ~400 events in one transaction. Importing one per step keeps a first
+// sync of a large fleet from overflowing live subscribers' buffers or holding the writer.
+const IMPORTS_PER_STEP = 1;
+const IMPORT_PACE_MS = 1_000;
 
 export interface AmFleetMirrorOptions {
   readonly instanceId: ProviderInstanceId;
@@ -85,6 +89,8 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
   const observeRequested = new Map<string, { readonly at: number; readonly head?: number }>();
   /** Agents whose project has no copy here, until am reports a change to them. */
   const missingWorkspaces = new Map<string, string>();
+  /** Tried since the imports last caught up, so a failing agent cannot hold up the rest. */
+  const triedImports = new Set<string>();
 
   /** Reports whether the agent now has a thread. */
   const adopt = Effect.fnUntraced(function* (row: AmFleetRow & { readonly ref: string }) {
@@ -189,7 +195,7 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
     });
     if (!plan.reachable) {
       yield* SubscriptionRef.set(status, `Agent Motel cannot reach ${host} to mirror its agents.`);
-      return;
+      return false;
     }
     const ignoreFailure = <A>(what: string, ref: string, fallback: A) =>
       Effect.catchCause((cause) =>
@@ -216,8 +222,19 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
         .pipe(ignoreFailure("restore the thread of", thread.ref, undefined));
     }
     let adopted = 0;
-    for (const row of plan.imports)
+    let tried = 0;
+    let importing = 0;
+    for (const row of plan.imports) {
+      if (triedImports.has(row.ref) || missingWorkspaces.get(row.ref) === row.updatedAt) continue;
+      if (tried === IMPORTS_PER_STEP) {
+        importing++;
+        continue;
+      }
+      tried++;
+      triedImports.add(row.ref);
       if (yield* adopt(row).pipe(ignoreFailure("import", row.ref, false))) adopted++;
+    }
+    if (importing === 0) triedImports.clear();
     for (const { thread, row } of plan.watch)
       yield* follow(thread, row).pipe(ignoreFailure("follow", thread.ref, undefined));
     previous = plan.liveness;
@@ -227,10 +244,12 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
       status,
       amMirrorStatus({
         mirrored: plan.mirrored + plan.unarchive.length + adopted,
+        importing,
         missingWorkspaces: missingWorkspaces.size,
         host,
       }),
     );
+    return importing > 0;
   });
 
   if (enabled) {
@@ -244,11 +263,17 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
     ]).pipe(Effect.map(([generic, instance]) => generic || instance));
     yield* Effect.gen(function* () {
       while (true) {
-        yield* reconcile().pipe(
+        const importing = yield* reconcile().pipe(
           Effect.catchCause((cause) =>
-            Effect.logWarning("Could not mirror the Agent Motel fleet", cause),
+            Effect.logWarning("Could not mirror the Agent Motel fleet", cause).pipe(
+              Effect.as(false),
+            ),
           ),
         );
+        if (importing) {
+          yield* Effect.sleep(IMPORT_PACE_MS);
+          continue;
+        }
         const wait = (yield* hasDemand) ? interval : Math.max(interval, IDLE_INTERVAL_MS);
         yield* Queue.take(wake).pipe(
           Effect.timeoutOrElse({ duration: wait, orElse: () => Effect.void }),

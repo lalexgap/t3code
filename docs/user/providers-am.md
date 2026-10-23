@@ -62,8 +62,9 @@ T3 Code keeps a thread for each agent in am's fleet, including agents you start 
 plus stopped agents active within the chosen window (7 days unless you change it). **Off** turns
 mirroring off; threads that already exist stay. Each Agent Motel instance mirrors its own Fleet
 host. Refresh provider status, or run **Sync Agent Motel agents** from the command palette, to sync
-now; otherwise it syncs about every 30 seconds, or every minute for a fleet host. Provider status
-shows how many agents it mirrors.
+now; otherwise it syncs about every 30 seconds, or every minute for a fleet host. New agents import
+one a second, running ones first. Provider status shows how many agents it mirrors and how many are
+still importing.
 
 - **Projects.** A new thread lands in the project for the agent's directory, which T3 Code adds if
   you do not have it yet. An agent that am runs in a worktree of its own lands in the repository's
