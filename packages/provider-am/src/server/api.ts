@@ -38,6 +38,8 @@ export const AmAgentDetail = Schema.Struct({
   statusReason: Schema.optional(Schema.NullOr(Schema.String)),
   provider: Schema.String,
   dir: Schema.String,
+  /** Messages waiting for delivery; a fleet host's detail may omit it. */
+  queue: Schema.optional(Schema.Array(Schema.Unknown)),
   /** Set by an am whose `send --json` returns receipt ids; a fleet host's reflects that host's am. */
   messageReceipts: Schema.optional(Schema.Boolean),
 });

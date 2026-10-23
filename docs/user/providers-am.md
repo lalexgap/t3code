@@ -65,9 +65,9 @@ unless you turn on **Stop agents when their thread is archived**. Both are in
 settled** to keep agents running. The mobile app has no editor for these settings, so change them
 from web or desktop.
 
-An agent that is working, or waiting on a prompt in its terminal, is never stopped: the thread
-shows a note saying so, and you can stop it with `am stop <name>`. An agent another active thread
-still uses keeps running too. The thread also notes when its agent was stopped. A stopped agent
+An agent that is working, waiting on a prompt in its terminal, or holding scheduled work,
+background shells or queued messages is never stopped: the thread shows a note saying so, and you
+can stop it with `am stop <name>`. An agent another active thread still uses keeps running too. The thread also notes when its agent was stopped. A stopped agent
 keeps its mirrored thread; T3 Code never removes an agent.
 
 ## Mirrored agents

@@ -38,6 +38,8 @@ export const makeAmThreadLifecycle = (
       if (phase === "gone") return null;
       if (phase === "running") return busy("is working");
       if (phase === "attention") return busy("is waiting on a prompt in its terminal");
+      if (detail.value.status === "waiting") return busy("has scheduled or background work");
+      if ((detail.value.queue?.length ?? 0) > 0) return busy("has queued messages");
       // The user may have taken the thread back, and sent it work, while am answered.
       if (!(yield* change.stillApplies) || options.busyAgents.has(ref)) return null;
       const stopped = yield* api.stop(ref).pipe(

@@ -92,6 +92,7 @@ describe("makeAmThreadLifecycle", () => {
     ["working", "is working"],
     ["starting", "is working"],
     ["needs-attention", "is waiting on a prompt in its terminal"],
+    ["waiting", "has scheduled or background work"],
   ] as const)("leaves a %s agent running and says so", ([status, reason]) =>
     Effect.gen(function* () {
       const { fake, lifecycle, stops } = yield* setup();
@@ -101,6 +102,19 @@ describe("makeAmThreadLifecycle", () => {
       assert.strictEqual(
         notice,
         `The Agent Motel agent ${AGENT} ${reason}, so it was not stopped when this thread was settled. Stop it with \`am stop ${AGENT}\`.`,
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("leaves an idle agent with queued messages running and says so", () =>
+    Effect.gen(function* () {
+      const { fake, lifecycle, stops } = yield* setup();
+      fake.agents.set(AGENT, { ...agent("idle"), queue: [{ id: "msg-1" }] });
+      const notice = yield* lifecycle(change());
+      assert.deepStrictEqual(stops(), []);
+      assert.strictEqual(
+        notice,
+        `The Agent Motel agent ${AGENT} has queued messages, so it was not stopped when this thread was settled. Stop it with \`am stop ${AGENT}\`.`,
       );
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );

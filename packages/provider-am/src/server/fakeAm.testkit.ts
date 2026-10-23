@@ -15,6 +15,8 @@ export interface FakeAgent {
   dir: string;
   provider: string;
   entries: Array<FakeEntry>;
+  /** Messages am holds for delivery, shown on the agent's detail. */
+  queue?: Array<unknown>;
   /** am's last state change, ISO; the fleet list reports it as the agent's activity. */
   updatedAt?: string;
   worktreePath?: string;
@@ -159,7 +161,7 @@ export const makeFakeAm = Effect.fnUntraced(function* (
         statusReason: agent.statusReason ?? null,
         provider: agent.provider,
         dir: agent.dir,
-        queue: [],
+        queue: agent.queue ?? [],
         pane: null,
         ...receiptsFlag,
       });
