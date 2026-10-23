@@ -123,8 +123,9 @@ the thread shows it as an approval with the provider's own choices, on any devic
 agent's prompt shows in its **Agent Motel activity** run. Answering it answers the agent, and the
 prompt in its terminal closes. A prompt answered in the terminal, or by another client, leaves the
 thread. Claude stops waiting for an answer from am after a while (2 minutes by default) and its own
-prompt carries on in the terminal; the thread then says so. A fleet host's prompts appear within a
-few seconds.
+prompt carries on in the terminal; the thread then says so. A fleet host's prompts usually appear
+within a few seconds, and at most about 30 seconds. A prompt whose input is too long to show in full
+offers only the provider's deny choices; to approve it, answer in the agent's session.
 
 With an older am, or for a prompt am cannot relay, such as one from a Codex subagent, the thread
 says the agent is waiting; answer it in the agent's session with `am j <name>`.

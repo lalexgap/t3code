@@ -1860,6 +1860,28 @@ describe("AmAdapterV2", () => {
       }).pipe(Effect.scoped, Effect.provide(testLayer)),
     );
 
+    it.live(
+      "still finds a fleet host's prompt while another tool call keeps the agent working",
+      () =>
+        Effect.gen(function* () {
+          const fake = yield* makeFakeAm({ permissionRequests: true });
+          const ref = `gapserver:${AGENT}`;
+          fake.agents.set(ref, idleAgent());
+          const remote = decodeSettings({ enabled: true, apiToken: FAKE_TOKEN, host: "gapserver" });
+          const harness = yield* makeHarness(fake, undefined, remote, 100);
+          yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, "Remote job"));
+          const sent = yield* fake.takeCall(
+            "POST",
+            `/api/agents/${encodeURIComponent(ref)}/messages`,
+          );
+          yield* deliver(fake, sent.messageId!, user("Remote job"));
+          fake.agents.get(ref)!.status = "working";
+          yield* fake.prompt(ref, CLAUDE_PROMPT, false);
+          const card = yield* harness.takeApproval();
+          assert.strictEqual(card.title, "Bash");
+        }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+
     it.live("lists a fleet host's prompt the run's agent detail already counts", () =>
       Effect.gen(function* () {
         const fake = yield* makeFakeAm({ permissionRequests: true });

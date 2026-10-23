@@ -95,6 +95,8 @@ const FULL_ACCESS_ONLY = "Agent Motel only runs in Full access";
 const ATTENTION_GRACE_MS = 2_000;
 // am expires a request only when it is read, so T3 reads again once a deadline has passed.
 const EXPIRY_SLACK_MS = 250;
+// Well inside am's two-minute wait for a Claude prompt.
+const FLEET_PROMPTS_REFRESH_POLLS = 6;
 
 const AmProviderCapabilitiesV2 = {
   // The agent's own provider enforces permissions; T3 never answers for it.
@@ -259,6 +261,8 @@ interface ActiveTurn {
   permissions: "unknown" | "supported" | "unsupported";
   /** The run's agent detail counted prompts not listed since. */
   promptsCounted: boolean;
+  /** When a fleet host's prompts were last counted or listed. */
+  promptsCheckedAt: number;
   /** When the agent was first seen waiting with no prompt listed, while am relays prompts. */
   attentionSince: number | undefined;
   readonly done: Deferred.Deferred<void>;
@@ -372,6 +376,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
       let receiptsConfirmed = false;
       /** The agent's permission prompts T3 has shown, by runtime request id. */
       const requests = new Map<string, AmPendingRequest>();
+      const fleetPromptsRefreshMs = (options.pollIntervalMs ?? 5_000) * FLEET_PROMPTS_REFRESH_POLLS;
       const forgetFinished = (request: AmPendingRequest) => {
         if (
           active !== request.turn &&
@@ -883,12 +888,15 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           const value = Option.getOrUndefined(detail.value);
           turn.permissions = value?.permissionRequests === true ? "supported" : "unsupported";
           turn.promptsCounted = (value?.pendingPermissions ?? 0) > 0;
+          turn.promptsCheckedAt = yield* Clock.currentTimeMillis;
         }
         if (turn.permissions !== "supported") return;
-        // A fleet host's listing is an ssh round trip, so it is read only while a prompt may be open.
+        // A fleet host's listing is an ssh round trip, so it is read only while a prompt may be open,
+        // and now and then since a sibling tool call's hook can report the agent working meanwhile.
         if (
           parseAmAgentRef(ref).host !== undefined &&
           !turn.promptsCounted &&
+          (yield* Clock.currentTimeMillis) - turn.promptsCheckedAt < fleetPromptsRefreshMs &&
           status !== "waiting" &&
           amTurnPhase(status) !== "attention" &&
           pendingRequestsOf(turn).length === 0
@@ -907,6 +915,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         );
         if (listed._tag === "None" || active !== turn) return;
         turn.promptsCounted = false;
+        turn.promptsCheckedAt = yield* Clock.currentTimeMillis;
         const shown = new Set(
           [...requests.values()].filter((request) => request.turn === turn).map((r) => r.amId),
         );
@@ -1509,6 +1518,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           settleWakePending: false,
           permissions: init.permissions ?? "unknown",
           promptsCounted: init.promptsCounted ?? false,
+          promptsCheckedAt: yield* Clock.currentTimeMillis,
           attentionSince: undefined,
           done: yield* Deferred.make<void>(),
         };
