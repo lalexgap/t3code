@@ -41,17 +41,35 @@ export const makeAmThreadLifecycle = (
       if (phase === "attention") return busy("is waiting on a prompt in its terminal");
       if (detail.value.status === "waiting") return busy("has scheduled or background work");
       if ((detail.value.queue?.length ?? 0) > 0) return busy("has queued messages");
+      // An am without the conditional stop would stop the agent even if work arrived since. Health
+      // speaks for the am T3 talks to; a fleet host's detail speaks for that host's am.
+      const tooOld = `The Agent Motel agent ${ref} was not stopped when this thread was ${change.event}: update am so T3 Code can stop it only while it is idle.`;
+      if (detail.value.stopIfIdle !== true || (yield* api.health).stopIfIdle !== true)
+        return tooOld;
       // The user may have taken the thread back, and sent it work, while am answered.
       if (!(yield* change.stillApplies) || options.busyAgents.has(ref)) return null;
-      const stopped = yield* api.stop(ref).pipe(
-        Effect.as(true),
+      const result = yield* api.stopIfIdle(ref).pipe(
+        Effect.map(Option.some),
         // am no longer has the agent, so there is nothing left to stop.
         Effect.catchIf(
           (error) => error.status === 404,
-          () => Effect.succeed(false),
+          () => Effect.succeedNone,
         ),
       );
-      return stopped ? `Stopped the Agent Motel agent ${ref}. Send a message to resume it.` : null;
+      if (Option.isNone(result)) return null;
+      // am re-checks under its delivery lock, so work that arrived since the checks above wins.
+      if (!result.value.stopped)
+        switch (result.value.reason) {
+          case "busy":
+            return busy("is working");
+          case "queued":
+            return busy("has queued messages");
+          case "in_turn":
+            return busy("is still finishing a turn");
+          case "remote_too_old":
+            return tooOld;
+        }
+      return `Stopped the Agent Motel agent ${ref}. Send a message to resume it.`;
     },
     (effect, change) =>
       effect.pipe(

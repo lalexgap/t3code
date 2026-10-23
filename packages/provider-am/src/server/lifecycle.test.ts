@@ -40,8 +40,9 @@ const change = (
 const setup = Effect.fnUntraced(function* (
   settings: Partial<AmSettings> = {},
   busyAgents: ReadonlySet<string> = new Set(),
+  fakeOptions: Parameters<typeof makeFakeAm>[0] = {},
 ) {
-  const fake = yield* makeFakeAm();
+  const fake = yield* makeFakeAm(fakeOptions);
   const lifecycle = makeAmThreadLifecycle({
     settings: decodeSettings({
       enabled: true,
@@ -75,8 +76,8 @@ describe("makeAmThreadLifecycle", () => {
       fake.agents.set(ref, agent("idle"));
       const notice = yield* lifecycle(change({ nativeThreadId: ref }));
       assert.deepStrictEqual(
-        stops().map((call) => [call.method, call.path]),
-        [["POST", `/api/agents/${encodeURIComponent(ref)}/stop`]],
+        stops().map((call) => [call.method, call.path, call.body]),
+        [["POST", `/api/agents/${encodeURIComponent(ref)}/stop`, { ifIdle: true }]],
       );
       assert.strictEqual(fake.agents.get(ref)?.status, "exited");
       assert.strictEqual(
@@ -116,6 +117,69 @@ describe("makeAmThreadLifecycle", () => {
         notice,
         `The Agent Motel agent ${AGENT} has queued messages, so it was not stopped when this thread was settled. Stop it with \`am stop ${AGENT}\`.`,
       );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live.each([
+    ["busy", "is working"],
+    ["queued", "has queued messages"],
+    ["in_turn", "is still finishing a turn"],
+  ] as const)("keeps an agent am refuses to stop as %s, and says why", ([reason, what]) =>
+    Effect.gen(function* () {
+      const { fake, lifecycle, stops } = yield* setup();
+      // Work that reached am after T3's own checks: only am, under its delivery lock, sees it.
+      fake.agents.set(AGENT, { ...agent("idle"), stopRefusal: { error: "not idle", reason } });
+      const notice = yield* lifecycle(change());
+      assert.strictEqual(stops().length, 1);
+      assert.strictEqual(fake.agents.get(AGENT)?.status, "idle");
+      assert.strictEqual(
+        notice,
+        `The Agent Motel agent ${AGENT} ${what}, so it was not stopped when this thread was settled. Stop it with \`am stop ${AGENT}\`.`,
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("keeps an agent whose delivered message am still counts as mid-turn", () =>
+    Effect.gen(function* () {
+      const { fake, lifecycle } = yield* setup();
+      fake.agents.set(AGENT, agent("idle"));
+      fake.messages.set("msg-1", {
+        agent: AGENT,
+        text: "one more thing",
+        mode: "queue",
+        state: "delivered",
+        transcriptIndex: 0,
+      });
+      const notice = yield* lifecycle(change());
+      assert.strictEqual(fake.agents.get(AGENT)?.status, "idle");
+      assert.include(notice ?? "", "is still finishing a turn");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  const tooOld = `The Agent Motel agent ${AGENT} was not stopped when this thread was settled: update am so T3 Code can stop it only while it is idle.`;
+
+  it.live("never asks an am without the conditional stop to stop, and says to update it", () =>
+    Effect.gen(function* () {
+      const { fake, lifecycle, stops } = yield* setup({}, new Set(), { stopIfIdle: false });
+      fake.agents.set(AGENT, agent("idle"));
+      assert.strictEqual(yield* lifecycle(change()), tooOld);
+      assert.deepStrictEqual(stops(), []);
+      assert.strictEqual(fake.agents.get(AGENT)?.status, "idle");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("says to update am when a fleet host's am is too old to stop only while idle", () =>
+    Effect.gen(function* () {
+      const { fake, lifecycle } = yield* setup();
+      fake.agents.set(AGENT, {
+        ...agent("idle"),
+        stopRefusal: {
+          error: "remote am too old on laptop (no stop --if-idle)",
+          reason: "remote_too_old",
+        },
+      });
+      assert.strictEqual(yield* lifecycle(change()), tooOld);
+      assert.strictEqual(fake.agents.get(AGENT)?.status, "idle");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

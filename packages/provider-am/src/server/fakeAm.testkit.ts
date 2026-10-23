@@ -22,6 +22,8 @@ export interface FakeAgent {
   worktreePath?: string;
   worktreeBranch?: string;
   repoRoot?: string;
+  /** The next conditional stop answers this 409, as when work arrives between T3's checks and am's. */
+  stopRefusal?: { readonly error: string; readonly reason: string };
 }
 
 export interface FakeMessage {
@@ -65,9 +67,13 @@ export const makeFakeAm = Effect.fnUntraced(function* (
     readonly hosts?: ReadonlyArray<{ name: string; reachable: boolean }>;
     /** False plays an am from before message receipts, on health and on agent detail. */
     readonly messageReceipts?: boolean;
+    /** False plays an am from before the conditional stop: it ignores `ifIdle` and stops regardless. */
+    readonly stopIfIdle?: boolean;
   } = {},
 ) {
   const receiptsFlag = options.messageReceipts === false ? {} : { messageReceipts: true };
+  const stopIfIdle = options.stopIfIdle !== false;
+  const capabilities = { ...receiptsFlag, ...(stopIfIdle ? { stopIfIdle: true } : {}) };
   const calls = yield* Queue.unbounded<FakeCall>();
   /** Keyed by am address: a bare name, or `host:name` for a fleet host's agent. */
   const agents = new Map<string, FakeAgent>();
@@ -104,7 +110,7 @@ export const makeFakeAm = Effect.fnUntraced(function* (
     log.push(call);
     Queue.offerUnsafe(calls, call);
     if (parts[0] === "health" && method === "GET")
-      return json(res, 200, { ok: true, name: "am", ...receiptsFlag });
+      return json(res, 200, { ok: true, name: "am", ...capabilities });
     if (parts[0] === "hosts" && method === "GET")
       return json(res, 200, { local: "fake-local", hosts: options.hosts ?? [] });
     if (parts[0] === "events" && method === "GET") {
@@ -163,7 +169,7 @@ export const makeFakeAm = Effect.fnUntraced(function* (
         dir: agent.dir,
         queue: agent.queue ?? [],
         pane: null,
-        ...receiptsFlag,
+        ...capabilities,
       });
     if (parts[2] === "transcript" && method === "GET") {
       const after = Number(url.searchParams.get("after") ?? "0");
@@ -288,6 +294,24 @@ export const makeFakeAm = Effect.fnUntraced(function* (
       return json(res, 200, { ok: true });
     }
     if (parts[2] === "stop" && method === "POST") {
+      if (stopIfIdle && body?.ifIdle === true) {
+        const refuse = (error: string, reason: string) => json(res, 409, { error, reason });
+        if (agent.stopRefusal) {
+          const { error, reason } = agent.stopRefusal;
+          delete agent.stopRefusal;
+          return refuse(error, reason);
+        }
+        if (["working", "starting", "waiting", "needs-attention"].includes(agent.status))
+          return refuse(`agent "${name}" is ${agent.status}`, "busy");
+        if ((agent.queue?.length ?? 0) > 0)
+          return refuse(`agent "${name}" has queued messages`, "queued");
+        for (const message of messages.values())
+          if (message.agent === name && message.state === "delivered")
+            return refuse(
+              `agent "${name}" has a delivered message whose turn has not finished`,
+              "in_turn",
+            );
+      }
       agent.status = "exited";
       return json(res, 200, { ok: true });
     }

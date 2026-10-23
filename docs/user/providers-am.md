@@ -68,6 +68,9 @@ from web or desktop.
 An agent that is working, waiting on a prompt in its terminal, or holding scheduled work,
 background shells or queued messages is never stopped: the thread shows a note saying so, and you
 can stop it with `am stop <name>`. An agent another active thread still uses keeps running too.
+am checks again as it stops the agent, so work that reaches it in the meantime keeps it running.
+This needs a recent am, on the agent's host too; with an older one, the thread notes that the agent
+was not stopped and asks you to update am.
 The thread also notes when its agent was stopped, or had stopped already. A stopped agent keeps its
 mirrored thread; T3 Code never removes an agent.
 
