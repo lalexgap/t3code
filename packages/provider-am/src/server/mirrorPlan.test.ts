@@ -299,6 +299,22 @@ describe("amHistory", () => {
     assert.include(notice ?? "", "50 earlier transcript entries");
   });
 
+  it("budgets history by its serialized size, which JSON escaping grows", () => {
+    const entries: Array<AmTranscriptEntry> = Array.from({ length: 100 }, (_, index) => ({
+      index,
+      kind: "user",
+      text: `${index} `.padEnd(16_000, "\u0000"),
+    }));
+    const { history } = amHistory("worker", entries, 100);
+    // Every history entry is written as a message and as a turn item.
+    const emitted = history.reduce(
+      (sum, message) => sum + 2 * new TextEncoder().encode(JSON.stringify(message.text)).length,
+      0,
+    );
+    assert.isAtMost(emitted, 1_000_000);
+    assert.isTrue(history.at(-1)!.text.startsWith("99 "));
+  });
+
   it("drops the oldest messages beyond the history's text budget", () => {
     // 100 clipped messages of 16k four-byte characters, far beyond the budget.
     const entries: Array<AmTranscriptEntry> = Array.from({ length: 100 }, (_, index) => ({

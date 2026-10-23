@@ -12,10 +12,10 @@ import { amAgentRef, amTurnPhase } from "./mapping.ts";
 export const AM_MIRROR_ENTRY_LIMIT = 200;
 const MESSAGE_TEXT_LIMIT = 16_000;
 /**
- * Text one adoption or one transcript read sends, in UTF-8 bytes. Each message is written twice
- * (message and turn item), and either must stay well inside a live subscriber's 8MB buffer.
+ * What the text of one adoption or one transcript read may add to its events, serialized as JSON.
+ * Either must stay well inside a live subscriber's 8MB buffer, envelopes included.
  */
-export const AM_TEXT_BYTE_LIMIT = 1_000_000;
+export const AM_EMITTED_BYTE_LIMIT = 1_000_000;
 const DAY_MS = 86_400_000;
 /** Marks a conversation head whose thread the mirror archived because am no longer has the agent. */
 export const AM_REMOVED_MARK = "am-removed";
@@ -221,10 +221,21 @@ export const amClipEntry = (entry: AmTranscriptEntry): AmTranscriptEntry => ({
 
 const utf8 = new TextEncoder();
 
-/** The UTF-8 bytes of an entry's text and tool fields. */
-export const amEntryTextBytes = (entry: AmTranscriptEntry) =>
-  utf8.encode(`${entry.text ?? ""}${entry.name ?? ""}${entry.input ?? ""}${entry.output ?? ""}`)
-    .length;
+/** A field's size once serialized: JSON escapes control characters to six. */
+const serializedBytes = (value: string | undefined) =>
+  value === undefined ? 0 : utf8.encode(JSON.stringify(value)).length;
+
+/**
+ * What an entry's text and tool fields add to the events a run emits for it, serialized. A reply
+ * is sent as a message and as a turn item.
+ */
+export const amEntryEmittedBytes = (entry: AmTranscriptEntry) =>
+  entry.kind === "assistant"
+    ? 2 * serializedBytes(entry.text)
+    : serializedBytes(entry.text) +
+      serializedBytes(entry.name) +
+      serializedBytes(entry.input) +
+      serializedBytes(entry.output);
 
 /**
  * The newest entries of a transcript tail as plain history, within the entry and text budgets;
@@ -237,12 +248,13 @@ export const amHistory = (
   total: number,
 ) => {
   const tail = entries.slice(-AM_MIRROR_ENTRY_LIMIT);
-  let budget = AM_TEXT_BYTE_LIMIT;
+  let budget = AM_EMITTED_BYTE_LIMIT;
   let start = tail.length;
   for (let index = tail.length - 1; index >= 0; index--) {
     const text = tail[index]!.kind === "tool" ? undefined : tail[index]!.text?.trim();
     if (text) {
-      const bytes = utf8.encode(clip(tail[index]!.text!)).length;
+      // Each history entry is written as a message and as a turn item.
+      const bytes = 2 * serializedBytes(clip(tail[index]!.text!));
       if (bytes > budget) break;
       budget -= bytes;
     }

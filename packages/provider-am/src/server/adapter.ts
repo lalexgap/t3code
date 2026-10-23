@@ -39,10 +39,10 @@ import type {
 } from "./api.ts";
 import {
   AM_MIRROR_ENTRY_LIMIT,
-  AM_TEXT_BYTE_LIMIT,
+  AM_EMITTED_BYTE_LIMIT,
   amClipEntry,
   amConversationHead,
-  amEntryTextBytes,
+  amEntryEmittedBytes,
   amMirroredThrough,
 } from "./mirrorPlan.ts";
 import {
@@ -533,11 +533,11 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
         const clipped = entries.map(amClipEntry);
         const reading = Math.max(start, turn.cursor ?? start);
         let shown = Math.max(reading, total - AM_MIRROR_ENTRY_LIMIT);
-        let budget = AM_TEXT_BYTE_LIMIT;
+        let budget = AM_EMITTED_BYTE_LIMIT;
         for (let index = clipped.length - 1; index >= 0; index--) {
           const entry = clipped[index]!;
           if (entry.index < shown) break;
-          budget -= amEntryTextBytes(entry);
+          budget -= amEntryEmittedBytes(entry);
           if (budget < 0) {
             shown = entry.index + 1;
             break;

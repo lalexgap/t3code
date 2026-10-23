@@ -32,7 +32,7 @@ import { makeAmAdapterV2 } from "./adapter.ts";
 import { makeAmApi } from "./api.ts";
 import { FAKE_TOKEN, makeFakeAm, type FakeAgent, type FakeEntry } from "./fakeAm.testkit.ts";
 import { amAgentName } from "./mapping.ts";
-import { AM_MIRROR_ENTRY_LIMIT, AM_TEXT_BYTE_LIMIT, amConversationHead } from "./mirrorPlan.ts";
+import { AM_MIRROR_ENTRY_LIMIT, AM_EMITTED_BYTE_LIMIT, amConversationHead } from "./mirrorPlan.ts";
 
 const testLayer = Layer.mergeAll(
   NodeServices.layer,
@@ -1296,6 +1296,44 @@ describe("AmAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.live("budgets a read by its serialized size, not its raw text", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      fake.agents.set(AGENT, {
+        ...idleAgent([user("Fix it"), assistant("On it.")]),
+        status: "working",
+      });
+      const harness = yield* makeHarness(fake, yield* importedThread(2));
+      const observed = yield* turnInput(harness.providerThread, "Activity outside T3 Code");
+      yield* harness.runtime.startTurn({
+        ...observed,
+        message: { ...observed.message, createdBy: "agent", creationSource: "provider" },
+      });
+      yield* fake.update(AGENT, (agent) => {
+        // Each NUL is one byte of text and six once JSON escapes it.
+        for (let index = 0; index < 60; index++)
+          agent.entries.push(assistant(`${index} `.padEnd(16_000, "\u0000")));
+        agent.status = "idle";
+      });
+      const end = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(end.status, "completed");
+      const serialized = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length;
+      const emittedText = harness.allEvents.reduce(
+        (sum, event) =>
+          sum +
+          (event.type === "message.updated"
+            ? serialized(event.message.text)
+            : event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+              ? serialized(event.turnItem.text)
+              : 0),
+        0,
+      );
+      assert.isAtMost(emittedText, AM_EMITTED_BYTE_LIMIT);
+      assert.isTrue(harness.replies().at(-1)!.startsWith("59 "));
+      assert.isBelow(serialized(harness.allEvents), 2_000_000);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.live("keeps one read's text within budget and clips oversized entries", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeAm();
@@ -1325,7 +1363,7 @@ describe("AmAdapterV2", () => {
       assert.strictEqual(end.status, "completed");
       const replies = [...new Set(harness.replies())];
       const bytes = replies.reduce((sum, text) => sum + new TextEncoder().encode(text).length, 0);
-      assert.isAtMost(bytes, AM_TEXT_BYTE_LIMIT);
+      assert.isAtMost(bytes, AM_EMITTED_BYTE_LIMIT);
       assert.isTrue(replies.every((text) => text.length <= 16_010));
       assert.isTrue(replies.at(-1)!.startsWith("59 "));
       const skipped = 61 - replies.length;
