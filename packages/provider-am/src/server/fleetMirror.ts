@@ -25,9 +25,11 @@ import {
   AM_REMOVED_MARK,
   amConversationHead,
   amHistory,
+  amHomeSpellings,
   amLocalPath,
   amMirroredThrough,
   amMirrorStatus,
+  amProjectRoot,
   amRepoSpelledLike,
   amWorkspace,
   fleetHostPathHere,
@@ -124,6 +126,31 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
   /** Tried since the imports last caught up, so a failing agent cannot hold up the rest. */
   const triedImports = new Set<string>();
 
+  /** A local root spelled as the project for its real path is, or will be, spelled. */
+  const localProjectRoot = Effect.fnUntraced(function* (root: string) {
+    const real = yield* options.realPath(root);
+    if (real === null) return root;
+    const projects = yield* Effect.forEach(yield* mirror.projectRoots, (projectRoot) =>
+      options
+        .realPath(projectRoot)
+        .pipe(Effect.map((resolved) => ({ root: projectRoot, real: resolved }))),
+    );
+    let homeSpelling: string | null = null;
+    for (const candidate of amHomeSpellings(real, options.home))
+      if ((yield* options.realPath(candidate)) === real) {
+        homeSpelling = candidate;
+        break;
+      }
+    return amProjectRoot({
+      root,
+      real,
+      projects,
+      homeSpelling,
+      home: options.home,
+      realHome: options.realHome,
+    });
+  });
+
   /** Reports whether the agent now has a thread. */
   const adopt = Effect.fnUntraced(function* (row: AmFleetRow & { readonly ref: string }) {
     if (missingWorkspaces.get(row.ref) === row.updatedAt) return false;
@@ -163,6 +190,7 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
       return false;
     }
     skipped.delete(row.ref);
+    const workspaceRoot = remote ? workspace.root : yield* localProjectRoot(workspace.root);
     const total = (yield* api.transcript(row.ref, TRANSCRIPT_END)).total;
     const tail = yield* api.transcript(row.ref, Math.max(0, total - AM_MIRROR_ENTRY_LIMIT));
     const { history, notice } = amHistory(row.ref, tail.entries, tail.total);
@@ -175,7 +203,7 @@ export const makeAmFleetMirror = Effect.fn("makeAmFleetMirror")(function* (
       title: row.name,
       model: amProviderForModel(row.provider) ?? AM_DEFAULT_MODEL,
       runtimeMode: "full-access",
-      workspaceRoot: workspace.root,
+      workspaceRoot,
       worktree: workspace.worktree,
       createdAt:
         DateTime.make(row.createdAt ?? row.updatedAt).pipe(Option.getOrUndefined) ??

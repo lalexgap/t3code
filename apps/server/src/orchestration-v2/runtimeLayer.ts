@@ -309,6 +309,7 @@ const layerProviderThreadMirrorProvided = ProviderThreadMirrorService.layer.pipe
       // Same layer reference as the adapter infrastructure, so drivers reach this handler.
       ProviderThreadMirror.layer,
       ProjectionStore.layer,
+      ProjectStore.layer,
       layerEventSinkProvided,
       layerProjectService,
       layerThreadLifecycleProvided,

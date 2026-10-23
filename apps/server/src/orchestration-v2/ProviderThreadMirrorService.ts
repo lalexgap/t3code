@@ -26,6 +26,7 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as ProjectStore from "./ProjectStore.ts";
 import * as ThreadLifecycleService from "./ThreadLifecycleService.ts";
 import { worktreeLeaseKey } from "../workspace/externalWorktree.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
@@ -143,6 +144,7 @@ export const layer = Layer.effectDiscard(
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const eventSink = yield* EventSink.EventSinkV2;
     const projects = yield* ProjectService.ProjectService;
+    const projectStore = yield* ProjectStore.ProjectStoreV2;
     const lifecycle = yield* ThreadLifecycleService.ThreadLifecycleService;
     const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
@@ -163,6 +165,13 @@ export const layer = Layer.effectDiscard(
       },
       Effect.mapError(failure("list", "Could not read the threads bound to this instance.")),
     );
+
+    const projectRoots: ProviderThreadMirror.ProviderThreadMirrorHandler["projectRoots"] =
+      projectStore.list().pipe(
+        Effect.map((rows) => rows.map((row) => row.workspaceRoot)),
+        Effect.mapError(failure("project-roots", "Could not read the projects.")),
+        Effect.withSpan("ProviderThreadMirror.projectRoots"),
+      );
 
     const resolveProject = Effect.fn("ProviderThreadMirror.resolveProject")(function* (
       workspaceRoot: string,
@@ -409,6 +418,6 @@ export const layer = Layer.effectDiscard(
       Effect.mapError(failure("update", "Could not update the thread.")),
     );
 
-    yield* mirror.install({ list, adopt, update });
+    yield* mirror.install({ list, projectRoots, adopt, update });
   }),
 );
