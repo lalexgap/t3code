@@ -1019,28 +1019,35 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     return plan.type === "create_with_handoff";
   });
 
-  /** An earlier root provider thread of the instance that can run the selection, if any. */
-  const providerThreadForInstanceHandoff = Effect.fn(
-    "Orchestrator.providerThreadForInstanceHandoff",
-  )(function* (
-    projection: Pick<
-      OrchestrationV2ThreadProjection,
-      "runs" | "providerSessions" | "providerThreads" | "thread"
-    >,
-    from: OrchestrationV2ProviderThread,
-    modelSelection: ModelSelection,
-  ) {
-    for (const candidate of rootProviderThreadsForProvider(projection, modelSelection.instanceId)) {
-      if (
-        candidate.id === from.id ||
-        providerThreadSelection(projection, candidate) === undefined ||
-        (yield* needsOtherProviderThread(projection, candidate, modelSelection))
-      )
-        continue;
-      return candidate;
-    }
-    return undefined;
-  });
+  /**
+   * The latest root provider thread of the instance that can run the selection, if any. A switch
+   * within the instance passes the thread it leaves, and then needs a known selection to trust.
+   */
+  const providerThreadForSelection = Effect.fn("Orchestrator.providerThreadForSelection")(
+    function* (
+      projection: Pick<
+        OrchestrationV2ThreadProjection,
+        "runs" | "providerSessions" | "providerThreads" | "thread"
+      >,
+      modelSelection: ModelSelection,
+      leaving?: OrchestrationV2ProviderThread,
+    ) {
+      for (const candidate of rootProviderThreadsForProvider(
+        projection,
+        modelSelection.instanceId,
+      )) {
+        if (
+          (leaving !== undefined &&
+            (candidate.id === leaving.id ||
+              providerThreadSelection(projection, candidate) === undefined)) ||
+          (yield* needsOtherProviderThread(projection, candidate, modelSelection))
+        )
+          continue;
+        return candidate;
+      }
+      return undefined;
+    },
+  );
 
   const enforceCommandPolicy =
     (command: OrchestrationV2Command) =>
@@ -1614,7 +1621,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const targetProviderThread = followsCurrent
         ? activeProviderThread?.providerInstanceId === queuedRun.providerInstanceId
           ? activeProviderThread
-          : rootProviderThreadsForProvider(projection, queuedRun.providerInstanceId)[0]
+          : yield* providerThreadForSelection(projection, queuedRun.modelSelection).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestratorDispatchError({
+                    commandId,
+                    commandType: "message.dispatch",
+                    cause,
+                  }),
+              ),
+            )
         : storedProviderThread;
       const queuedProviderThread: OrchestrationV2ProviderThread = targetProviderThread ?? {
         id: idAllocator.derive.providerThread({
@@ -4559,24 +4575,37 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
         ),
       );
+      const existingTargetProviderThread = yield* providerThreadForSelection(
+        input.projection,
+        input.modelSelection,
+        providerInstanceChanged ? undefined : providerThread,
+      ).pipe(mapDispatchError(input.command));
+      // Back on its own native conversation within the instance, a thread needs only what it missed.
+      const deltaSinceRun =
+        providerInstanceChanged ||
+        existingTargetProviderThread === undefined ||
+        existingTargetProviderThread.nativeThreadRef === null
+          ? undefined
+          : (lastDeliveredRunForProviderThread(input.projection, existingTargetProviderThread.id)
+              ?.ordinal ?? 0);
+      const deltaRuns =
+        deltaSinceRun === undefined
+          ? undefined
+          : input.projection.runs.filter(
+              (run) =>
+                run.ordinal > deltaSinceRun &&
+                run.ordinal <= targetRun.ordinal &&
+                (run.id === targetRun.id || isHandoffSourceRun(run)),
+            );
       yield* enforceCommandPolicy(input.command)(
         commandPolicy.ensureContextHandoff({
           commandId: input.command.commandId,
           threadId: input.command.threadId,
           providerInstanceId: input.modelSelection.instanceId,
           capabilities: targetCapabilities,
-          strategy: "full_thread_summary",
+          strategy: deltaRuns === undefined ? "full_thread_summary" : "delta_context",
         }),
       );
-      const existingTargetProviderThread = providerInstanceChanged
-        ? rootProviderThreadsForProvider(input.projection, input.modelSelection.instanceId).find(
-            (candidate) => candidate.id !== providerThread.id,
-          )
-        : yield* providerThreadForInstanceHandoff(
-            input.projection,
-            providerThread,
-            input.modelSelection,
-          ).pipe(mapDispatchError(input.command));
       const targetProviderSessionId =
         existingTargetProviderThread?.providerSessionId ??
         (yield* mapDispatchError(input.command)(
@@ -4630,9 +4659,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           toProviderThreadId: targetProviderThreadBase.id,
           fromProviderInstanceId: targetRun.providerInstanceId,
           toProviderInstanceId: input.modelSelection.instanceId,
-          coveredRunOrdinals: { from: 1, to: targetRun.ordinal },
-          strategy: "full_thread_summary",
-          items: yield* readHandoffItems(input.command.threadId),
+          coveredRunOrdinals: {
+            from: deltaRuns?.[0]?.ordinal ?? 1,
+            to: targetRun.ordinal,
+          },
+          strategy:
+            deltaRuns === undefined ? "full_thread_summary" : "delta_since_target_last_seen",
+          items: yield* readHandoffItems(
+            input.command.threadId,
+            deltaRuns?.map((run) => run.id),
+          ),
           runs: input.projection.runs,
           createdAt: now,
         })
@@ -5415,14 +5451,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const runId = idAllocator.derive.run({ threadId: command.threadId, ordinal });
       const targetProviderThread =
         modelSelection.instanceId !== queueProviderThread.providerInstanceId
-          ? rootProviderThreadsForProvider(projection, modelSelection.instanceId)[0]
+          ? yield* providerThreadForSelection(projection, modelSelection).pipe(
+              mapDispatchError(command),
+            )
           : (yield* needsOtherProviderThread(projection, queueProviderThread, modelSelection).pipe(
                 mapDispatchError(command),
               ))
-            ? yield* providerThreadForInstanceHandoff(
+            ? yield* providerThreadForSelection(
                 projection,
-                queueProviderThread,
                 modelSelection,
+                queueProviderThread,
               ).pipe(mapDispatchError(command))
             : queueProviderThread;
       const queuedAdapter = yield* providerAdapters
@@ -6144,13 +6182,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ),
     );
     const targetProviderThread = switchWithinInstance
-      ? yield* providerThreadForInstanceHandoff(
-          projection,
-          activeProviderThread!,
-          modelSelection,
-        ).pipe(mapDispatchError(command))
+      ? yield* providerThreadForSelection(projection, modelSelection, activeProviderThread!).pipe(
+          mapDispatchError(command),
+        )
       : isProviderSwitch && !canResumeAcrossInstances
-        ? rootProviderThreadsForProvider(projection, modelSelection.instanceId)[0]
+        ? yield* providerThreadForSelection(projection, modelSelection).pipe(
+            mapDispatchError(command),
+          )
         : activeProviderThread;
     const providerSessionId =
       (canResumeAcrossInstances ? undefined : targetProviderThread?.providerSessionId) ??
