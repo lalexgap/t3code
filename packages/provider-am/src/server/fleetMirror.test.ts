@@ -54,6 +54,8 @@ const makeFakeMirror = Effect.fnUntraced(function* (
     readonly head: OrchestrationV2ProviderRef | null;
     readonly archived?: boolean;
   }>,
+  /** Workspace roots of the server's existing projects; an adoption adds its own. */
+  initialProjects: ReadonlyArray<string> = [],
 ) {
   const now = yield* DateTime.now;
   const threads = new Map<string, ProviderThreadMirror.MirroredProviderThread>();
@@ -81,17 +83,20 @@ const makeFakeMirror = Effect.fnUntraced(function* (
       },
     });
   for (const thread of initial) bind(thread.ref, thread.head, thread.archived);
+  const projects = new Set(initialProjects);
   const adoptions = yield* Queue.unbounded<ProviderThreadMirror.ProviderThreadAdoption>();
   const updates = yield* Queue.unbounded<ProviderThreadMirror.ProviderThreadMirrorUpdate>();
   const handler: Context.Service.Shape<typeof ProviderThreadMirror.ProviderThreadMirror> = {
     available: true,
     install: () => Effect.void,
     list: () => Effect.sync(() => [...threads.values()]),
+    projectRoots: Effect.sync(() => [...projects]),
     adopt: (input) =>
       Effect.sync((): ProviderThreadMirror.ProviderThreadAdoptionResult => {
         Queue.offerUnsafe(adoptions, input);
         if (input.workspaceRoot.startsWith("/work/missing"))
           return { _tag: "WorkspaceMissing", workspaceRoot: input.workspaceRoot };
+        projects.add(input.workspaceRoot);
         bind(input.nativeThreadId, input.conversationHeadRef);
         return { _tag: "Adopted", threadId: ThreadId.make(`thread-${input.nativeThreadId}`) };
       }),
@@ -399,6 +404,100 @@ describe("makeAmFleetMirror", () => {
       // The worktree's root is resolved as it is bound, not as git spelled it.
       assert.include(resolved, "/work/app");
       assert.notInclude(resolved, "/data/work/app");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("keeps one project for a repository am spells under home and by its real path", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      const now = yield* DateTime.now;
+      const linked = "/home/op/code/producthunt";
+      const real = "/mnt/fastdata/code/producthunt";
+      const worktrees = "/home/op/.agent-manager/worktrees/producthunt";
+      // The agent spelled by its real path is the most recent, so it is imported first.
+      fake.agents.set(
+        "real-wt",
+        agent([], {
+          dir: `${worktrees}/real-wt`,
+          worktreePath: `${worktrees}/real-wt`,
+          worktreeBranch: "am/real-wt",
+          repoRoot: real,
+          updatedAt: DateTime.formatIso(now),
+        }),
+      );
+      fake.agents.set(
+        "home-wt",
+        agent([], {
+          dir: `${worktrees}/home-wt`,
+          worktreePath: `${worktrees}/home-wt`,
+          worktreeBranch: "am/home-wt",
+          repoRoot: linked,
+          updatedAt: daysAgo(now, 1),
+        }),
+      );
+      fake.agents.set(
+        "git-wt",
+        agent([], { dir: `${worktrees}/git-wt`, updatedAt: daysAgo(now, 2) }),
+      );
+      fake.agents.set("main", agent([], { dir: linked, updatedAt: daysAgo(now, 3) }));
+      const mirror = yield* makeFakeMirror([]);
+      const { statuses } = yield* startMirror(fake, mirror, "", {
+        home: "/home/op",
+        realHome: "/home/op",
+        // Git names a linked worktree's common dir by its real path.
+        gitRoot: (path) =>
+          Effect.succeed(
+            path === linked ? { root: linked, worktree: null } : { root: real, worktree: path },
+          ),
+        realPath: (path) =>
+          Effect.succeed(
+            path === linked || path.startsWith(`${linked}/`)
+              ? `${real}${path.slice(linked.length)}`
+              : path.startsWith("/mnt/fastdata/") || path.startsWith(`${worktrees}/`)
+                ? path
+                : null,
+          ),
+      });
+      yield* Queue.take(statuses);
+      const adopted = new Map<string, ProviderThreadMirror.ProviderThreadAdoption>();
+      for (let index = 0; index < 4; index++) {
+        yield* TestClock.adjust("1 second");
+        const adoption = yield* Queue.take(mirror.adoptions);
+        adopted.set(adoption.nativeThreadId, adoption);
+      }
+      for (const name of ["real-wt", "home-wt", "git-wt", "main"])
+        assert.strictEqual(adopted.get(name)?.workspaceRoot, linked, name);
+      assert.deepStrictEqual(adopted.get("real-wt")?.worktree, {
+        path: `${worktrees}/real-wt`,
+        branch: "am/real-wt",
+      });
+      assert.deepStrictEqual(adopted.get("home-wt")?.worktree, {
+        path: `${worktrees}/home-wt`,
+        branch: "am/home-wt",
+      });
+      assert.deepStrictEqual(adopted.get("git-wt")?.worktree, {
+        path: `${worktrees}/git-wt`,
+        branch: null,
+      });
+      assert.isNull(adopted.get("main")?.worktree);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("joins an existing project at the same real path under any spelling", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeAm();
+      const linked = "/home/op/code/producthunt";
+      const real = "/mnt/fastdata/code/producthunt";
+      fake.agents.set("main", agent([], { dir: linked }));
+      const mirror = yield* makeFakeMirror([], ["/home/op/code/other", real]);
+      const { statuses } = yield* startMirror(fake, mirror, "", {
+        home: "/home/op",
+        realHome: "/home/op",
+        gitRoot: () => Effect.succeed({ root: linked, worktree: null }),
+        realPath: (path) => Effect.succeed(path === linked ? real : path),
+      });
+      yield* Queue.take(statuses);
+      assert.strictEqual((yield* Queue.take(mirror.adoptions)).workspaceRoot, real);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

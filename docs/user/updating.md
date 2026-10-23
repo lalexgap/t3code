@@ -98,6 +98,14 @@ If you run the server with `npx` rather than an installed `t3`, there is
 nothing to update on the host: stop the server and relaunch it as
 `npx t3@<client-version>` with the same subcommand and options.
 
+## Turn off server updates
+
+Set `T3CODE_DISABLE_SERVER_UPDATE=1` in a server's environment to update it only by your own
+means. The server then refuses every update request, from a client or from `t3 update`, with
+"Server updates are disabled on this server", and clients treat it as a server that needs a
+manual update. For a background service, set it in the service's environment, and in the shell
+you run `t3 update` from.
+
 ## If an update fails
 
 Keep the client open until it reconnects or reports a failure. A failed service

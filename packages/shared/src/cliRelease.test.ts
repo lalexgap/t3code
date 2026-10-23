@@ -1,8 +1,20 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { cliArchiveTarCommand, newestCliReleaseVersion, parseChecksums } from "./cliRelease.ts";
+import {
+  cliArchiveTarCommand,
+  newestCliReleaseVersion,
+  parseChecksums,
+  serverUpdatesDisabled,
+} from "./cliRelease.ts";
 
 describe("cliRelease", () => {
+  it("disables server updates for any value but an empty one or an explicit no", () => {
+    for (const value of [undefined, "", " ", "0", "false", "No", "OFF"])
+      expect(serverUpdatesDisabled(value)).toBe(false);
+    for (const value of ["1", "true", "yes", "Y", "on"])
+      expect(serverUpdatesDisabled(value)).toBe(true);
+  });
+
   it("parses sha256sum output including binary-mode markers", () => {
     const checksums = parseChecksums(
       [

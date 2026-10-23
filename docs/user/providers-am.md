@@ -88,8 +88,11 @@ still importing.
 - **Projects.** A new thread lands in the project for the agent's git repository, or its directory
   outside one, which T3 Code adds if you do not have it yet. An agent in a worktree, whether am
   made it or not, lands in the main repository's project, on that worktree. A git repository can
-  be anywhere. An agent whose project would be `/`, your home directory, or a folder outside it
-  that is not a git repository is skipped, and provider status counts it.
+  be anywhere. A repository reached through a symlink is one project however am spells it: a
+  local agent joins the project already at the same real path, and a new project takes the spelling
+  under your home directory when one leads there, else the real path. An agent whose project would
+  be `/`, your home directory, or a folder outside it that is not a git repository is skipped, and
+  provider status counts it.
 - **Fleet hosts.** A fleet host's paths are on that machine, so T3 Code uses this machine's copy at
   the same path under your home directory, as it does for threads it starts there. A fleet host's
   worktree stays on that host, so its agent's thread uses the project, not a worktree. It never creates
