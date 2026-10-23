@@ -256,7 +256,6 @@ export interface AmApi {
    */
   readonly stopIfIdle: (ref: string) => Effect.Effect<AmStopResult, AmApiError>;
   readonly transcript: (name: string, after: number) => Effect.Effect<AmTranscript, AmApiError>;
-  /** The agent's pending permission prompts. */
   readonly permissions: (
     ref: string,
   ) => Effect.Effect<ReadonlyArray<AmPermissionRequest>, AmApiError>;
