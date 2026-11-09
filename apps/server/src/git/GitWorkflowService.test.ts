@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as FileSystem from "effect/FileSystem";
 
@@ -12,6 +13,8 @@ import * as GitManager from "./GitManager.ts";
 import * as GitWorkflowService from "./GitWorkflowService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
+
+const platformLayer = Layer.mergeAll(NodeServices.layer, NodeCrypto.layer);
 
 const testLayer = (externalWorktrees: Array<string> = []) =>
   GitWorkflowService.layer.pipe(
@@ -30,13 +33,13 @@ const testLayer = (externalWorktrees: Array<string> = []) =>
     Layer.provideMerge(VcsProcess.layer),
     Layer.provideMerge(
       ServerConfig.layerTest(process.cwd(), { prefix: "t3-ref-named-" }).pipe(
-        Layer.provide(NodeServices.layer),
+        Layer.provide(platformLayer),
       ),
     ),
-    Layer.provideMerge(NodeServices.layer),
+    Layer.provideMerge(platformLayer),
   );
 
-it.layer(NodeServices.layer)("GitWorkflowService", (it) => {
+it.layer(platformLayer)("GitWorkflowService", (it) => {
   it.effect("finds a name among the refs of every namespace", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
