@@ -1414,7 +1414,8 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
           text: message.text,
           attachments: message.attachments,
           resolveAttachmentPath: providerHost.resolveAttachmentPath,
-        }).trim();
+          resolveExtractedTextPath: providerHost.resolveExtractedTextPath,
+        }).pipe(Effect.map((text) => text.trim()));
 
       // am restarts only an idle agent. Sending anyway would run on a model the thread does not
       // show, so the turn fails and says why.
@@ -1510,7 +1511,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
             messages: [],
           });
         }
-        const text = promptText(turnInput.message);
+        const text = yield* promptText(turnInput.message);
         if (!text) return yield* protocolError("Agent Motel needs a text message");
         const { host, name } = parseAmAgentRef(ref);
         const dir = turnInput.runtimePolicy.cwd ?? cwd;
@@ -1788,7 +1789,7 @@ export const makeAmAdapterV2 = Effect.fn("makeAmAdapterV2")(function* (
               !validateThread(args.providerThread)
             )
               return yield* protocolError("This Agent Motel turn cannot be steered");
-            const text = promptText(args.message);
+            const text = yield* promptText(args.message);
             if (!text) return yield* protocolError("Agent Motel needs a text message");
             // An observing run follows someone else's work, so its steer waits for the agent.
             const mode = turn.observe || turn.messages[0]?.state === "queued" ? "queue" : "now";
